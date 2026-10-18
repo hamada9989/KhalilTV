@@ -46,13 +46,13 @@ val hasReleaseSigning = keystoreProps.getProperty("storeFile") != null
 
 android {
     namespace = "com.aeriotv.android"
-    compileSdk = 34
-    buildToolsVersion = "34.0.0"
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
 
     defaultConfig {
         applicationId = "com.aeriotv.android"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 69
         versionName = "0.5.13"
         vectorDrawables { useSupportLibrary = true }
