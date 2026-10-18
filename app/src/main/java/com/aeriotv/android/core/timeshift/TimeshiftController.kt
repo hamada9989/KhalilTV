@@ -1,0 +1,892 @@
+package com.aeriotv.android.core.timeshift
+
+import android.util.Log
+import com.aeriotv.android.core.preferences.AppPreferences
+import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Live Rewind session arbiter (task #143).
+ *
+ * Owns the active [TimeshiftWriter] and the UI-facing state. The
+ * shared live player's tee (see [TeeDataSource] wiring in
+ * AerioExoPlayerHolder) mirrors bytes into [activeWriter] whenever one
+ * exists; PlayerScreen starts/stops sessions around fullscreen live
+ * playback, per the locked v1 scope: fullscreen single-stream only,
+ * multiview tiles / mini-player / PiP stay pure live.
+ *
+ * P1 wires enable + depth prefs; retention and budget ride interim
+ * defaults until the P2 settings land.
+ */
+@Singleton
+class TimeshiftController @Inject constructor(
+    private val store: TimeshiftBufferStore,
+    private val prefs: AppPreferences,
+) {
+    companion object {
+        /** Retries for a kept fill's first open that meets a 503. */
+        private const val OPEN_BUSY_RETRIES = 4
+        private const val OPEN_BUSY_RETRY_MS = 2_000L
+
+        private const val TAG = "TimeshiftController"
+
+        /** Retention as a USER concept died in the 2026-07-11 settings
+         *  rework ("we don't really care how long the files are stored
+         *  ... just delete the buffered video after an hour"): buffered
+         *  video is removed this long after its session goes quiet. The
+         *  liveRewindRetentionHours pref is dormant. */
+        const val FIXED_RETENTION_MS = 60L * 60 * 1000
+
+        /** App log tag for Keep Recent Channels Live user actions. */
+        private const val APP_TAG = "AerioTV"
+    }
+
+    // Single-threaded: session start/stop/enter/exit all mutate the same
+    // fields, and callers arrive from Main (transport buttons), IO (the
+    // delayed pause filler), and the player thread. Serial confinement
+    // makes start/stop ordering deterministic (a fast open-then-back
+    // could previously stop BEFORE the start coroutine ran, orphaning a
+    // writer the mini-player's tee fed forever) and makes the filler
+    // is-active check atomic.
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+    /**
+     * GH #51 ROOT CAUSE: the independent filler is a BLOCKING network read
+     * loop that runs for the whole connection lifetime. It used to launch
+     * on the serial [scope]; with limitedParallelism(1) every control task
+     * queued after it (stop-fill, Go Live's stop, the session close on
+     * channel change, even the NEXT channel's session start) starved
+     * behind the blocked worker - the filler was unstoppable once started
+     * ("ghost streams until manually killed in the Dispatcharr GUI"), and
+     * the next channel's tee kept appending into the previous channel's
+     * buffer. Long-blocking work gets its own unbounded IO scope; the
+     * serial scope stays the control plane.
+     */
+    private val fillScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        // Retention/budget reaper independent of new sessions: without
+        // this, disabling the feature (or never watching live again)
+        // stranded old buffers on disk until app data was cleared.
+        scope.launch {
+            runCatching {
+                store.pruneExpired(FIXED_RETENTION_MS)
+                // Storage Limit setting removed: depth is the knob; the
+                // free-space floor is the invisible seatbelt.
+                store.enforceBudget(store.freeSpaceBudgetBytes())
+            }.onFailure { Log.w(TAG, "startup reaper failed: $it") }
+        }
+    }
+
+    @Volatile
+    var activeWriter: TimeshiftWriter? = null
+        private set
+
+    /** Live stream URL + headers of the current session, captured at
+     *  start so the independent filler can reconnect on its own. */
+    @Volatile private var liveUrl: String? = null
+    @Volatile private var liveHeaders: Map<String, String> = emptyMap()
+
+    /** Channel identity of the FOREGROUND session, so a channel flip can
+     *  demote the outgoing session into [retained] instead of deleting it. */
+    @Volatile private var currentChannelId: String? = null
+    @Volatile private var currentChannelName: String? = null
+    @Volatile private var currentChannelLogo: String? = null
+
+    /**
+     * Keep Recent Channels Live (iOS parity): a flipped-away channel's
+     * session keeps its writer and gets its own independent filler, so
+     * flipping back restores the full rewind timeline including the time
+     * away. Insertion order = recency; oldest is evicted past the count.
+     * Mutated only on the serial [scope].
+     */
+    private class RetainedSession(
+        val channelId: String,
+        val channelName: String,
+        val logoUrl: String?,
+        /** Wall time the channel started being kept live (demotion). */
+        var sinceMs: Long,
+        /** FROZEN at demotion. Never consults [currentPlayUrlProvider]:
+         *  by demotion time the holder is already tuning the NEW channel,
+         *  so chasing the provider would record the wrong channel. */
+        val url: String,
+        val headers: Map<String, String>,
+        val writer: TimeshiftWriter,
+    ) {
+        @Volatile var fillCall: okhttp3.Call? = null
+        var fillJob: kotlinx.coroutines.Job? = null
+    }
+
+    private val retained = LinkedHashMap<String, RetainedSession>()
+
+    /**
+     * A kept channel the user tuned back to while its OWN fill connection
+     * keeps feeding the buffer, which the player reads from its live edge
+     * ([AerioExoPlayerHolder.playRetainedLive]). No new server connection is
+     * opened on re-tune (Apple parity: the kept remuxer's live window
+     * resumes with no new ingest). Closing or flipping away hands the same
+     * running connection straight back to [retained]. Serial scope only.
+     */
+    private var adoptedSession: RetainedSession? = null
+
+    /** Lock-free snapshot of the kept writers, read on the Main thread by
+     *  PlayerScreen at tune time so the player can start on the kept buffer
+     *  before the serial adoption task runs. */
+    @Volatile private var retainedWriters: Map<String, TimeshiftWriter> = emptyMap()
+
+    /** The kept buffer for [channelId] when it is still writable, else null. */
+    fun retainedWriterFor(channelId: String): TimeshiftWriter? =
+        retainedWriters[channelId]?.takeIf { !it.closed }
+
+    /** Called (on the serial scope) when the adopted live connection ended
+     *  on its own while the player was reading it; the holder re-tunes the
+     *  direct stream so playback does not stall at the buffer head. */
+    @Volatile var onAdoptedFillEnded: ((String) -> Unit)? = null
+
+    data class RetainedChannel(
+        val channelId: String,
+        val channelName: String,
+        val logoUrl: String? = null,
+        /** Wall time (ms) the channel started being kept live. */
+        val sinceMs: Long = 0L,
+    )
+
+    /** UI-facing list of channels being kept live (recency order, oldest
+     *  first). Collected by the retained-channels card above the nav bar,
+     *  the player's Kept Live options section, and the KEPT badges. */
+    private val _retainedChannels = MutableStateFlow<List<RetainedChannel>>(emptyList())
+    val retainedChannels: StateFlow<List<RetainedChannel>> = _retainedChannels
+
+    private fun publishRetained() {
+        retainedWriters = retained.mapValues { it.value.writer }
+        _retainedChannels.value = retained.values.map {
+            RetainedChannel(it.channelId, it.channelName, it.logoUrl, it.sinceMs)
+        }
+    }
+
+    /** The outgoing channel's ACTUAL play URL (post LAN/WAN failover),
+     *  snapshotted by PlayerScreen at the top of a channel flip while the
+     *  holder is still on the OLD channel. Demotion prefers this over the
+     *  tune-time [liveUrl] for the same reason the filler does. */
+    @Volatile private var lastPlayUrlSnapshot: String? = null
+    fun noteChannelLeaving() {
+        lastPlayUrlSnapshot = currentPlayUrlProvider?.invoke()
+            ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+    }
+
+    /** The URL the player is ACTUALLY playing right now (post LAN/WAN
+     *  failover), supplied by the holder via PlayerScreen. The tune-time
+     *  [liveUrl] comes from the stored channel row, whose embedded base
+     *  can be stale after a server move (2026-08-13 VPS migration: live
+     *  video failed over to WAN but the filler kept dialing the dead LAN
+     *  address, so pause/resume stalled at head forever). The filler
+     *  prefers this provider's http(s) result; buffer playback leaves the
+     *  holder's lastPlayUrl on the live URL, so the value is valid exactly
+     *  when the filler starts. */
+    @Volatile var currentPlayUrlProvider: (() -> String?)? = null
+    private var fillJob: kotlinx.coroutines.Job? = null
+
+    private val fillClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .followRedirects(true)
+            .build()
+    }
+
+    data class State(
+        /** A buffer session is rolling for the current live channel. */
+        val buffering: Boolean = false,
+        /** Playback is on the buffer (paused/rewound) rather than the direct stream. */
+        val timeshifting: Boolean = false,
+        /** Oldest rewindable wall time. */
+        val tailWallMs: Long = 0,
+        /** Newest buffered wall time (the live edge). */
+        val headWallMs: Long = 0,
+        /** When timeshifting: wall time playback entered the buffer at. */
+        val baseWallMs: Long = 0,
+    )
+
+    private val _state = MutableStateFlow(State())
+    val state: StateFlow<State> = _state
+
+    /**
+     * Begin buffering [channelId] if Live Rewind is enabled. Called by
+     * PlayerScreen when fullscreen live playback starts (and on channel
+     * change, which implicitly ends the previous session).
+     */
+    fun onFullscreenLiveStarted(
+        channelId: String,
+        channelName: String,
+        streamUrl: String,
+        headers: Map<String, String> = emptyMap(),
+        logoUrl: String? = null,
+        /** True when the player is already reading the kept buffer's live
+         *  edge (no new connection): adoption keeps the kept fill running as
+         *  this session's live feed instead of stopping it. */
+        adoptLive: Boolean = false,
+        /** False when the outgoing channel failed (Channel Unavailable): a
+         *  dead stream is never kept live, it is released instead. */
+        keepPrevious: Boolean = true,
+    ) {
+        liveUrl = streamUrl
+        liveHeaders = headers
+        scope.launch {
+            // Back to full screen (expand or a new tune): the mini's X no
+            // longer owns this channel.
+            miniKeepCandidate = null
+            // runCatching: session setup does disk IO (mkdirs, meta
+            // write) that can throw on a full or flaky disk; an uncaught
+            // exception here killed the whole process on every tune.
+            runCatching {
+                val enabled = prefs.liveRewindEnabled.first()
+                val keepRecent = enabled && prefs.liveRewindKeepRecent.first()
+                // Settings changed underneath live retained sessions:
+                // release them rather than leaving orphan fillers running.
+                if (!keepRecent && retained.isNotEmpty()) {
+                    retained.values.forEach { releaseRetained(it, "Keep Recent Channels Live turned off") }
+                    retained.clear()
+                    publishRetained()
+                }
+                if (!enabled) return@launch
+                val depthMin = prefs.liveRewindDepthMinutes.first()
+                val keepCount = prefs.liveRewindKeepCount.first()
+                if (keepRecent && !keepPrevious && currentChannelName != null) {
+                    Log.i(APP_TAG, "[RETAIN] not kept $currentChannelName: stream failed")
+                }
+                if (keepRecent && keepPrevious) demoteCurrentSession(keepCount) else stopSessionInternal()
+                // Flip-back: adopt the retained session so the rewind
+                // timeline spans the time away. The tee is a different
+                // connection than the retained filler, so mark the splice.
+                val adopted = retained.remove(channelId)
+                if (adopted != null) {
+                    val liveFill = adoptLive && !adopted.writer.closed &&
+                        adopted.fillJob?.isActive == true
+                    if (!liveFill) stopRetainedFill(adopted)
+                    publishRetained()
+                    if (!adopted.writer.closed) {
+                        currentChannelId = channelId
+                        currentChannelName = channelName
+                        currentChannelLogo = logoUrl
+                        activeWriter = adopted.writer
+                        if (liveFill) {
+                            // The kept connection IS this session's live
+                            // feed now: same bytes, no splice. Registered as
+                            // the independent fill so pause/rewind never
+                            // start a second connection, and Go Live /
+                            // stop / demote own its lifetime.
+                            adoptedSession = adopted
+                            fillJob = adopted.fillJob
+                            Log.i(TAG, "adopted retained buffer for $channelName (live fill kept, no new connection)")
+                        } else {
+                            // The player's own connection takes over: mark
+                            // the splice for the tee.
+                            adopted.writer.markDiscontinuity()
+                            Log.i(TAG, "adopted retained buffer for $channelName")
+                        }
+                        _state.value = State(
+                            buffering = true,
+                            tailWallMs = adopted.writer.tailWallMs,
+                            headWallMs = adopted.writer.headWallMs,
+                        )
+                        return@launch
+                    }
+                    // Writer died in the background (disk full, etc.):
+                    // release the corpse and fall through to a fresh start.
+                    releaseRetained(adopted, "buffer closed before re-tune")
+                }
+                val writer = store.startSession(
+                    channelId = channelId,
+                    channelName = channelName,
+                    depthMs = depthMin * 60_000L,
+                    retentionMs = FIXED_RETENTION_MS,
+                    budgetBytes = store.freeSpaceBudgetBytes(),
+                    protectedDirs = retained.values.map { it.writer.sessionDir }.toSet(),
+                )
+                currentChannelId = channelId
+                currentChannelName = channelName
+                currentChannelLogo = logoUrl
+                activeWriter = writer
+                _state.value = State(
+                    buffering = true,
+                    tailWallMs = writer.sessionStartMs,
+                    headWallMs = writer.sessionStartMs,
+                )
+                Log.i(TAG, "buffering started for $channelName")
+            }.onFailure {
+                Log.w(TAG, "session start failed: $it")
+                activeWriter = null
+                _state.value = State()
+            }
+        }
+    }
+
+    /**
+     * Channel flip with Keep Recent Channels Live on: instead of closing
+     * and deleting the outgoing session, park it in [retained] with its
+     * own independent filler so the buffer keeps rolling. Oldest retained
+     * session past [maxCount] is evicted (its buffer deleted). Serial
+     * scope only.
+     */
+    private fun demoteCurrentSession(maxCount: Int) {
+        // Adopted kept channel leaving the screen: its own connection is
+        // still filling the buffer, so hand it straight back to [retained]
+        // instead of cancelling it and dialing a new one.
+        val reuse = adoptedSession?.takeIf {
+            it.writer === activeWriter && !it.writer.closed && it.fillJob?.isActive == true
+        }
+        if (reuse != null) {
+            adoptedSession = null
+            fillJob = null
+            fillCall = null
+        }
+        stopIndependentFill()
+        val writer = activeWriter
+        val chId = currentChannelId
+        val chName = currentChannelName
+        val chLogo = currentChannelLogo
+        activeWriter = null
+        currentChannelId = null
+        currentChannelName = null
+        currentChannelLogo = null
+        if (writer == null) return
+        // Freeze the URL now: the snapshot PlayerScreen took while the old
+        // channel was still up beats the tune-time row URL (VPS-migration
+        // rule), and the live provider lambda is already off-limits (it
+        // points at the incoming channel).
+        val url = lastPlayUrlSnapshot ?: liveUrl
+        lastPlayUrlSnapshot = null
+        if (reuse != null && chId != null) {
+            reuse.sinceMs = System.currentTimeMillis()
+            retained.remove(chId)
+            retained[chId] = reuse
+            evictPastCap(maxCount)
+            publishRetained()
+            Log.i(TAG, "keeping $chName live (${retained.size} retained, same connection, no reconnect)")
+            return
+        }
+        reuse?.let { stopRetainedFill(it) }
+        if (chId == null || url == null || writer.closed) {
+            // Not retainable: release exactly like stopSessionInternal.
+            Log.i(APP_TAG, "[RETAIN] not kept ${chName ?: "?"}: " +
+                if (writer.closed) "buffer closed" else "no channel id or URL")
+            writer.close()
+            runCatching { writer.sessionDir.deleteRecursively() }
+            return
+        }
+        val session = RetainedSession(
+            channelId = chId,
+            channelName = chName ?: chId,
+            logoUrl = chLogo?.takeIf { it.isNotBlank() },
+            sinceMs = System.currentTimeMillis(),
+            url = url,
+            headers = liveHeaders,
+            writer = writer,
+        )
+        retained.remove(chId)
+        retained[chId] = session
+        evictPastCap(maxCount)
+        startRetainedFill(session)
+        publishRetained()
+        Log.i(TAG, "keeping $chName live (${retained.size} retained)")
+    }
+
+    private fun evictPastCap(maxCount: Int) {
+        while (retained.size > maxCount.coerceIn(1, 5)) {
+            val oldest = retained.entries.first()
+            retained.remove(oldest.key)
+            releaseRetained(oldest.value, "evicted by a newer keep (cap ${maxCount.coerceIn(1, 5)})")
+        }
+    }
+
+    /**
+     * A retained channel's buffer is fed ONLY by its own connection against
+     * the frozen URL. The retained connection must never compete with what
+     * the user is watching: under a Dispatcharr per-user stream limit a
+     * reconnect can be the request that gets the watched stream terminated.
+     * So the channel stops being retained (buffer released) the moment the
+     * server ends the connection cleanly or answers with any HTTP error
+     * (429 stream limit included); there is no reconnect loop for those.
+     * A thrown network error (socket reset, timeout) keeps the bounded
+     * reconnect. Every (re)connect is a splice, so the writer realigns per
+     * attempt.
+     */
+    private fun startRetainedFill(session: RetainedSession) {
+        session.fillJob = fillScope.launch {
+            var attempts = 0
+            var everConnected = false
+            var openBusyRetries = 0
+            while (currentCoroutineContext().isActive && !session.writer.closed) {
+                var endReason: String? = null
+                try {
+                    session.writer.markDiscontinuity()
+                    val req = Request.Builder().url(session.url).apply {
+                        session.headers.forEach { (k, v) -> header(k, v) }
+                    }.build()
+                    val call = fillClient.newCall(req)
+                    session.fillCall = call
+                    call.execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            endReason = "http ${resp.code}"
+                            return@use
+                        }
+                        attempts = 0
+                        everConnected = true
+                        val src = resp.body?.byteStream()
+                        if (src == null) {
+                            endReason = "empty response"
+                            return@use
+                        }
+                        val buf = ByteArray(64 * 1024)
+                        while (currentCoroutineContext().isActive && !session.writer.closed) {
+                            val n = src.read(buf)
+                            if (n < 0) {
+                                endReason = "connection ended"
+                                break
+                            }
+                            if (n > 0) session.writer.appendFill(buf, 0, n)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    if (session.fillJob?.isActive != true) return@launch
+                    Log.w(TAG, "retained fill error for ${session.channelName}: $t")
+                }
+                if (!currentCoroutineContext().isActive || session.writer.closed) return@launch
+                // A keep that opens right after the player stopped (the mini
+                // close) can meet a 503 while the server still holds the
+                // player's slot (Streamer 2026-10-12: released 0.3 s after
+                // the keep). Before the first successful open, a 503 is
+                // retried a few times instead of ending the keep.
+                if (endReason == "http 503" && !everConnected && openBusyRetries < OPEN_BUSY_RETRIES) {
+                    openBusyRetries++
+                    Log.i(APP_TAG, "[RETAIN] kept fill for ${session.channelName}: http 503 on open, retry $openBusyRetries/$OPEN_BUSY_RETRIES")
+                    kotlinx.coroutines.delay(OPEN_BUSY_RETRY_MS)
+                    continue
+                }
+                endReason?.let { reason ->
+                    releaseRetainedAfterFillEnd(session, reason)
+                    return@launch
+                }
+                if (++attempts > 20) {
+                    Log.w(TAG, "retained fill gave up for ${session.channelName}")
+                    releaseRetainedAfterFillEnd(session, "gave up after 20 reconnects")
+                    return@launch
+                }
+                kotlinx.coroutines.delay(3_000)
+            }
+        }
+        Log.i(TAG, "retained fill started for ${session.channelName}")
+    }
+
+    /** Drop [session] from [retained] after its own connection ended, on the
+     *  serial scope. Skipped when the session was already adopted, evicted or
+     *  replaced in the meantime. */
+    private fun releaseRetainedAfterFillEnd(session: RetainedSession, reason: String) {
+        scope.launch {
+            if (adoptedSession === session) {
+                // On screen: the buffer stays as the foreground session's
+                // rewind window; only the live feed ended. The holder goes
+                // back to a direct tune so playback does not run dry.
+                adoptedSession = null
+                if (fillJob === session.fillJob) fillJob = null
+                session.fillCall = null
+                session.fillJob = null
+                Log.i(APP_TAG, "[RETAIN] adopted live feed ended for ${session.channelName}: $reason")
+                onAdoptedFillEnded?.invoke(session.channelId)
+                return@launch
+            }
+            if (retained[session.channelId] !== session) return@launch
+            retained.remove(session.channelId)
+            releaseRetained(session, "server ended the kept connection ($reason)")
+            publishRetained()
+        }
+    }
+
+    /** Same discipline as [stopIndependentFill]: cancel the CALL, not just
+     *  the coroutine, or the blocking read holds the provider connection
+     *  open until the 60s read timeout (ghost streams). */
+    private fun stopRetainedFill(session: RetainedSession) {
+        session.fillCall?.cancel()
+        session.fillCall = null
+        session.fillJob?.cancel()
+        session.fillJob = null
+    }
+
+    /** Stop and delete a retained session's buffer. Caller removes it from
+     *  [retained] and publishes. */
+    private fun releaseRetained(session: RetainedSession, reason: String) {
+        Log.i(APP_TAG, "[RETAIN] released ${session.channelName}: $reason")
+        stopRetainedFill(session)
+        session.writer.close()
+        runCatching {
+            if (session.writer.sessionDir.deleteRecursively()) {
+                Log.i(TAG, "released retained buffer ${session.writer.sessionDir.name}")
+            }
+        }.onFailure { Log.w(TAG, "retained cleanup failed: $it") }
+    }
+
+    /** Card / options-sheet Stop: stop keeping one channel live. Releases
+     *  the kept connection and its buffer immediately. */
+    fun stopRetainedChannel(channelId: String) {
+        scope.launch {
+            retained.remove(channelId)?.let {
+                releaseRetained(it, "released by user")
+            }
+            publishRetained()
+        }
+    }
+
+    /** Card / options-sheet Stop All: same as [stopAllRetained], logged as a
+     *  user release per channel. */
+    fun stopAllRetainedByUser() {
+        scope.launch {
+            if (retained.isEmpty()) return@launch
+            retained.values.forEach { releaseRetained(it, "released by user (Stop All)") }
+            retained.clear()
+            publishRetained()
+        }
+    }
+
+    /** Indicator dialog "Stop All", and the app-background policy: retained
+     *  fillers are network connections the user cannot see, so they do not
+     *  outlive the app being on screen (anti-ghost-stream rule; there is no
+     *  FGS for this convenience feature). */
+    fun stopAllRetained(reason: String) {
+        scope.launch {
+            if (retained.isEmpty()) return@launch
+            retained.values.forEach { releaseRetained(it, reason) }
+            retained.clear()
+            publishRetained()
+        }
+    }
+
+    /**
+     * Stop buffering (leaving fullscreen live: channel close, minimize,
+     * multiview, PiP handoff). Buffered data stays on disk until the
+     * retention reaper ages it out.
+     */
+    fun onFullscreenLiveStopped(
+        keepIfEnabled: Boolean = false,
+        toMini: Boolean = false,
+        /** True when the closing channel failed (Channel Unavailable) and has
+         *  not played since: a dead stream is never kept live, as for a flip. */
+        streamFailed: Boolean = false,
+    ) {
+        // Snapshot the actual play URL now if the holder still has one
+        // (post LAN/WAN failover); after an X-close the holder is already
+        // stopped and demotion falls back to the tune-time URL.
+        if (keepIfEnabled || toMini) noteChannelLeaving()
+        // Through the same serial scope as start so a fast tune-then-back
+        // can never stop BEFORE the pending start runs.
+        scope.launch {
+            // Minimize: the buffer session ends as before, but remember the
+            // channel so the mini's X can keep it live (same outcome as the
+            // full-screen X). Only a channel that had a buffer qualifies,
+            // which already excludes HLS and non-TS sessions.
+            if (toMini && streamFailed && activeWriter != null) {
+                Log.i(APP_TAG, "[RETAIN] not kept ${currentChannelName ?: "?"}: stream failed")
+            }
+            miniKeepCandidate = if (toMini && !streamFailed && activeWriter != null) {
+                val id = currentChannelId
+                val url = lastPlayUrlSnapshot ?: liveUrl
+                if (id != null && url != null) {
+                    MiniKeepCandidate(id, currentChannelName ?: id, currentChannelLogo, url, liveHeaders)
+                } else null
+            } else null
+            // Keep Recent Channels Live on close (iOS parity, NowPlaying.stop
+            // hands the remuxer to the retained manager): closing the player
+            // demotes the session exactly like a flip, honoring the cap and
+            // eviction. The Kept Live card's Stop releases it.
+            val keep = keepIfEnabled && activeWriter != null && runCatching {
+                prefs.liveRewindEnabled.first() && prefs.liveRewindKeepRecent.first()
+            }.getOrDefault(false)
+            if (keep && streamFailed) {
+                Log.i(APP_TAG, "[RETAIN] not kept ${currentChannelName ?: "?"}: stream failed")
+                stopSessionInternal()
+            } else if (keep) {
+                val name = currentChannelName
+                val keepCount = runCatching { prefs.liveRewindKeepCount.first() }.getOrDefault(1)
+                demoteCurrentSession(keepCount)
+                if (name != null && retained.values.any { it.channelName == name }) {
+                    Log.i(APP_TAG, "[RETAIN] kept on close $name")
+                }
+            } else {
+                if (keepIfEnabled) {
+                    Log.i(
+                        APP_TAG,
+                        "[RETAIN] not kept on close ${currentChannelName ?: "?"}: " +
+                            if (activeWriter == null) "no buffer session" else "Keep Recent Channels Live off",
+                    )
+                }
+                stopSessionInternal()
+            }
+            lastPlayUrlSnapshot = null
+            _state.value = State()
+        }
+    }
+
+    private data class MiniKeepCandidate(
+        val channelId: String,
+        val channelName: String,
+        val logoUrl: String?,
+        val url: String,
+        val headers: Map<String, String>,
+    )
+
+    /** Channel that was minimized to the mini player (see [onMiniClosed]). */
+    @Volatile private var miniKeepCandidate: MiniKeepCandidate? = null
+
+    /**
+     * The mini player's X: the same Keep Recent Channels Live outcome as the
+     * full-screen player's close. The buffer session ended at minimize, so a
+     * fresh kept session opens on its own connection; call this AFTER the
+     * player is stopped so only one connection is open at a time. No-op when
+     * the setting is off or the minimized channel had no buffer.
+     */
+    fun onMiniClosed(via: String = "mini-x") {
+        scope.launch {
+            val c = miniKeepCandidate ?: run {
+                Log.i(APP_TAG, "[RETAIN] not kept on mini close ($via): no buffered channel was minimized")
+                return@launch
+            }
+            miniKeepCandidate = null
+            runCatching {
+                val keep = prefs.liveRewindEnabled.first() && prefs.liveRewindKeepRecent.first()
+                if (!keep) {
+                    Log.i(APP_TAG, "[RETAIN] not kept on mini close ${c.channelName} ($via): Keep Recent Channels Live off")
+                    return@launch
+                }
+                val depthMin = prefs.liveRewindDepthMinutes.first()
+                val keepCount = prefs.liveRewindKeepCount.first()
+                val writer = store.startSession(
+                    channelId = c.channelId,
+                    channelName = c.channelName,
+                    depthMs = depthMin * 60_000L,
+                    retentionMs = FIXED_RETENTION_MS,
+                    budgetBytes = store.freeSpaceBudgetBytes(),
+                    protectedDirs = retained.values.map { it.writer.sessionDir }.toSet(),
+                )
+                retained.remove(c.channelId)?.let { releaseRetained(it, "replaced by mini close keep") }
+                val session = RetainedSession(
+                    channelId = c.channelId,
+                    channelName = c.channelName,
+                    logoUrl = c.logoUrl?.takeIf { it.isNotBlank() },
+                    sinceMs = System.currentTimeMillis(),
+                    url = c.url,
+                    headers = c.headers,
+                    writer = writer,
+                )
+                retained[c.channelId] = session
+                evictPastCap(keepCount)
+                startRetainedFill(session)
+                publishRetained()
+                Log.i(APP_TAG, "[RETAIN] kept on close: ${c.channelName} (mini, via $via)")
+            }.onFailure { Log.w(TAG, "mini close keep failed: $it") }
+        }
+    }
+
+    /**
+     * While playback is ON the buffer, the shared player's live
+     * connection (which carries the tee) is closed, so the buffer
+     * would stop growing exactly when the user needs it to keep
+     * rolling. This independent filler streams the SAME live URL into
+     * the writer for the duration of the timeshift. It starts when
+     * playback enters the buffer and stops on Go Live, so the
+     * provider sees one active stream at a time (modulo a sub-second
+     * splice overlap), which matters for single-connection accounts.
+     */
+    private fun startIndependentFill() {
+        val playing = currentPlayUrlProvider?.invoke()
+            ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        val url = playing ?: liveUrl ?: return
+        if (playing != null && playing != liveUrl) {
+            Log.i(TAG, "fill using player's active URL (failover happened since tune)")
+        }
+        val writer = activeWriter ?: return
+        if (fillJob?.isActive == true) return
+        // New connection joining the proxy mid-packet: realign before
+        // its bytes land in the buffer.
+        writer.markDiscontinuity()
+        fillJob = fillScope.launch {
+            try {
+                val req = Request.Builder().url(url).apply {
+                    liveHeaders.forEach { (k, v) -> header(k, v) }
+                }.build()
+                val call = fillClient.newCall(req)
+                fillCall = call
+                call.execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.w(TAG, "fill connect failed http=${resp.code}")
+                        return@use
+                    }
+                    val src = resp.body?.byteStream() ?: return@use
+                    val buf = ByteArray(64 * 1024)
+                    while (currentCoroutineContext().isActive && !writer.closed) {
+                        val n = src.read(buf)
+                        if (n < 0) break
+                        // appendFill, not append: nothing renders off this
+                        // thread, so it waits for the writer instead of
+                        // punching holes in the buffer when the server's
+                        // join backlog arrives far faster than live (GH #55).
+                        if (n > 0) writer.appendFill(buf, 0, n)
+                    }
+                }
+            } catch (t: Throwable) {
+                if (fillJob?.isActive == true) Log.w(TAG, "fill stream error: $t")
+            }
+            Log.i(TAG, "independent fill ended")
+        }
+        Log.i(TAG, "independent fill started")
+    }
+
+    /** The filler's in-flight OkHttp call. Cancelled explicitly on stop:
+     *  a coroutine cancel alone is cooperative and the blocking
+     *  `src.read` otherwise held the provider connection open (alongside
+     *  the fresh live one) until the 60s read timeout. */
+    @Volatile private var fillCall: okhttp3.Call? = null
+
+    private fun stopIndependentFill() {
+        adoptedSession?.let {
+            adoptedSession = null
+            stopRetainedFill(it)
+        }
+        fillCall?.cancel()
+        fillCall = null
+        fillJob?.cancel()
+        fillJob = null
+        pauseFillJob?.cancel()
+        pauseFillJob = null
+    }
+
+    private var pauseFillJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Cable-seamless pause: the player just pauses (no source switch)
+     * and, because this is a LIVE stream, ExoPlayer keeps downloading at
+     * 1x into its read-ahead - the tee stays at the live edge and keeps
+     * feeding the buffer until maxBuffer fills (tens of seconds), or
+     * until the server kicks the idle client. The old fixed 8s delay
+     * started the filler while the tee was still reading, so BOTH
+     * connections interleaved appends into the same buffer (GH #51
+     * corruption) and the filler's server-side replay landed tens of MB
+     * behind the head. Now the filler starts only when bytes actually
+     * STOP arriving (head idle > 4s): no double-feed, and the splice
+     * overlap shrinks to the server's small join replay, which the
+     * writer's trimmer removes.
+     */
+    fun onLivePaused() {
+        if (pauseFillJob?.isActive == true || fillJob?.isActive == true) return
+        pauseFillJob = scope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(2_000)
+                val w = activeWriter ?: return@launch
+                if (w.closed || fillJob?.isActive == true) return@launch
+                if (System.currentTimeMillis() - w.headWallMs > 4_000) break
+            }
+            // Serial scope: this cannot interleave with a Main-thread
+            // rewind press starting its own filler (double-fill race).
+            startIndependentFill()
+        }
+    }
+
+    /** Short pause resumed on the untouched live pipeline: the tee is
+     *  reading again; retire the filler (it may not have started). If the
+     *  filler DID run (a media-key resume after a long pause, GH #51),
+     *  the tee's next append follows the filler's bytes from a different
+     *  connection - mark the splice so the writer realigns and trims. */
+    fun onLiveResumedAtEdge() {
+        scope.launch {
+            val fillerRan = fillJob?.isActive == true
+            stopIndependentFill()
+            if (fillerRan) activeWriter?.markDiscontinuity()
+        }
+    }
+
+    /** Playback switched onto the buffer at [atWallMs]. */
+    fun onEnterTimeshift(atWallMs: Long) {
+        val w = activeWriter ?: return
+        scope.launch {
+            // Retire a pending pause-stall watcher (its job is starting
+            // the SAME filler); a filler already running keeps running.
+            pauseFillJob?.cancel()
+            pauseFillJob = null
+            startIndependentFill()
+        }
+        _state.update {
+            it.copy(
+                timeshifting = true,
+                baseWallMs = atWallMs,
+                tailWallMs = w.tailWallMs,
+                headWallMs = w.headWallMs,
+            )
+        }
+    }
+
+    /** Playback returned to the direct live stream. */
+    fun onGoLive() {
+        scope.launch { stopIndependentFill() }
+        _state.update { it.copy(timeshifting = false, baseWallMs = 0) }
+    }
+
+    /** Poll tick from the chrome while visible: refresh window bounds. */
+    fun refreshWindow() {
+        val w = activeWriter ?: return
+        if (w.closed) {
+            // Disk-full (or any write failure) self-closed the writer;
+            // stop advertising a rewind window that can no longer grow.
+            _state.update { it.copy(buffering = false, timeshifting = false) }
+            return
+        }
+        _state.update { it.copy(tailWallMs = w.tailWallMs, headWallMs = w.headWallMs) }
+    }
+
+    private fun stopSessionInternal() {
+        stopIndependentFill()
+        val finished = activeWriter
+        finished?.close()
+        activeWriter = null
+        currentChannelId = null
+        currentChannelName = null
+        // Discord (di5cord20, Formuler Z11): app storage past 3 GB. A closed
+        // session's directory is DEAD BYTES - every read path in
+        // TimeshiftDataSources goes through writerProvider(), i.e. the ACTIVE
+        // writer, and startSession() always mints a fresh `sess_<now>` dir, so
+        // nothing in the app can open a session again once it has ended. They
+        // were nevertheless kept for the full FIXED_RETENTION_MS hour and
+        // measured against a "budget" of totalBytes() + (free - 2 GB), which on
+        // a box with a large disk is not a budget at all. Every channel change
+        // therefore stranded up to a depth's worth of transport stream - 30
+        // minutes of HD runs to a gigabyte or two - for an hour, on the slow
+        // eMMC of exactly the devices least able to afford it.
+        //
+        // Delete it here instead. No feature is lost, because no feature could
+        // ever have used it. pruneExpired/enforceBudget stay as the
+        // crash-recovery net for a process that dies mid-session, which is now
+        // the only way a directory can be left behind.
+        //
+        // Deleting files another thread may still hold open is safe here: the
+        // unlink leaves existing descriptors valid, so a data source racing the
+        // teardown reads to its natural end instead of faulting.
+        finished?.let { w ->
+            runCatching {
+                if (w.sessionDir.deleteRecursively()) {
+                    Log.i(TAG, "released buffer ${w.sessionDir.name}")
+                }
+            }.onFailure { Log.w(TAG, "session cleanup failed: $it") }
+        }
+    }
+}

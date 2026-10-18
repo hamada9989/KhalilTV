@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Launcher background. Matches iOS AppIcon's deep-navy backdrop
+        (`#0A1628` from Aerio/Design/ThemeManager.swift's `appBackground`)
+        so the Android adaptive-icon background tile reads as the same
+        brand surface as the iOS home-screen tile.
+    -->
+    <color name="launcher_background">#0A1628</color>
+</resources>

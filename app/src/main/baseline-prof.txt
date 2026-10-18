@@ -1,0 +1,102 @@
+# ART baseline profile rules. Methods matched here are AOT-compiled by
+# ProfileInstaller at install time (via the binary profile AGP bundles into
+# assets/dexopt/baseline.prof), so they run as native code instead of
+# interpreter -> JIT. This eliminates the press-to-action lag on low-end TV
+# boxes (e.g. Google TV Streamer) where guide/list/player navigation would
+# otherwise run interpreted on a cold install.
+#
+# FORMAT
+#   Each line is a profgen "human readable profile" rule:
+#     <flags>L<class-glob>-><method-glob>(<param-glob>)<return-glob>
+#   Flags: H = hot (AOT-compile the method), S = startup, P = post-startup.
+#   Wildcards: `*` matches within a name segment; `**` matches ACROSS package
+#   separators (`/`) AND nested/synthetic-class separators (`$`). The class
+#   subtree form `Lpkg/**` (no trailing `;`) plus `->**(**)**` matches every
+#   method of every class under that package, INCLUDING the synthetic lambda
+#   classes the Kotlin/Compose compiler generates per composable
+#   (e.g. GuideScreenKt$GuideContent$1$2, ComposableSingletons$GuideScreenKt).
+#
+# WHY THE OLD PROFILE WAS INADEQUATE
+#   It listed exact classes like `LGuideScreenKt;->**(**)**`, which match the
+#   top-level class but NOT the synthetic lambda classes that hold the bulk of
+#   composable bodies. It also assumed framework (Compose/coroutine/collection)
+#   coverage was handled entirely by the libraries' own bundled profiles. On
+#   this app's specific guide-grid + D-pad-focus hot path that left the
+#   per-frame navigation code interpreted. AGP's profgen expands the globs
+#   below against the MERGED dex (app + every dependency dexed into the APK),
+#   so framework subtrees listed here are resolved to concrete methods at
+#   build time -- it does NOT only accept the app's own classes.
+#
+# Coverage is intentionally broad over the rendering/navigation-critical
+# subtrees rather than narrowly enumerated: on a dedicated TV box the modestly
+# larger install-time dexopt is an acceptable trade for guaranteeing that no
+# guide/list/player navigation code path runs interpreted.
+
+# ---------------------------------------------------------------------------
+# App code -- ALL of it, including every composable's synthetic lambda classes,
+# ViewModels, repositories, preferences, playback holders and DB wrappers.
+# The `**` crosses `$`, so GuideScreenKt$... ProgrammeCell lambdas, etc. are
+# all covered (the single biggest gap in the previous profile).
+# ---------------------------------------------------------------------------
+HSPLcom/aeriotv/android/**->**(**)**
+
+# ---------------------------------------------------------------------------
+# Jetpack Compose runtime -- recomposer, snapshot system, Composer, State,
+# SnapshotStateList/Map, derivedStateOf. Runs on every recomposition, i.e.
+# every D-pad focus move in the guide.
+# ---------------------------------------------------------------------------
+HSPLandroidx/compose/runtime/**->**(**)**
+
+# Compose foundation -- LazyColumn/LazyRow item composition + measurement,
+# scroll state, gesture/focus handling, background/border/clip modifiers.
+HSPLandroidx/compose/foundation/**->**(**)**
+
+# Compose UI core -- layout nodes, modifier chain resolution, focus traversal,
+# semantics, graphics layers, text layout, key/input event dispatch.
+HSPLandroidx/compose/ui/**->**(**)**
+
+# Compose Material3 + Material + animation -- widgets, the focus-scale
+# animations used throughout the TV chrome, and the material-icons-extended
+# vector assets the guide cell menus / chrome build during composition (these
+# live under androidx.compose.material.icons, NOT material3).
+HSPLandroidx/compose/material3/**->**(**)**
+HSPLandroidx/compose/material/**->**(**)**
+HSPLandroidx/compose/animation/**->**(**)**
+
+# androidx.tv Material/Foundation -- the TV-specific components the guide,
+# pills and cards are built from.
+HSPLandroidx/tv/**->**(**)**
+
+# androidx.collection -- ScatterMap/ObjectList et al. that Compose's runtime
+# and layout lean on heavily per frame.
+HSPLandroidx/collection/**->**(**)**
+
+# Lifecycle -- collectAsStateWithLifecycle, ViewModel, repeatOnLifecycle that
+# feed guide/list state into composition.
+HSPLandroidx/lifecycle/**->**(**)**
+
+# Navigation-Compose -- route changes when opening the player / switching tabs.
+HSPLandroidx/navigation/**->**(**)**
+
+# DataStore -- preference reads that gate guide layout (scale, tints, groups).
+HSPLandroidx/datastore/**->**(**)**
+
+# ---------------------------------------------------------------------------
+# Kotlin coroutines + the kotlin stdlib. The guide leans on stdlib collection/
+# sequence/text/comparison/range ops every frame for filtering, sorting,
+# grouping, time formatting and StateFlow plumbing; covering the whole stdlib
+# (it is small relative to Compose) closes the gap to full-AOT smoothness.
+# ---------------------------------------------------------------------------
+HSPLkotlinx/coroutines/**->**(**)**
+HSPLkotlin/**->**(**)**
+
+# ---------------------------------------------------------------------------
+# Coil 3 -- channel/programme logo loading shown inline in the guide rows.
+# ---------------------------------------------------------------------------
+HSPLcoil3/**->**(**)**
+
+# ---------------------------------------------------------------------------
+# Media3 ExoPlayer -- the persistent player window is built eagerly in the main
+# scaffold and entered from the guide; keep its setup/render path native.
+# ---------------------------------------------------------------------------
+HSPLandroidx/media3/**->**(**)**

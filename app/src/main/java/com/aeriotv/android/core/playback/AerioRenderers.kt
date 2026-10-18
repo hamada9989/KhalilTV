@@ -1,0 +1,921 @@
+package com.aeriotv.android.core.playback
+
+import android.content.Context
+import android.os.Handler
+import androidx.annotation.OptIn
+import androidx.media3.common.Format
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.RendererCapabilities
+import androidx.media3.exoplayer.DecoderReuseEvaluation
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.Renderer
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.ForwardingAudioSink
+import androidx.media3.exoplayer.mediacodec.MediaCodecAdapter
+import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer
+import androidx.media3.exoplayer.video.VideoRendererEventListener
+
+/**
+ * Shared renderers factory for every player in the app (live holder, VOD,
+ * multiview tiles). Two deviations from stock, each gated by a flag:
+ *
+ * [audioPassthrough] false (the default preference) builds the audio sink
+ * with PCM-only capabilities, so surround bitstreams (AC-3/E-AC-3) are decoded
+ * in-app (AC-3 and E-AC-3 by MediaCodec or the bundled FFmpeg decoder)
+ * and the display receives plain PCM on the standard
+ * latency-compensated path. Many TVs decode a passthrough bitstream with
+ * latency Android reports as zero, which the player cannot compensate;
+ * the visible symptom is lip-sync drift on live TV. True restores the
+ * stock sink (bitstream rides HDMI untouched, 5.1 preserved).
+ * API gotcha: the Context overload of [DefaultAudioSink.Builder] IGNORES
+ * setAudioCapabilities (it installs its own AudioCapabilitiesReceiver), so
+ * the deprecated no-context Builder is the one that actually honors a
+ * forced capability set.
+ *
+ * [forceVideoCodecReinit] true (live holder only) vetoes VIDEO decoder
+ * reuse across media-item transitions, so every channel switch re-creates
+ * the codec against the current surface. Some Codec2 video decoders
+ * (observed: c2.exynos.h264.decoder, Samsung phone, GitHub black-screen
+ * report on 0.2.7) come out of Media3's flush-and-reuse path decoding but
+ * never rendering: audio plays, the screen stays black, and only an app
+ * restart recovers. The re-init path is the one that works on every
+ * device in the user log; audio codec reuse is untouched, so switches
+ * stay snappy.
+ */
+@OptIn(UnstableApi::class)
+fun aerioRenderersFactory(
+    context: Context,
+    audioPassthrough: Boolean,
+    forceVideoCodecReinit: Boolean = false,
+    // On-demand path only (VOD + DVR recordings): prefer the bundled FFmpeg
+    // audio decoder over the platform MediaCodec one. GH #45 - some devices'
+    // hardware AAC decoder (Hisense/MediaTek c2.android.aac.decoder) throws a
+    // RUNTIME CodecException 0xe on HE-AAC (AAC+SBR) recordings that ffmpeg
+    // decodes fine. enableDecoderFallback can't rescue a post-STARTED runtime
+    // failure and never crosses to the separate FFmpeg renderer, so the player
+    // fatals + retries the same broken decoder. PREFER routes AAC (and AC-3,
+    // which this path already PCM-decodes with passthrough off) to FFmpeg
+    // first. E-AC-3/DTS/TrueHD are NOT in the bundled FFmpeg build any more
+    // back in the bundled FFmpeg build since 2026-09-14, along with aac, so on
+    // this path the FFmpeg renderer claims them first. That is what fixes the
+    // Shield E-AC-3 VOD silence, where the platform decoder offers bitstream
+    // only and the forced-PCM sink cannot use it, and it restores the original
+    // GH #45 HE-AAC routing described above.
+    // Scoped to on-demand so live TV's 24/7 hardware-first audio
+    // is untouched; a single finite VOD stream is a few % of one core, video
+    // stays hardware-decoded. MUST stay false for the live holder + multiview.
+    preferSoftwareAudio: Boolean = false,
+    // Multiview tiles only: a gate that swallows audio while the tile is not
+    // the audio-focused one, so the audio TRACK stays selected (no track
+    // re-selection, no source re-load on a focus switch) while no AudioTrack
+    // exists and the tile's clock runs off the wall clock like a muted tile.
+    tileAudioGate: TileAudioGate? = null,
+    // Composited Multiview cast tiles only (2026-10-06): replaces the gated
+    // tile sink around the PCM tile sink (see CompositeTapAudioSink). Needs
+    // [tileAudioGate] non-null so the audio renderer stays clockless.
+    tileAudioSinkWrapper: ((AudioSink) -> AudioSink)? = null,
+): DefaultRenderersFactory {
+    val factory = object : DefaultRenderersFactory(context) {
+        override fun buildAudioSink(
+            context: Context,
+            enableFloatOutput: Boolean,
+            enableAudioTrackPlaybackParams: Boolean,
+        ): AudioSink? {
+            if (tileAudioGate != null) {
+                @Suppress("DEPRECATION")
+                val tileSink = DefaultAudioSink.Builder()
+                    .setAudioCapabilities(AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .build()
+                tileAudioSinkWrapper?.let { return it(tileSink) }
+                return GatedTileAudioSink(AudioSyncShiftSink(PtsSmoothingAudioSink(tileSink)), tileAudioGate)
+            }
+            if (audioPassthrough) {
+                android.util.Log.i("AerioPlayerDiag", "audio sink -> stock context sink (passthrough on)")
+                return super.buildAudioSink(context, enableFloatOutput, enableAudioTrackPlaybackParams)
+                    ?.let { AudioSyncShiftSink(it) }
+            }
+            android.util.Log.i("AerioPlayerDiag", "audio sink -> forced-PCM no-context sink + PTS-smoothing (passthrough off)")
+            @Suppress("DEPRECATION")
+            val pcmSink = DefaultAudioSink.Builder()
+                .setAudioCapabilities(AudioCapabilities.DEFAULT_AUDIO_CAPABILITIES)
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .build()
+            return AudioSyncShiftSink(PtsSmoothingAudioSink(pcmSink))
+        }
+
+        override fun buildAudioRenderers(
+            context: Context,
+            extensionRendererMode: Int,
+            mediaCodecSelector: MediaCodecSelector,
+            enableDecoderFallback: Boolean,
+            audioSink: AudioSink,
+            eventHandler: Handler,
+            eventListener: androidx.media3.exoplayer.audio.AudioRendererEventListener,
+            out: ArrayList<Renderer>,
+        ) {
+            if (tileAudioGate == null) {
+                // Stock build first (it also appends the bundled FFmpeg audio
+                // renderer, and its ORDER carries the PREFER/ON semantics), then
+                // swap the platform MediaCodec audio renderer in place for our
+                // subclass so every path gets the 0-channel AAC workaround.
+                val stock = ArrayList<Renderer>()
+                super.buildAudioRenderers(context, extensionRendererMode, mediaCodecSelector, enableDecoderFallback, audioSink, eventHandler, eventListener, stock)
+                for (renderer in stock) {
+                    if (renderer.javaClass == androidx.media3.exoplayer.audio.MediaCodecAudioRenderer::class.java) {
+                        out.add(
+                            AerioMediaCodecAudioRenderer(
+                                context, codecAdapterFactory, mediaCodecSelector,
+                                enableDecoderFallback, eventHandler, eventListener, audioSink,
+                                clockless = false,
+                            ),
+                        )
+                    } else if (renderer.javaClass == androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer::class.java) {
+                        out.add(MimeGuardRenderer(renderer, clockless = false))
+                    } else {
+                        out.add(renderer)
+                    }
+                }
+                return
+            }
+            // Multiview tile: the audio renderer is NOT a media clock. The tile
+            // runs on ExoPlayer's standalone clock in every state, which is the
+            // clock a tile with no audio track uses (measured smooth on the
+            // Streamer), so muting or unmuting the sink never changes the
+            // clock and never re-selects tracks. The audible tile's sink plays
+            // at the standalone clock's pace; the sync error is bounded by the
+            // AudioTrack start latency, which multiview tolerates.
+            out.add(
+                AerioMediaCodecAudioRenderer(
+                    context, codecAdapterFactory, mediaCodecSelector,
+                    enableDecoderFallback, eventHandler, eventListener, audioSink,
+                    clockless = true,
+                ),
+            )
+            // The bundled FFmpeg renderer behind it, clockless too, exactly
+            // as the live player has it behind the platform renderer
+            // (EXTENSION_RENDERER_MODE_ON). Without it a tile whose audio the
+            // platform cannot decode to PCM (AC-3 on phones with no AC-3
+            // MediaCodec decoder, e.g. the Nothing Phone) had NO audio
+            // renderer: the track stayed unplayed, no PCM ever reached the
+            // tile sink, and the composite cast carried only generated
+            // silence (Nothing Phone log 2026-10-08 14:35: three ESPN tiles,
+            // three video decoders, zero audio decoders created).
+            out.add(MimeGuardRenderer(androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer(eventHandler, eventListener, audioSink), clockless = true))
+        }
+
+        override fun buildVideoRenderers(
+            context: Context,
+            extensionRendererMode: Int,
+            mediaCodecSelector: MediaCodecSelector,
+            enableDecoderFallback: Boolean,
+            eventHandler: Handler,
+            eventListener: VideoRendererEventListener,
+            allowedVideoJoiningTimeMs: Long,
+            out: ArrayList<Renderer>,
+        ) {
+            // Always our subclass: it carries the Dolby Vision base-layer
+            // fallback, which every playback path needs, and vetoes codec
+            // reuse only when asked. Mirror of the stock platform renderer
+            // construction; no video extension renderers are bundled in this
+            // app, so skipping the extension lookup super would do loses
+            // nothing.
+            out.add(
+                AerioMediaCodecVideoRenderer(
+                    context,
+                    codecAdapterFactory,
+                    mediaCodecSelector,
+                    allowedVideoJoiningTimeMs,
+                    enableDecoderFallback,
+                    eventHandler,
+                    eventListener,
+                    MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY,
+                    vetoCodecReuse = forceVideoCodecReinit,
+                ),
+            )
+        }
+    }
+    return factory
+        .setEnableDecoderFallback(true)
+        // EXTENSION_RENDERER_MODE_ON (live + multiview default): the bundled
+        // FFmpeg audio renderer sits AFTER the platform MediaCodec renderers, so
+        // hardware decoders stay primary and FFmpeg is used only as a fallback
+        // for formats the device can't decode in hardware -- notably AC-3 and
+        // MP2 on broadcast (ATSC) channels, which cheaper boxes like the
+        // Chromecast with Google TV have no MediaCodec decoder for.
+        //
+        // E-AC-3, DTS and TrueHD are back in the bundled FFmpeg build as of
+        // 2026-09-14, matching what VLC and Kodi ship. They had been removed on
+        // 2026-09-11; the regression that brought them back: Shield TV, VOD
+        // with E-AC-3 5.1 and Surround Sound Passthrough OFF played video with
+        // silent audio. With passthrough off the sink is forced to PCM-only
+        // capabilities, and the Shield platform decoder exposes E-AC-3 for
+        // BITSTREAM only, so MediaCodecAudioRenderer declines the format and it
+        // falls through to the FFmpeg renderer behind it -- which no longer had
+        // an eac3 decoder and declined it too, leaving the track with NO
+        // renderer. Hardware still wins whenever it can actually produce PCM;
+        // FFmpeg only picks up what the platform refuses. AAC came back on
+        // 2026-09-14 too (it had been dropped 2026-09-12), so the bundled build
+        // is now aac, ac3, eac3, dca, truehd, mlp, mp2, mp3, flac, alac. On
+        // THIS path that changes nothing for AAC: the platform AAC decoder is
+        // ahead of FFmpeg and every supported device has one, so live AAC still
+        // decodes in hardware. Anything with neither a hardware nor a bundled
+        // software decoder plays silent and logs the unsupported audio group
+        // (GH #8 diagnostic in AerioExoPlayerHolder), alongside the always-on
+        // "audio renderer -> ..." line that names the renderer that won.
+        // Routing ALL
+        // audio through the software decoder 24/7 would waste CPU on formats the
+        // hardware handles fine, so live stays hardware-first.
+        //
+        // EXTENSION_RENDERER_MODE_PREFER (on-demand only, preferSoftwareAudio):
+        // FFmpeg audio renderer goes FIRST. This was originally how GH #45 was
+        // fixed: the bundled FFmpeg build enabled `aac`, so the software
+        // renderer claimed AAC (incl. HE-AAC/SBR) ahead of the quirky hardware
+        // AAC decoders that failed to decode those recordings.
+        //
+        // The 2026-09-12 codec trim had dropped `aac`, which suspended that fix
+        // and left HE-AAC on-demand recordings on the device's hardware AAC
+        // decoder. The 2026-09-14 rebuild restored `aac` along with eac3, dca,
+        // truehd and mlp, so PREFER once again does exactly what GH #45 needed:
+        // the software renderer claims AAC ahead of the quirky hardware ones.
+        //
+        // So on this path FFmpeg gets first claim on everything it carries
+        // (aac, ac3, eac3, dca, truehd, mlp, mp2, mp3, flac, alac) for
+        // on-demand files, where a software decode is cheap and more
+        // predictable than a marginal hardware one, and a finite VOD stream
+        // costs a few % of one core. Only Opus and Vorbis, which the build does
+        // not carry, fall through to hardware here. No passthrough regression
+        // because the on-demand path already forces a PCM sink
+        // (audioPassthrough=false); if a "bitstream to receiver" option is ever
+        // added to VOD, revisit this.
+        .setExtensionRendererMode(
+            if (preferSoftwareAudio) DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
+            else DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON,
+        )
+}
+
+/**
+ * Task #184: session-wide user audio sync offset (positive = audio later),
+ * mirrored on iOS/tvOS as mpv's audio-delay. Shared by every player built
+ * from [aerioRenderersFactory] and reset only on app restart - matching
+ * the Apple side, where the offset lives on the warm mpv instance. Not
+ * persisted to disk.
+ */
+object AudioSyncOffset {
+    const val MIN_MS = -1000L
+    const val MAX_MS = 1000L
+
+    @Volatile
+    var offsetMs: Long = 0L
+        set(value) {
+            field = value.coerceIn(MIN_MS, MAX_MS)
+        }
+}
+
+/**
+ * Task #184: applies [AudioSyncOffset] by shifting the position the audio
+ * sink reports. The audio renderer is the player's MediaClock, so video
+ * release timing follows the reported audio position: inflating it by X
+ * makes video run X early, i.e. audio plays X LATER relative to video
+ * (positive = audio later, matching mpv audio-delay). ExoPlayer has no
+ * first-class audio-delay knob; this clock shift is the established
+ * Media3 pattern. Changes mid-playback re-sync within a frame or two.
+ */
+@OptIn(UnstableApi::class)
+private class AudioSyncShiftSink(sink: AudioSink) : ForwardingAudioSink(sink) {
+    override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
+        val p = super.getCurrentPositionUs(sourceEnded)
+        if (p == AudioSink.CURRENT_POSITION_NOT_SET) return p
+        return (p + AudioSyncOffset.offsetMs * 1000L).coerceAtLeast(0L)
+    }
+}
+
+/**
+ * Wraps the forced-PCM audio sink to absorb the periodic ~1s output-PTS jumps
+ * the FFmpeg AC-3 decoder emits on live single-PMT MPEG-TS (it was first seen
+ * on E-AC-3 too, back when that decoder was bundled). Root cause
+ * (verified against media3 1.4.1 DefaultAudioSink.handleBuffer): when the
+ * incoming presentationTimeUs diverges from the sink's frame-derived expected by
+ * more than a hardcoded 200ms, the sink drains the AudioTrack to re-sync, which
+ * underruns it; since the audio renderer is the MediaClock, the player stalls
+ * READY -> BUFFERING for 2-4s and flushes the video codec. There is no public
+ * knob to widen that 200ms gate, and the UnexpectedDiscontinuityException is
+ * log-only (never thrown), so catching it does nothing. Instead we keep the
+ * OUTPUT timeline continuous: on a spurious forward jump (>=150ms and <=1.5s) we
+ * advance the rewritten PTS by the last NORMAL inter-buffer cadence instead of
+ * the jump, so the gate never trips. Normal buffers, backward jumps, and real
+ * gaps (>1.5s) pass through untouched, so it is a structural no-op for VOD and
+ * multiview (continuous timestamps) and for passthrough (this wrapper isn't used
+ * when passthrough is on). State resets on configure/flush/reset/discontinuity so
+ * a genuine seek is never mis-corrected. Position reporting is unaffected (the
+ * sink derives it from AudioTrack frames, not from our rewrite).
+ */
+@OptIn(UnstableApi::class)
+private class PtsSmoothingAudioSink(sink: AudioSink) : ForwardingAudioSink(sink) {
+    private var hasLast = false
+    private var lastInUs = 0L
+    private var lastOutUs = 0L
+    private var lastNormalDeltaUs = -1L // -1 until we have seen a normal cadence
+
+    override fun handleBuffer(
+        buffer: java.nio.ByteBuffer,
+        presentationTimeUs: Long,
+        encodedAccessUnitCount: Int,
+    ): Boolean {
+        val outUs: Long = if (!hasLast) {
+            presentationTimeUs // first buffer: anchor the output timeline to the real PTS
+        } else {
+            val deltaIn = presentationTimeUs - lastInUs
+            val effectiveDelta =
+                if (lastNormalDeltaUs >= 0 && deltaIn in TRIP_THRESHOLD_US..MAX_SWALLOW_US) {
+                    lastNormalDeltaUs // spurious jump -> advance by the normal cadence
+                } else {
+                    deltaIn // normal increment, backward jump, or real large gap
+                }
+            lastOutUs + effectiveDelta
+        }
+        val ok = super.handleBuffer(buffer, outUs, encodedAccessUnitCount)
+        // Advance state only when the buffer was accepted; on a partial/false return
+        // the same buffer is re-submitted and must map to the same rewritten PTS.
+        if (ok) {
+            if (hasLast) {
+                val deltaIn = presentationTimeUs - lastInUs
+                if (deltaIn in 0 until TRIP_THRESHOLD_US) lastNormalDeltaUs = deltaIn
+            }
+            lastInUs = presentationTimeUs
+            lastOutUs = outUs
+            hasLast = true
+        }
+        return ok
+    }
+
+    override fun configure(inputFormat: Format, specifiedBufferSize: Int, outputChannels: IntArray?) {
+        resetSmoothing()
+        super.configure(inputFormat, specifiedBufferSize, outputChannels)
+    }
+
+    override fun flush() { resetSmoothing(); super.flush() }
+
+    override fun reset() { resetSmoothing(); super.reset() }
+
+    override fun handleDiscontinuity() { resetSmoothing(); super.handleDiscontinuity() }
+
+    private fun resetSmoothing() {
+        hasLast = false
+        lastInUs = 0L
+        lastOutUs = 0L
+        lastNormalDeltaUs = -1L
+    }
+
+    companion object {
+        // Below the sink's hardcoded 200ms re-sync gate, so we pre-empt it.
+        private const val TRIP_THRESHOLD_US = 150_000L
+        // Cap: only absorb the known ~1s muxer hiccups; larger = a real gap, pass through.
+        private const val MAX_SWALLOW_US = 1_500_000L
+    }
+}
+
+/**
+ * MediaCodecVideoRenderer that downgrades every would-be codec reuse to a
+ * full re-initialisation. See [aerioRenderersFactory]: flush-and-reuse on
+ * some Codec2 decoders produces a decoder that runs but never renders
+ * (black screen with audio after a live channel switch).
+ */
+@OptIn(UnstableApi::class)
+private class AerioMediaCodecVideoRenderer(
+    context: Context,
+    codecAdapterFactory: MediaCodecAdapter.Factory,
+    mediaCodecSelector: MediaCodecSelector,
+    allowedJoiningTimeMs: Long,
+    enableDecoderFallback: Boolean,
+    eventHandler: Handler?,
+    eventListener: VideoRendererEventListener?,
+    maxDroppedFramesToNotify: Int,
+    private val vetoCodecReuse: Boolean,
+) : MediaCodecVideoRenderer(
+    context,
+    codecAdapterFactory,
+    mediaCodecSelector,
+    allowedJoiningTimeMs,
+    enableDecoderFallback,
+    eventHandler,
+    eventListener,
+    maxDroppedFramesToNotify,
+) {
+    /**
+     * Dolby Vision base-layer fallback.
+     *
+     * Media3 1.4.1 substitutes an HEVC/H.264/AV1 decoder for the Dolby Vision
+     * profiles whose base layer is plainly backward compatible (DvheDtr,
+     * DvheSt, DvavSe, Dvav110 - see MediaCodecUtil.getAlternativeCodecMimeType)
+     * but deliberately NOT for dvhe.07 (DvheDtb), the dual-layer Blu-ray
+     * profile. On a device without a Dolby Vision decoder that leaves the video
+     * track with no decoder at all, so ExoPlayer drops it and plays the file as
+     * audio only. Measured on a Z Fold 5 with a 73 Mbps remux (HEVC Main 10
+     * 3840x2160 + TrueHD Atmos, DOVI profile 7, el_present_flag 1): audio
+     * played, the surface never received a frame, and no video codec was ever
+     * created.
+     *
+     * The base layer of these files is ordinary HEVC Main 10; the enhancement
+     * layer and RPU ride in NAL units a plain HEVC decoder ignores, which is
+     * exactly how mpv plays them on iOS. So when the stock path finds nothing,
+     * retry as if the track were HEVC. Colour may be slightly off versus true
+     * Dolby Vision output (the RPU is not applied), which is a better outcome
+     * than no picture.
+     *
+     * A device that HAS a Dolby Vision decoder fails the same file the other
+     * way round. The Google TV Streamer (MediaTek) accepts the track on
+     * c2.mtk.dvav.ser.decoder and then dies mid-decode with
+     * ERROR_CODE_DECODING_FAILED, because the shipping DV decoders target the
+     * single-layer profiles (5, 8, 9) and profile 7 carries a second layer
+     * they cannot consume. That is a RUNTIME failure, so neither the
+     * no-decoder fallback above nor Media3's enableDecoderFallback (which only
+     * covers decoder INITIALISATION) can rescue it.
+     *
+     * So profile 7 is special-cased: prefer the HEVC base layer even when the
+     * platform offers a Dolby Vision decoder, and keep that decoder as a last
+     * resort behind it. Profile 7 is a Blu-ray dual-layer format that Media3
+     * itself calls deprecated and not always backward compatible; a device
+     * that truly decodes it is not something any of these panels ship.
+     *
+     * Deliberately narrow: DV formats that are not profile 7 keep using the
+     * device decoder, and the fallback engages for them only when nothing
+     * else can decode the track.
+     */
+    private fun baseLayerFormatOrNull(format: Format): Format? {
+        if (!MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType, ignoreCase = true)) return null
+        return format.buildUpon()
+            .setSampleMimeType(MimeTypes.VIDEO_H265)
+            // The codecs string still says dvhe.*; clearing it stops the
+            // profile/level check from rejecting the HEVC decoder.
+            .setCodecs(null)
+            .build()
+    }
+
+    /**
+     * True for dual-layer Dolby Vision (profile 7). The codecs string is
+     * "dvhe.07.06" / "dvh1.07.06": the profile is the middle field. Absent or
+     * unparseable codecs means "not known to be profile 7", which keeps the
+     * device decoder in charge rather than guessing.
+     */
+    private fun isDolbyVisionProfile7(format: Format): Boolean {
+        if (!MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType, ignoreCase = true)) return false
+        val parts = format.codecs?.split('.') ?: return false
+        if (parts.size < 2) return false
+        return parts[1].trim().toIntOrNull() == 7
+    }
+
+    override fun supportsFormat(
+        mediaCodecSelector: MediaCodecSelector,
+        format: Format,
+    ): Int {
+        val support = super.supportsFormat(mediaCodecSelector, format)
+        if (RendererCapabilities.getFormatSupport(support) == androidx.media3.common.C.FORMAT_HANDLED) {
+            // Profile 7 reports handled on devices whose DV decoder then fails
+            // mid-decode, so answer for the decoder getDecoderInfos will
+            // actually hand back (the HEVC base layer) rather than for one we
+            // are about to skip.
+            if (isDolbyVisionProfile7(format)) {
+                val p7BaseLayer = baseLayerFormatOrNull(format)
+                if (p7BaseLayer != null) {
+                    val p7Support = super.supportsFormat(mediaCodecSelector, p7BaseLayer)
+                    if (RendererCapabilities.getFormatSupport(p7Support) ==
+                        androidx.media3.common.C.FORMAT_HANDLED
+                    ) {
+                        return p7Support
+                    }
+                }
+            }
+            return support
+        }
+        val baseLayer = baseLayerFormatOrNull(format) ?: return support
+        val fallback = super.supportsFormat(mediaCodecSelector, baseLayer)
+        if (RendererCapabilities.getFormatSupport(fallback) == androidx.media3.common.C.FORMAT_HANDLED) {
+            android.util.Log.i(
+                "AerioPlayerDiag",
+                "Dolby Vision without a DV decoder; decoding the HEVC base layer",
+            )
+            return fallback
+        }
+        return support
+    }
+
+    override fun getDecoderInfos(
+        mediaCodecSelector: MediaCodecSelector,
+        format: Format,
+        requiresSecureDecoder: Boolean,
+    ): List<MediaCodecInfo> {
+        val infos = super.getDecoderInfos(mediaCodecSelector, format, requiresSecureDecoder)
+        if (infos.isNotEmpty()) {
+            if (!isDolbyVisionProfile7(format)) return infos
+            val p7BaseLayer = baseLayerFormatOrNull(format) ?: return infos
+            val baseLayerInfos =
+                super.getDecoderInfos(mediaCodecSelector, p7BaseLayer, requiresSecureDecoder)
+            if (baseLayerInfos.isEmpty()) return infos
+            android.util.Log.i(
+                "AerioPlayerDiag",
+                "Dolby Vision Profile 7 is dual layer; decoding the HEVC base layer " +
+                    "ahead of the device DV decoder",
+            )
+            // Base layer first, the platform's own DV decoders behind it, so a
+            // device that really can decode profile 7 still has a route.
+            return baseLayerInfos + infos.filterNot { it in baseLayerInfos }
+        }
+        val baseLayer = baseLayerFormatOrNull(format) ?: return infos
+        return super.getDecoderInfos(mediaCodecSelector, baseLayer, requiresSecureDecoder)
+    }
+
+    override fun canReuseCodec(
+        codecInfo: MediaCodecInfo,
+        oldFormat: Format,
+        newFormat: Format,
+    ): DecoderReuseEvaluation {
+        val evaluation = super.canReuseCodec(codecInfo, oldFormat, newFormat)
+        // Stock already vetoed reuse (a real format/config change) -- respect it.
+        if (evaluation.result == DecoderReuseEvaluation.REUSE_RESULT_NO) return evaluation
+        // Android#133: a reused decoder keeps the output dataspace it was
+        // configured with (Shield OMX.Nvidia.h265.decode stayed ARBITRARY on an
+        // SDR -> HDR10 HEVC zap, washed-out picture). Any color difference, or
+        // an HEVC live zap where neither side declares color, re-inits.
+        CodecColorReuse.vetoReason(oldFormat, newFormat, liveChannelChange = vetoCodecReuse)?.let { why ->
+            android.util.Log.i("AerioPlayerDiag", "[TUNE] codec reuse vetoed: color $why (${codecInfo.name})")
+            return DecoderReuseEvaluation(
+                evaluation.decoderName,
+                oldFormat,
+                newFormat,
+                DecoderReuseEvaluation.REUSE_RESULT_NO,
+                DecoderReuseEvaluation.DISCARD_REASON_WORKAROUND,
+            )
+        }
+        if (!vetoCodecReuse) return evaluation
+        // Only the decoders that actually showed the flush-and-reuse black-screen
+        // (Exynos / Samsung C2 H.264, the 0.2.7 GitHub report) need the forced
+        // re-init. Forcing it EVERYWHERE re-instantiates the codec against the
+        // live persistent Surface every switch, which on MediaTek (c2.mtk.avc.
+        // decoder) bumps the C2 surface generation mid-stream and DECODE-FAILS
+        // (queueInputBuffer errno 14 after "discarded an unknown buffer"). So let
+        // every other vendor take Media3's stock flush-and-reuse path, which never
+        // re-attaches the surface (no generation bump, no race) and is also faster.
+        val name = codecInfo.name.lowercase()
+        val needsForcedReinit =
+            name.startsWith("c2.exynos.") ||
+            name.startsWith("omx.exynos.") ||
+            name.startsWith("omx.samsung.")
+        if (!needsForcedReinit) return evaluation
+        return DecoderReuseEvaluation(
+            evaluation.decoderName,
+            oldFormat,
+            newFormat,
+            DecoderReuseEvaluation.REUSE_RESULT_NO,
+            DecoderReuseEvaluation.DISCARD_REASON_WORKAROUND,
+        )
+    }
+}
+
+/**
+ * Audio renderer used by every player in the app (live holder, VOD, multiview
+ * tiles). Two deviations from stock:
+ *
+ * 1. Zero-channel AAC (Nothing Phone, Qualcomm yupik, 2026-09-11). Dispatcharr
+ *    transcodes some channels' audio to AAC, and a 5.1 source arrives as
+ *    mp4a.40.2 whose AudioSpecificConfig has channel_configuration 0, i.e. the
+ *    real layout rides in an in-band Program Config Element. The extractor then
+ *    reports Format.channelCount = 0 ("0ch 48000Hz support=HANDLED"), stock
+ *    copies that straight into MediaFormat.KEY_CHANNEL_COUNT, and this SoC's
+ *    MediaCodec AAC decoder refuses the configuration: ERROR_CODE_DECODING_FAILED
+ *    (4003) about 1.5s after the tune, on the decoder retry and the reload too.
+ *    Stereo (2ch) AAC on the same server plays fine. Fix: configure the decoder
+ *    with a placeholder channel count of 2 while leaving the CSD untouched, so
+ *    the decoder parses the PCE and reports the true layout in its OUTPUT
+ *    format, which is the format the audio sink is configured from. Deliberately
+ *    narrow: only AAC with a non-positive channel count is touched.
+ * 2. [clockless] (multiview tiles only) drops the media clock, so the tile runs
+ *    on ExoPlayer's standalone clock whether or not its sink is muted.
+ */
+/**
+ * Wraps the bundled FFmpeg audio renderer (final, so it cannot be subclassed).
+ *
+ * 1. MIME guard. media3's Ac3Reader emits a Format with a NULL sampleMimeType
+ *    when it parses an AC-3 header with fscod '11' ("do not decode"). Garbage
+ *    bytes that happen to carry the 0x0B77 sync word after an ingest gap or a
+ *    corrupt segment produce exactly that mid-stream. DecoderAudioRenderer then
+ *    tears the decoder down and builds a new FfmpegAudioDecoder from the null
+ *    MIME without re-checking support, and the constructor throws a
+ *    NullPointerException, which surfaces as a fatal player error (Nothing
+ *    Phone log 2026-10-11 15:46:24, composite tile ESPNU HD, E-AC-3 3 ch). The
+ *    wrapper hands the renderer a SampleStream that replaces any undecodable
+ *    format with the last decodable one, so the decoder is reused and the bad
+ *    access units that follow are dropped by the decoder itself (FFmpeg's
+ *    "Invalid data" result is a decode-only skip, not an error). A real
+ *    config change (new MIME, channels, rate) still passes through and
+ *    re-initializes the decoder as before.
+ * 2. [clockless] (Multiview tiles only): never offers the media clock, so a tile
+ *    keeps running on ExoPlayer's standalone clock whichever audio renderer
+ *    claims the track.
+ */
+@OptIn(UnstableApi::class)
+private class MimeGuardRenderer(
+    private val inner: Renderer,
+    private val clockless: Boolean,
+) : Renderer by inner {
+    private var original: androidx.media3.exoplayer.source.SampleStream? = null
+
+    override fun getMediaClock(): androidx.media3.exoplayer.MediaClock? =
+        if (clockless) null else inner.mediaClock
+    override fun getDurationToProgressUs(positionUs: Long, elapsedRealtimeUs: Long): Long =
+        inner.getDurationToProgressUs(positionUs, elapsedRealtimeUs)
+    override fun setPlaybackSpeed(currentPlaybackSpeed: Float, targetPlaybackSpeed: Float) =
+        inner.setPlaybackSpeed(currentPlaybackSpeed, targetPlaybackSpeed)
+    override fun enableMayRenderStartOfStream() = inner.enableMayRenderStartOfStream()
+    override fun release() = inner.release()
+
+    override fun enable(
+        configuration: androidx.media3.exoplayer.RendererConfiguration,
+        formats: Array<out Format>,
+        stream: androidx.media3.exoplayer.source.SampleStream,
+        positionUs: Long,
+        joining: Boolean,
+        mayRenderStartOfStream: Boolean,
+        startPositionUs: Long,
+        offsetUs: Long,
+        mediaPeriodId: androidx.media3.exoplayer.source.MediaSource.MediaPeriodId,
+    ) {
+        original = stream
+        inner.enable(
+            configuration, formats, GuardedSampleStream(stream, formats.firstOrNull { it.sampleMimeType != null }),
+            positionUs, joining, mayRenderStartOfStream, startPositionUs, offsetUs, mediaPeriodId,
+        )
+    }
+
+    override fun replaceStream(
+        formats: Array<out Format>,
+        stream: androidx.media3.exoplayer.source.SampleStream,
+        startPositionUs: Long,
+        offsetUs: Long,
+        mediaPeriodId: androidx.media3.exoplayer.source.MediaSource.MediaPeriodId,
+    ) {
+        original = stream
+        inner.replaceStream(
+            formats, GuardedSampleStream(stream, formats.firstOrNull { it.sampleMimeType != null }),
+            startPositionUs, offsetUs, mediaPeriodId,
+        )
+    }
+
+    // ExoPlayerImplInternal compares getStream() with the period's own stream by
+    // identity, so report the original, never the wrapper.
+    override fun getStream(): androidx.media3.exoplayer.source.SampleStream? =
+        if (inner.stream == null) null else original
+
+    override fun disable() { inner.disable(); original = null }
+    override fun reset() { inner.reset(); original = null }
+}
+
+@OptIn(UnstableApi::class)
+private class GuardedSampleStream(
+    private val inner: androidx.media3.exoplayer.source.SampleStream,
+    private var lastGood: Format?,
+) : androidx.media3.exoplayer.source.SampleStream by inner {
+    override fun readData(
+        formatHolder: androidx.media3.exoplayer.FormatHolder,
+        buffer: androidx.media3.decoder.DecoderInputBuffer,
+        readFlags: Int,
+    ): Int {
+        val result = inner.readData(formatHolder, buffer, readFlags)
+        if (result != androidx.media3.common.C.RESULT_FORMAT_READ) return result
+        val format = formatHolder.format ?: return result
+        if (format.sampleMimeType != null) { lastGood = format; return result }
+        val keep = lastGood
+        if (keep != null) {
+            android.util.Log.w("AerioPlayer", "[FFMPEG-AUDIO] undecodable format (null MIME) dropped, keeping ${keep.sampleMimeType} ${keep.channelCount} ch")
+            formatHolder.format = keep
+            return result
+        }
+        // No decodable format seen yet: discard what is buffered and wait.
+        android.util.Log.w("AerioPlayer", "[FFMPEG-AUDIO] undecodable first format (null MIME), skipping buffered audio")
+        formatHolder.format = null
+        inner.skipData(Long.MAX_VALUE)
+        return androidx.media3.common.C.RESULT_NOTHING_READ
+    }
+}
+
+@OptIn(UnstableApi::class)
+private class AerioMediaCodecAudioRenderer(
+    context: Context,
+    codecAdapterFactory: MediaCodecAdapter.Factory,
+    mediaCodecSelector: MediaCodecSelector,
+    enableDecoderFallback: Boolean,
+    eventHandler: Handler?,
+    eventListener: androidx.media3.exoplayer.audio.AudioRendererEventListener?,
+    audioSink: AudioSink,
+    private val clockless: Boolean,
+) : androidx.media3.exoplayer.audio.MediaCodecAudioRenderer(
+    context,
+    codecAdapterFactory,
+    mediaCodecSelector,
+    enableDecoderFallback,
+    eventHandler,
+    eventListener,
+    audioSink,
+) {
+    private var loggedZeroChannelKey: String? = null
+
+    override fun getMediaClock(): androidx.media3.exoplayer.MediaClock? =
+        if (clockless) null else super.getMediaClock()
+
+    override fun getMediaFormat(
+        format: Format,
+        codecMimeType: String,
+        codecMaxInputSize: Int,
+        codecOperatingRate: Float,
+    ): android.media.MediaFormat {
+        if (!isZeroChannelAac(format)) {
+            return super.getMediaFormat(format, codecMimeType, codecMaxInputSize, codecOperatingRate)
+        }
+        val key = "${format.sampleMimeType}/${format.sampleRate}/${format.id}"
+        if (loggedZeroChannelKey != key) {
+            loggedZeroChannelKey = key
+            android.util.Log.i(
+                "AerioExoPlayer",
+                "AAC track reports 0 channels (PCE layout); configuring decoder as stereo",
+            )
+        }
+        // Hand super a stereo-stamped Format so every derived value (the PCM
+        // float capability probe included) is computed from a legal channel
+        // count instead of 0; initializationData (the AudioSpecificConfig with
+        // channel_configuration 0) is carried through untouched.
+        val patched = format.buildUpon().setChannelCount(PLACEHOLDER_CHANNEL_COUNT).build()
+        val mediaFormat =
+            super.getMediaFormat(patched, codecMimeType, codecMaxInputSize, codecOperatingRate)
+        mediaFormat.setInteger(android.media.MediaFormat.KEY_CHANNEL_COUNT, PLACEHOLDER_CHANNEL_COUNT)
+        return mediaFormat
+    }
+
+    private fun isZeroChannelAac(format: Format): Boolean {
+        if (format.channelCount > 0) return false
+        val mime = format.sampleMimeType ?: return false
+        return MimeTypes.AUDIO_AAC.equals(mime, ignoreCase = true) ||
+            mime.startsWith("audio/mp4a", ignoreCase = true)
+    }
+
+    private companion object {
+        const val PLACEHOLDER_CHANNEL_COUNT = 2
+    }
+}
+
+/**
+ * Per-tile audio gate for multiview. [muted] is flipped from the main thread
+ * on audio-focus changes; the sink reads it on the playback thread.
+ */
+class TileAudioGate(initiallyMuted: Boolean) {
+    @Volatile var muted: Boolean = initiallyMuted
+}
+
+/**
+ * Multiview tile sink (2026-09-02). The tile keeps its audio track selected
+ * and decoding at all times; this sink decides what happens to the PCM:
+ *
+ * - muted: buffers are swallowed at real-time pace (no AudioTrack is ever
+ *   created) and the sink reports no position; the tile's audio renderer is
+ *   clockless (see buildAudioRenderers), so the tile runs on ExoPlayer's
+ *   standalone clock exactly as a tile with no audio track does (smooth).
+ * - audible: buffers go to the real [DefaultAudioSink] and its position
+ *   takes over once the AudioTrack has started.
+ *
+ * Flipping the gate never touches track selection, so ExoPlayer never
+ * re-selects tracks or re-loads the source (the freeze the old strategy had).
+ * Muting drains the real sink on the next playback-thread call.
+ */
+@OptIn(UnstableApi::class)
+private class GatedTileAudioSink(
+    sink: AudioSink,
+    private val gate: TileAudioGate,
+) : ForwardingAudioSink(sink) {
+    /** The real sink has received buffers since the last flush (an AudioTrack may exist). */
+    private var realActive = false
+    // Muted pacing: accept audio no faster than real time, like a real sink
+    // would, so the audio renderer neither drains the whole buffer ahead
+    // (which starves it and parks the player in BUFFERING) nor stalls.
+    private var playing = false
+    private var anchorPtsUs = AudioSink.CURRENT_POSITION_NOT_SET
+    private var anchorWallUs = 0L
+    private var endOfStream = false
+
+    private fun wallUs() = android.os.SystemClock.elapsedRealtime() * 1000L
+    private fun pacedNowUs(): Long =
+        if (anchorPtsUs == AudioSink.CURRENT_POSITION_NOT_SET) AudioSink.CURRENT_POSITION_NOT_SET
+        else if (playing) anchorPtsUs + (wallUs() - anchorWallUs) else anchorPtsUs
+    private fun reanchor(ptsUs: Long) { anchorPtsUs = ptsUs; anchorWallUs = wallUs() }
+
+    /** Playback thread: the gate closed while the real sink held audio; drop it. */
+    private fun drainRealIfMuted() {
+        if (gate.muted && realActive) {
+            super.pause()
+            super.flush()
+            realActive = false
+        }
+    }
+
+    override fun handleBuffer(buffer: java.nio.ByteBuffer, presentationTimeUs: Long, encodedAccessUnitCount: Int): Boolean {
+        drainRealIfMuted()
+        if (gate.muted) {
+            if (anchorPtsUs == AudioSink.CURRENT_POSITION_NOT_SET) reanchor(presentationTimeUs)
+            // Hold the buffer (not consumed) until its time is within a small
+            // cushion of the paced clock; the renderer retries on its next pass.
+            if (presentationTimeUs > pacedNowUs() + MUTED_CUSHION_US) return false
+            buffer.position(buffer.limit())
+            return true
+        }
+        val ok = super.handleBuffer(buffer, presentationTimeUs, encodedAccessUnitCount)
+        if (ok) { realActive = true; reanchor(presentationTimeUs) }
+        return ok
+    }
+
+    override fun getCurrentPositionUs(sourceEnded: Boolean): Long {
+        drainRealIfMuted()
+        if (!realActive) return AudioSink.CURRENT_POSITION_NOT_SET
+        return super.getCurrentPositionUs(sourceEnded)
+    }
+
+    override fun play() {
+        if (anchorPtsUs != AudioSink.CURRENT_POSITION_NOT_SET) reanchor(pacedNowUs())
+        playing = true
+        super.play()
+    }
+
+    override fun pause() {
+        if (anchorPtsUs != AudioSink.CURRENT_POSITION_NOT_SET) reanchor(pacedNowUs())
+        playing = false
+        super.pause()
+    }
+
+    override fun flush() {
+        realActive = false; anchorPtsUs = AudioSink.CURRENT_POSITION_NOT_SET; endOfStream = false
+        super.flush()
+    }
+
+    override fun reset() {
+        realActive = false; anchorPtsUs = AudioSink.CURRENT_POSITION_NOT_SET; endOfStream = false
+        super.reset()
+    }
+
+    override fun hasPendingData(): Boolean = if (gate.muted) !endOfStream else super.hasPendingData()
+    override fun isEnded(): Boolean = if (gate.muted) endOfStream else super.isEnded()
+    override fun playToEndOfStream() { if (gate.muted) endOfStream = true else super.playToEndOfStream() }
+
+    private companion object {
+        const val MUTED_CUSHION_US = 250_000L
+    }
+}
+
+/**
+ * Android#133: decides whether a video decoder may be reused across a format
+ * change given the two formats' color metadata. Pure, unit tested.
+ */
+@OptIn(UnstableApi::class)
+internal object CodecColorReuse {
+    /** Returns "<old> -> <new>" when reuse must be vetoed, else null. */
+    fun vetoReason(oldFormat: Format, newFormat: Format, liveChannelChange: Boolean): String? {
+        val o = oldFormat.colorInfo
+        val n = newFormat.colorInfo
+        if (o != null || n != null) {
+            if (o == null || n == null ||
+                o.colorTransfer != n.colorTransfer ||
+                o.colorSpace != n.colorSpace ||
+                o.colorRange != n.colorRange ||
+                !java.util.Arrays.equals(o.hdrStaticInfo, n.hdrStaticInfo)
+            ) return "${describe(o)} -> ${describe(n)}"
+            return null
+        }
+        // Neither side declares color. On a live channel change the HDR
+        // signalling may only be in-band, so an HEVC stream that is not
+        // provably 8-bit on both sides counts as a color change.
+        if (!liveChannelChange) return null
+        if (!isHevc(oldFormat) || !isHevc(newFormat)) return null
+        if (isProvablyHevc8Bit(oldFormat) && isProvablyHevc8Bit(newFormat)) return null
+        return "unknown(${oldFormat.codecs}) -> unknown(${newFormat.codecs})"
+    }
+
+    private fun isHevc(f: Format): Boolean =
+        f.sampleMimeType == MimeTypes.VIDEO_H265 ||
+            f.codecs?.let { it.startsWith("hvc1.") || it.startsWith("hev1.") } == true
+
+    /** RFC 6381 HEVC codecs string: general_profile_idc 1 is Main (8-bit). */
+    private fun isProvablyHevc8Bit(f: Format): Boolean {
+        val c = f.codecs ?: return false
+        val parts = c.split('.')
+        if (parts.size < 2 || (parts[0] != "hvc1" && parts[0] != "hev1")) return false
+        return parts[1].trimStart('A', 'B', 'C') == "1"
+    }
+
+    private fun describe(c: androidx.media3.common.ColorInfo?): String =
+        if (c == null) "null" else
+            "space=${c.colorSpace} transfer=${c.colorTransfer} range=${c.colorRange} " +
+                "hdrStatic=${if (c.hdrStaticInfo != null) "yes" else "no"}"
+}

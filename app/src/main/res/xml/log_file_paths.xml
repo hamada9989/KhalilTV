@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider scope for the diagnostic log files written by
+    com.aeriotv.android.core.debug.DebugLogger. The logger drops
+    `aerio_debug_logs.txt` (and the rotated `aerio_debug_logs_archive.txt`)
+    inside filesDir/logs/, and the Settings -> Developer -> Share Log File
+    button hands that file path off to the system share sheet via
+    FileProvider so the user can attach it to a GitHub Issue, email, etc.
+    Without a matching entry here the URI is opaque to the receiving app
+    and the share fails with SecurityException.
+-->
+<paths>
+    <files-path name="aerio_logs" path="logs/" />
+</paths>

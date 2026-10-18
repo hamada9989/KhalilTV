@@ -1,0 +1,738 @@
+package com.aeriotv.android.feature.cast
+
+import android.util.Log
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.width
+import com.aeriotv.android.feature.main.floatingNavChrome
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
+import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.aeriotv.android.core.cast.AerioCastSender
+import com.aeriotv.android.core.cast.companion.CompanionRemoteController
+import com.aeriotv.android.core.data.M3UChannel
+import com.aeriotv.android.feature.miniplayer.CastMiniController
+import com.aeriotv.android.feature.player.StreamOption
+import com.aeriotv.android.feature.player.SwitchStreamSheet
+import kotlinx.coroutines.launch
+
+private const val TAG = "CastCard"
+
+/**
+ * THE cast card (Logan 2026-09-12): one card above the bottom nav bar for both
+ * transports this phone can drive, Google Cast and the AerioTV Remote companion
+ * link. It shows the device, what is playing on it with its program, play/pause
+ * and stop; tapping it opens [CastRemoteSheet] over the page the user is on
+ * instead of taking over the screen.
+ *
+ * Rules it implements:
+ *  - Connecting from the picker stays on the current page; the card simply
+ *    appears. With nothing playing yet it reads "Select a Channel", and the
+ *    next channel tap casts (the tap handler owns that, see Navigation).
+ *  - Google Cast: the X (and Stop casting) on a PLAYING card stops the media
+ *    and returns the card to its idle "Select a Channel" state with the session
+ *    still connected; the X on the IDLE card ends the session and hides it.
+ *    Companion remote: the X stops the TV and hides the card. Playback is
+ *    never handed back to the phone.
+ *  - Companion only: "Disconnect" in the remote sheet drops the link and hides
+ *    the card while the TV keeps playing.
+ *  - Only ONE card is possible: the picker keeps the two transports mutually
+ *    exclusive, and a live Cast session wins if both somehow exist.
+ */
+@Composable
+fun CastTransportCard(
+    castSender: AerioCastSender,
+    companionRemote: CompanionRemoteController,
+    channels: List<M3UChannel>,
+    /** Current guide programme for a channel, resolved the same way the
+     *  channel list rows do; drives the card's program line and the sheet's
+     *  time range and progress. */
+    nowProgramme: (M3UChannel) -> com.aeriotv.android.core.data.EPGProgramme?,
+    /** Cast this channel to the active session (the scaffold's channel tap). */
+    onCastChannel: (M3UChannel) -> Unit,
+    /** Dispatcharr Switch Stream plumbing (admin-only channels). */
+    loadChannelStreams: suspend (Int) -> List<StreamOption>,
+    loadCurrentStreamId: suspend (String) -> Int?,
+    switchChannelStream: suspend (String, Int) -> Unit,
+    /** Re-reads the live Dispatcharr user level (fail closed), the same
+     *  pre-check the player's Switch Stream runs before opening. */
+    recheckSwitchStreamAllowed: suspend (String) -> Boolean,
+    modifier: Modifier = Modifier,
+    /** Tablets (iPad parity, Logan 2026-10-05): the card's fixed width; it
+     *  then takes the tab pill's capsule and chrome. Null on phones. */
+    tabletWidth: androidx.compose.ui.unit.Dp? = null,
+    /** Phone-composited Multiview on a web receiver (2026-10-06): the sheet
+     *  shows its grid preview (tap a tile for its audio). */
+    multiviewCast: com.aeriotv.android.core.cast.multiview.MultiviewCastController? = null,
+    /** Web receiver only: the playlist headers a composite started from the
+     *  card's Add Channel uses. Null hides Add Channel (Logan 2026-10-11). */
+    compositeHeaders: (() -> Map<String, String>)? = null,
+) {
+    val dvrCanRecord = com.aeriotv.android.ui.LocalDvrAccess.current == "manage"
+    val castState by castSender.state.collectAsStateWithLifecycle()
+    val castContent by castSender.content.collectAsStateWithLifecycle()
+    val castIsPlaying by castSender.isPlaying.collectAsStateWithLifecycle()
+    // Web-receiver channel flip in flight: the old media has been unloaded and
+    // the new proxy session is warming up, so the card says so rather than
+    // keeping the old channel's name on screen (Logan 2026-09-13).
+    val castSwitchingTo by castSender.switchingTo.collectAsStateWithLifecycle()
+    // A held receiver stall (iOS incident 2026-09-25): the session is kept
+    // through a rebuffer and the card says so.
+    val castBuffering by castSender.receiverBuffering.collectAsStateWithLifecycle()
+    // What the proxy decided for this channel and what the receiver reports
+    // presenting: the "Receiver" stat and the transcode note.
+    val castVideoPath by castSender.videoPath.collectAsStateWithLifecycle()
+    val castReceiverVideo by castSender.receiverVideo.collectAsStateWithLifecycle()
+    val castProxyStats by castSender.proxyStats.collectAsStateWithLifecycle()
+    val isTabletDevice = androidx.compose.ui.platform.LocalConfiguration.current.smallestScreenWidthDp >= 600
+    val companionConn by companionRemote.connection.collectAsStateWithLifecycle()
+    val companionIsPlaying by companionRemote.isPlaying.collectAsStateWithLifecycle()
+    val companionNowPlaying by companionRemote.nowPlaying.collectAsStateWithLifecycle()
+    val companionChannelId by companionRemote.currentChannelId.collectAsStateWithLifecycle()
+    val companionDetails by companionRemote.details.collectAsStateWithLifecycle()
+
+    val castDevice = (castState as? AerioCastSender.State.Connected)?.deviceName
+    val casting = castState is AerioCastSender.State.Connected
+    val companionTv = companionConn as? CompanionRemoteController.Conn.Connected
+    // A live Cast session wins when both transports are somehow up.
+    val isCompanion = !casting && companionTv != null
+    val active = casting || isCompanion
+    val deviceName = if (isCompanion) companionTv?.name else castDevice
+    // Cast Connect Multiview (Logan 2026-10-08): the AerioTV Android TV app
+    // runs the grid natively; the card and sheet follow its state pushes.
+    val nativeMvState by castSender.nativeMultiview.collectAsStateWithLifecycle()
+    val nativeMultiview = if (isCompanion) null else nativeMvState
+
+    var sheetOpen by remember { mutableStateOf(false) }
+    /** The Cast device picker, opened from the idle sheet's Change Cast Device. */
+    var pickerOpen by remember { mutableStateOf(false) }
+    var switchStreams by remember { mutableStateOf<List<StreamOption>?>(null) }
+    var switchCurrentId by remember { mutableStateOf<Int?>(null) }
+    /** The channel the open Switch Stream sheet acts on: the cast channel,
+     *  or a composite tile's channel (preview tile menu). */
+    var switchChannel by remember { mutableStateOf<M3UChannel?>(null) }
+    var sleepEndsAt by remember { mutableStateOf<Long?>(null) }
+    // Published once per second so the Options row can show the countdown.
+    var sleepRemainingMs by remember { mutableStateOf<Long?>(null) }
+    // Program handed to the shared Record sheet; null = sheet closed.
+    var recordTarget by remember { mutableStateOf<com.aeriotv.android.core.data.ProgramInfoTarget?>(null) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val isDispatcharrAdmin = com.aeriotv.android.ui.LocalIsDispatcharrAdmin.current
+
+    // The session ended (stop, disconnect, TV powered off): drop the sheet with
+    // the card so neither outlives the transport.
+    LaunchedEffect(active) {
+        Log.i(TAG, "[Cast] card ${if (active) "show" else "hide"}")
+        if (!active) {
+            sheetOpen = false
+            switchStreams = null
+            sleepEndsAt = null
+        }
+    }
+    DisposableEffect(Unit) { onDispose { Log.i(TAG, "[Cast] card hide") } }
+
+    // Sleep timer (the only one the remote transports have): pause whatever is
+    // playing on the other screen when it expires. The session stays connected.
+    LaunchedEffect(sleepEndsAt) {
+        val endsAt = sleepEndsAt ?: run { sleepRemainingMs = null; return@LaunchedEffect }
+        while (true) {
+            val remaining = endsAt - System.currentTimeMillis()
+            sleepRemainingMs = remaining.coerceAtLeast(0L)
+            if (remaining <= 0L) {
+                if (isCompanion) companionRemote.pause() else castSender.pause()
+                sleepEndsAt = null
+                break
+            }
+            kotlinx.coroutines.delay(1_000L)
+        }
+    }
+
+    // The picker is drawn ABOVE the early return: Change Device on the
+    // companion transport disconnects first, so the card goes inactive before
+    // the picker opens, and a picker below the return would never show.
+    if (pickerOpen) {
+        CastRouteChooserDialog(
+            sender = castSender,
+            companionRemote = companionRemote,
+            companionDiscovery = null,
+            onDismiss = { pickerOpen = false },
+        )
+    }
+
+    if (!active) return
+
+    // What the other screen is on, resolved back to a playlist channel so
+    // channel up/down and Switch Stream have something to work with.
+    val currentChannelId = when {
+        isCompanion -> companionChannelId
+        nativeMultiview != null -> null
+        else -> castContent?.mediaId
+    }
+    val currentChannel = remember(currentChannelId, channels) {
+        val id = currentChannelId ?: return@remember null
+        val bare = id.substringAfter(':', id)
+        channels.firstOrNull { it.id == id }
+            ?: channels.firstOrNull { it.id.substringAfter(':', it.id) == bare }
+            // A cast resumed after an app restart only recovers the channel TITLE
+            // as mediaId (the receiver's bridged session drops our id).
+            ?: channels.firstOrNull { it.name == id }
+    }
+    // Re-resolved each minute so the programme rolls over on the hour.
+    var guideTick by remember { mutableStateOf(0) }
+    LaunchedEffect(currentChannel?.id) {
+        while (true) {
+            kotlinx.coroutines.delay(60_000L)
+            guideTick++
+        }
+    }
+    val castProgramme = remember(currentChannel, guideTick) {
+        if (isCompanion) null else currentChannel?.let(nowProgramme)
+    }
+    val programmeTitle = if (isCompanion) {
+        companionDetails?.programmeTitle
+    } else {
+        castProgramme?.title
+    }
+    val programmeStartMs = if (isCompanion) companionDetails?.programmeStartMs ?: 0L
+        else castProgramme?.startMillis ?: 0L
+    val programmeEndMs = if (isCompanion) companionDetails?.programmeEndMs ?: 0L
+        else castProgramme?.endMillis ?: 0L
+    val logoUrl = if (nativeMultiview != null) null else if (isCompanion) {
+        companionDetails?.logoUrl
+    } else {
+        castContent?.artUri?.takeIf { it.isNotBlank() }
+            ?: currentChannel?.tvgLogo?.takeIf { it.isNotBlank() }
+    }
+    // A composite dropped to one tile (Apple 6136daf round 9) reads as that
+    // channel, like a normal cast, while the stream stays the composite.
+    val compositeSession = multiviewCast?.session?.collectAsState()?.value
+    val compositeSingleName = if (!isCompanion &&
+        castContent?.mediaId == com.aeriotv.android.core.cast.multiview.MultiviewCastController.MEDIA_ID
+    ) compositeSession?.singleChannelName else null
+    val title = when {
+        isCompanion -> companionDetails?.channelName
+            ?: companionNowPlaying.takeIf { it.isNotBlank() }
+            ?: ""
+        nativeMultiview != null -> com.aeriotv.android.core.cast.multiview.MultiviewCastController.TITLE
+        else -> compositeSingleName ?: castContent?.title.orEmpty()
+    }
+    val hasContent = title.isNotBlank()
+    // Composited Multiview: title "Multiview", the channel names under it,
+    // live only (no skips, no channel up/down).
+    val isComposite = !isCompanion && nativeMultiview == null &&
+        castContent?.mediaId == com.aeriotv.android.core.cast.multiview.MultiviewCastController.MEDIA_ID
+    val nativeNames = nativeMultiview?.channels?.joinToString(", ") { it.name }
+    // Either Multiview path: live only, no channel flips or skips.
+    val isMultiview = isComposite || nativeMultiview != null
+    val switchingTo = if (isCompanion) null else castSwitchingTo
+    // Google Cast only, and only for the channel actually on the receiver.
+    val showCastVideo = !isCompanion && hasContent && switchingTo == null
+    val receiverLine = castReceiverVideo?.takeIf { showCastVideo }?.let {
+        "Receiver: " + com.aeriotv.android.core.cast.hlsproxy.CastVideoPlan.receiverPlayingText(it.resolution, it.fps)
+    }
+    val transcodeNote = if (showCastVideo) {
+        com.aeriotv.android.core.cast.hlsproxy.CastVideoPlan.transcodeNote(
+            receiverName = castDevice,
+            deviceNoun = if (isTabletDevice) "tablet" else "phone",
+            path = castVideoPath,
+        )
+    } else {
+        emptyList()
+    }
+    // Composited Multiview: the phone's composite, its container path and the
+    // audio form (shared wording with Apple, round 2 2026-10-07).
+    // Apple a4bd790: the channel line follows the composite's live tiles
+    // (add, remove, swap), not the subtitle set once at load.
+    val compositeNames = compositeSession?.tiles?.takeIf { it.isNotEmpty() }?.joinToString(", ") { it.displayName }
+    // Apple 9c19a33: a composite's Stream Info is one card of labeled rows
+    // (SOURCE upstream host, COMPOSITE, FORMAT, VIDEO, AUDIO, then TV and the
+    // receiver's own summary), not plain text lines.
+    val castDetailLines = if (isMultiview) emptyList() else listOfNotNull(receiverLine) + transcodeNote
+    val compositeInfoRows = if (nativeMultiview != null) {
+        listOfNotNull(
+            "MULTIVIEW" to "${nativeMultiview.channels.size} channels, on the TV",
+            deviceName?.let { "TV" to it },
+        )
+    } else if (isComposite) {
+        com.aeriotv.android.core.cast.multiview.MultiviewCompositeLayout.streamInfoRows(compositeSession?.sourceHost) +
+            listOfNotNull(deviceName?.let { "TV" to it })
+    } else if (!isCompanion && hasContent) {
+        // Single-channel cast (Apple CastStreamInfoCard rows): the same
+        // labeled card as the composite instead of plain lines.
+        singleCastInfoRows(
+            stats = castProxyStats,
+            path = castVideoPath,
+            tvName = deviceName,
+            receiverVideo = castReceiverVideo?.takeIf { showCastVideo }?.let {
+                com.aeriotv.android.core.cast.hlsproxy.CastVideoPlan.receiverPlayingText(it.resolution, it.fps)
+            },
+        )
+    } else emptyList()
+
+    // Add Channel (Logan 2026-10-11): a single live cast becomes a 2-tile
+    // composite, a composite gains a tile; hidden at the composite tile cap.
+    val mvMax = com.aeriotv.android.core.cast.multiview.MultiviewCompositeLayout.MAX_TILES
+    val canAddChannel = compositeHeaders != null && multiviewCast != null && !isCompanion &&
+        nativeMultiview == null && switchingTo == null && hasContent &&
+        (if (isComposite) (compositeSession?.tiles?.size ?: 0) < mvMax else currentChannel != null)
+    var addPickerOpen by remember { mutableStateOf(false) }
+    val openAddChannel: () -> Unit = {
+        Log.i(TAG, "[MV-CAST] Add Channel opened (${if (isComposite) "composite" else "single cast"})")
+        sheetOpen = false
+        addPickerOpen = true
+    }
+
+    fun flipChannel(delta: Int) {
+        val idx = channels.indexOfFirst { it.id == currentChannel?.id }
+        if (idx < 0) return
+        channels.getOrNull((idx + delta).coerceIn(0, channels.lastIndex))
+            ?.let(onCastChannel)
+    }
+
+    // The card's X: stop playback on the other screen AND close the card, for both
+    // transports (Logan 2026-09-12). Google Cast gets that for free because ending
+    // the session stops the receiver and the HLS proxy; the companion link would
+    // otherwise leave the TV playing, so it is told to stop first and only then
+    // disconnected.
+    fun endSession() {
+        if (isCompanion) {
+            Log.i(TAG, "[Remote] X: stop + close")
+            companionRemote.stopRemotePlayback()
+            companionRemote.disconnect()
+        } else if (nativeMultiview != null) {
+            // Stop Casting on a Cast Connect Multiview ends the Multiview on
+            // the TV (back to its UI) and keeps the session, like a channel stop.
+            castSender.stopNativeMultiview()
+        } else if (hasContent || switchingTo != null) {
+            // Playing card (or its sheet's Stop casting): stop the media, keep
+            // the session, and fall back to the idle card (iOS parity).
+            castSender.stopPlayback()
+        } else {
+            Log.i(TAG, "[Cast] X on idle card: session ended, no local resume")
+            castSender.stopCasting()
+        }
+        sheetOpen = false
+    }
+
+    // Companion only: give up the remote without touching the TV, which keeps
+    // playing whatever it is on. Hides the card the same way a stop does.
+    fun disconnectCompanionOnly() {
+        Log.i(TAG, "[Remote] disconnect, TV keeps playing")
+        sheetOpen = false
+        companionRemote.disconnect()
+    }
+
+    Box(
+        modifier = if (tabletWidth != null) {
+            modifier
+                .width(tabletWidth)
+                .floatingNavChrome(RoundedCornerShape(percent = 50))
+        } else {
+            // Phones (Logan 2026-10-05): the Kept Live pill's capsule and
+            // surface and its frame (600 dp cap, 20 dp side margins), so the
+            // two stack as matching capsules.
+            modifier
+                .widthIn(max = 600.dp)
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .floatingNavChrome(RoundedCornerShape(percent = 50))
+        },
+    ) {
+        CastMiniController(
+            containerColor = androidx.compose.ui.graphics.Color.Transparent,
+            horizontalPadding = if (tabletWidth != null) 18.dp else 12.dp,
+            title = when {
+                switchingTo != null -> "Switching to $switchingTo"
+                hasContent -> title
+                else -> "Casting to ${deviceName ?: "your TV"}"
+            },
+            deviceName = deviceName,
+            artUri = when {
+                isCompanion -> companionDetails?.logoUrl
+                nativeMultiview != null -> null
+                else -> castContent?.artUri
+            },
+            isPlaying = if (isCompanion) companionIsPlaying else castIsPlaying,
+            // Nothing playing yet: the card says where the next tap lands.
+            subtitle = when {
+                switchingTo != null -> "Casting to ${deviceName ?: "your TV"}"
+                !hasContent -> "Select a Channel"
+                !isCompanion && castBuffering -> "Buffering\u2026"
+                isCompanion -> "Controlling ${deviceName ?: "TV"}"
+                isComposite && compositeSingleName != null -> null
+                isComposite -> compositeNames ?: castContent?.subtitle
+                nativeMultiview != null -> nativeNames
+                else -> null
+            },
+            transportIcon = if (isCompanion) Icons.Filled.Tv else Icons.Filled.Cast,
+            showTransport = hasContent && nativeMultiview == null,
+            stopDescription = if (isCompanion) "Stop playback" else "Stop casting",
+            onTap = {
+                Log.i(TAG, "[Cast] card tap")
+                sheetOpen = true
+            },
+            onTogglePlayPause = {
+                if (isCompanion) companionRemote.togglePlayPause() else castSender.togglePlayPause()
+            },
+            onStop = { endSession() },
+            onAddChannel = if (canAddChannel) openAddChannel else null,
+        )
+    }
+
+    if (addPickerOpen && multiviewCast != null && compositeHeaders != null) {
+        val store = com.aeriotv.android.feature.multiview.rememberMultiviewStoreHandle()
+        val composite = isComposite
+        val seedChannel = if (composite) null else currentChannel
+        val baseTiles = remember {
+            if (composite) compositeSession?.tiles.orEmpty()
+            else listOfNotNull(seedChannel?.let { com.aeriotv.android.feature.multiview.MultiviewTile.live(it) })
+        }
+        val snapshot = remember { store.selected.value to store.audioFocusedIndex.value }
+        remember {
+            store.restore(baseTiles, if (composite) compositeSession?.focused ?: 0 else 0)
+            true
+        }
+        fun applyPicks() {
+            addPickerOpen = false
+            val picked = multiviewCast.castableTiles(store.selected.value)
+            val baseIds = baseTiles.map { it.id }.toSet()
+            if (composite) {
+                // Joins the running composite in place (no receiver reload).
+                val pickedIds = picked.map { it.id }.toSet()
+                baseTiles.filter { it.id !in pickedIds }.forEach { multiviewCast.toggleTile(it) }
+                picked.filter { it.id !in baseIds }.forEach { multiviewCast.toggleTile(it) }
+                Log.i(TAG, "[MV-CAST] Add Channel applied: composite ${picked.size} tiles")
+            } else if (picked.size >= 2) {
+                val tiles = picked.take(mvMax)
+                Log.i(TAG, "[MV-CAST] Add Channel: single cast -> composite ${tiles.joinToString { it.displayName }}")
+                if (multiviewCast.start(tiles, compositeHeaders(), 0)) store.setStaging(false)
+                else store.restore(snapshot.first, snapshot.second)
+            } else {
+                store.restore(snapshot.first, snapshot.second)
+            }
+        }
+        com.aeriotv.android.feature.multiview.AddToMultiviewSheet(
+            currentChannel = seedChannel,
+            onLaunch = { applyPicks() },
+            onCancel = {
+                addPickerOpen = false
+                store.restore(snapshot.first, snapshot.second)
+            },
+            onDismiss = { applyPicks() },
+            multiviewStore = store,
+        )
+    }
+
+    // Connected, nothing playing (and no flip warming up): the minimal idle
+    // sheet, not the remote with every control dimmed (iOS parity 2026-09-25).
+    val idleCast = !isCompanion && !hasContent && switchingTo == null
+    if (sheetOpen && idleCast) {
+        CastIdleSheet(
+            deviceName = deviceName,
+            statusText = "Connected. Select a channel to start.",
+            onChangeDevice = {
+                Log.i(TAG, "[Cast] idle sheet: change device")
+                sheetOpen = false
+                pickerOpen = true
+            },
+            onDismiss = { sheetOpen = false },
+        )
+    }
+
+    if (sheetOpen && !idleCast) {
+        val remoteState by (if (isCompanion) companionRemote.remoteState else castSender.remoteState)
+            .collectAsStateWithLifecycle()
+        val remoteIsPlaying by (if (isCompanion) companionRemote.isPlaying else castSender.isPlaying)
+            .collectAsStateWithLifecycle()
+        val position by (if (isCompanion) companionRemote.position else castSender.position)
+            .collectAsStateWithLifecycle()
+        // Google Cast only: the skips live in the transport row (the companion
+        // transport already draws them above its rewind scrubber).
+        val castCanSkip by castSender.canSkip.collectAsStateWithLifecycle()
+        // Hidden for non-admin accounts, the same gate as the player menu.
+        val canSwitchStream = isDispatcharrAdmin && currentChannel?.dispatcharrChannelId != null &&
+            currentChannel.id.startsWith("disp:")
+        // The program airing now on the cast channel, in the shape the guide and
+        // channel list hand to the shared Record sheet, so recording from the
+        // remote goes through exactly the same Dispatcharr / local paths.
+        val recordableTarget = currentChannel?.takeIf { programmeEndMs > System.currentTimeMillis() }?.let { ch ->
+            com.aeriotv.android.core.data.ProgramInfoTarget(
+                channelName = ch.name,
+                title = programmeTitle.orEmpty(),
+                startMillis = programmeStartMs,
+                endMillis = programmeEndMs,
+                description = castProgramme?.description.orEmpty(),
+                category = castProgramme?.category.orEmpty(),
+                channelDispatcharrId = ch.dispatcharrChannelId,
+            )
+        }
+        CastRemoteSheet(
+            deviceName = deviceName,
+            channelTitle = title,
+            switchingTo = switchingTo,
+            buffering = !isCompanion && castBuffering,
+            programmeTitle = programmeTitle,
+            logoUrl = logoUrl,
+            programmeStartMs = programmeStartMs,
+            programmeEndMs = programmeEndMs,
+            remoteState = remoteState,
+            isPlaying = remoteIsPlaying,
+            position = position,
+            transportIcon = if (isCompanion) Icons.Filled.Tv else Icons.Filled.Cast,
+            statusVerb = if (isCompanion) "Controlling" else "Casting to",
+            stopLabel = if (isCompanion) "Stop" else "Stop Casting",
+            // Only the companion transport can be dropped while the TV plays on.
+            onDisconnect = if (isCompanion) ({ disconnectCompanionOnly() }) else null,
+            canChangeChannel = currentChannel != null && !isMultiview,
+            showInlineSkip = !isCompanion && !isMultiview,
+            showSkipButtons = !isMultiview,
+            showPlayPause = nativeMultiview == null,
+            programmeTitleOverride = when {
+                nativeMultiview != null -> nativeNames
+                isComposite && compositeSingleName == null -> compositeNames ?: castContent?.subtitle
+                else -> null
+            },
+            allowWebScrub = !isMultiview,
+            topContent = if (nativeMultiview != null) {
+                {
+                    NativeMultiviewPanel(
+                        state = nativeMultiview,
+                        onFocus = { castSender.setNativeMultiviewFocus(it) },
+                        onLayout = { castSender.setNativeMultiviewLayout(it) },
+                    )
+                }
+            } else if (isComposite && multiviewCast != null) {
+                {
+                    // Tile menu Switch Stream (Logan 2026-10-07): the same
+                    // admin gate and server-side change_stream as the cast
+                    // channel. Dispatcharr switches the tile's upstream in
+                    // place, so the composite and its other tiles keep running.
+                    fun tileChannel(tileId: String): M3UChannel? =
+                        channels.firstOrNull { it.id == tileId }
+                            ?.takeIf { it.id.startsWith("disp:") && it.dispatcharrChannelId != null }
+                    MultiviewCompositePreview(
+                        multiviewCast,
+                        canSwitchStream = { id -> isDispatcharrAdmin && tileChannel(id) != null },
+                        onSwitchStream = { id ->
+                            val ch = tileChannel(id)
+                            val chPk = ch?.dispatcharrChannelId
+                            if (ch != null && chPk != null) {
+                                switchChannel = ch
+                                scope.launch {
+                                    if (!recheckSwitchStreamAllowed("Switch Stream open (Multiview tile)")) {
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            com.aeriotv.android.feature.player.SWITCH_DENIED_MESSAGE,
+                                            android.widget.Toast.LENGTH_LONG,
+                                        ).show()
+                                        return@launch
+                                    }
+                                    switchCurrentId = loadCurrentStreamId(ch.id.removePrefix("disp:"))
+                                    switchStreams = loadChannelStreams(chPk)
+                                }
+                            }
+                        },
+                        onAddChannel = if (canAddChannel) openAddChannel else null,
+                    )
+                }
+            } else if (canAddChannel) {
+                { com.aeriotv.android.feature.cast.MultiviewAddChannelRow(openAddChannel) }
+            } else null,
+            inlineSkipEnabled = castCanSkip || position.canSeek || remoteState.canSeek,
+            canSwitchStream = canSwitchStream,
+            castDetailLines = castDetailLines,
+            streamInfoRows = compositeInfoRows,
+            onTogglePlayPause = {
+                if (isCompanion) companionRemote.togglePlayPause() else castSender.togglePlayPause()
+            },
+            onChannelUp = { flipChannel(1) },
+            onChannelDown = { flipChannel(-1) },
+            onStopCasting = { endSession() },
+            changeDeviceLabel = if (isCompanion) "Change Device" else "Change Cast Device",
+            onChangeDevice = {
+                Log.i(TAG, "[Cast] playing sheet: change device")
+                // Captured before the stop clears it, armed after: the channel
+                // follows the user to whichever receiver the picker starts next.
+                val follow = if (isCompanion) null else currentChannel
+                endSession()
+                // Held by the sender, not this card: the switch drops the
+                // session, which removes this card from composition (and any
+                // state remembered here) before the new session connects.
+                castSender.armHandoff(follow?.id)
+                // Let the sheet finish closing before the picker opens, so the
+                // two modals never animate over each other (iOS uses 350 ms too).
+                scope.launch {
+                    kotlinx.coroutines.delay(350L)
+                    pickerOpen = true
+                }
+            },
+            onSetAudioTrack = { id ->
+                if (isCompanion) companionRemote.setRemoteAudioTrack(id) else castSender.setRemoteAudioTrack(id)
+            },
+            onSetTextTrack = { id ->
+                if (isCompanion) companionRemote.setRemoteTextTrack(id) else castSender.setRemoteTextTrack(id)
+            },
+            onSetSpeed = { s ->
+                if (isCompanion) companionRemote.setRemoteSpeed(s) else castSender.setRemoteSpeed(s)
+            },
+            onSetAspect = { mode ->
+                if (isCompanion) companionRemote.setRemoteAspect(mode) else castSender.setRemoteAspect(mode)
+            },
+            onSwitchStream = {
+                // Server-side change_stream: works the same whether the stream is
+                // playing here or on the other screen.
+                val ch = currentChannel
+                switchChannel = ch
+                val chPk = ch?.dispatcharrChannelId
+                if (ch != null && chPk != null) {
+                    val uuid = ch.id.removePrefix("disp:")
+                    scope.launch {
+                        // Re-read the user level before opening (player parity):
+                        // the picker follows the live answer, fail closed.
+                        if (!recheckSwitchStreamAllowed("Switch Stream open")) {
+                            android.widget.Toast.makeText(
+                                context,
+                                com.aeriotv.android.feature.player.SWITCH_DENIED_MESSAGE,
+                                android.widget.Toast.LENGTH_LONG,
+                            ).show()
+                            return@launch
+                        }
+                        switchCurrentId = loadCurrentStreamId(uuid)
+                        switchStreams = loadChannelStreams(chPk)
+                    }
+                }
+            },
+            sleepLabel = sleepRemainingMs?.let { ms ->
+                // Same wording as the local player's remaining-time label.
+                val minutes = (ms + 59_999L) / 60_000L
+                when {
+                    minutes < 60L -> "$minutes min remaining"
+                    minutes % 60L == 0L -> "${minutes / 60L} h remaining"
+                    else -> "${minutes / 60L} h ${minutes % 60L} min remaining"
+                }
+            } ?: "Off",
+            recordProgramTitle = recordableTarget?.title,
+            onRecordCurrentProgram = recordableTarget?.takeIf { dvrCanRecord }?.let { target ->
+                { recordTarget = target }
+            },
+            onSleepMinutes = { minutes ->
+                sleepEndsAt = if (minutes == 0) null else System.currentTimeMillis() + minutes * 60_000L
+            },
+            onSeekBy = { delta ->
+                if (isCompanion) companionRemote.seekBy(delta) else castSender.skipBy(delta)
+            },
+            onSeekToWall = { target ->
+                if (isCompanion) companionRemote.seekToWall(target) else castSender.seekToWall(target)
+            },
+            webSeekWindow = if (isCompanion) null else ({ castSender.webSeekWindow() }),
+            onSeekToStreamPosition = { ms -> castSender.seekToStreamPosition(ms) },
+            onGoLive = {
+                if (isCompanion) companionRemote.goLiveRemote() else castSender.goLiveRemote()
+            },
+            onRefreshState = {
+                if (isCompanion) companionRemote.requestRemoteState() else castSender.requestRemoteState()
+            },
+            onDismiss = { sheetOpen = false },
+        )
+    }
+
+    recordTarget?.let { target ->
+        com.aeriotv.android.feature.livetv.RecordProgramSheet(
+            target = target,
+            onDismiss = { recordTarget = null },
+        )
+    }
+
+    switchStreams?.let { streams ->
+        SwitchStreamSheet(
+            streams = streams,
+            currentStreamId = switchCurrentId,
+            onSelect = { streamId ->
+                val uuid = switchChannel?.id?.removePrefix("disp:")
+                switchStreams = null
+                if (uuid != null) {
+                    // Optimistic radio mark; a failure puts the previous one
+                    // back (player and Apple SwitchStreamView parity).
+                    val previousId = switchCurrentId
+                    switchCurrentId = streamId
+                    scope.launch {
+                        val result = runCatching { switchChannelStream(uuid, streamId) }
+                        val error = result.exceptionOrNull() ?: return@launch
+                        if (switchCurrentId == streamId) switchCurrentId = previousId
+                        Log.w(TAG, "[SwitchStream] cast change_stream failed stream=$streamId: ${error.message}")
+                        android.widget.Toast.makeText(
+                            context,
+                            com.aeriotv.android.feature.player.switchStreamFailureMessage(
+                                "switch the stream",
+                                com.aeriotv.android.feature.player.SWITCH_DENIED_MESSAGE,
+                                error,
+                            ),
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                        if ((error as? com.aeriotv.android.core.network.DispatcharrHttpFailure)?.status == 403) {
+                            // The server says the level changed: re-read it so
+                            // the Switch Stream gate follows.
+                            recheckSwitchStreamAllowed("403 on change_stream")
+                        }
+                    }
+                }
+            },
+            onDismiss = { switchStreams = null },
+        )
+    }
+}
+
+/** Apple CastStreamInfoCard single-channel rows: SOURCE, VIDEO, AUDIO, SEGS,
+ *  RATE, PROXY, TV, RECEIVER. Empty until the proxy has a channel. */
+private fun singleCastInfoRows(
+    stats: com.aeriotv.android.core.cast.hlsproxy.CastProxyStats?,
+    path: com.aeriotv.android.core.cast.hlsproxy.CastVideoPathInfo?,
+    tvName: String?,
+    receiverVideo: String?,
+): List<Pair<String, String>> {
+    if (stats == null) return emptyList()
+    val video = path?.let { p ->
+        val src = p.source
+        val codec = if (src.codec == com.aeriotv.android.core.cast.hlsproxy.CastVideoOutputSpec.Codec.HEVC) "HEVC" else "H.264"
+        val fps = src.fps?.let { f ->
+            val r = Math.round(f)
+            if (kotlin.math.abs(r - f) < 0.01) " ${r}fps" else " ${"%.2f".format(java.util.Locale.US, f)}fps"
+        }.orEmpty()
+        val base = "$codec ${src.width}x${src.height}$fps"
+        val out = p.output
+        if (out == null) base else {
+            val outCodec = if (out.codec == com.aeriotv.android.core.cast.hlsproxy.CastVideoOutputSpec.Codec.HEVC) "HEVC" else "H.264"
+            "$base to $outCodec ${out.width}x${out.height}"
+        }
+    } ?: "detecting"
+    val rate = stats.rollupKbps?.let { kbps ->
+        "$kbps kbps" + (stats.rollupAvgSegmentSeconds?.let { "  avg seg ${"%.2f".format(java.util.Locale.US, it)}s" }.orEmpty())
+    } ?: "measuring"
+    return listOf(
+        "SOURCE" to (stats.ingestHost ?: "-"),
+        "VIDEO" to video,
+        "AUDIO" to (stats.audioPath ?: "detecting"),
+        "SEGS" to "${stats.segmentsProduced} produced  gen ${stats.generation}",
+        "RATE" to rate,
+        "PROXY" to "HLS on port ${stats.port}",
+        "TV" to (tvName ?: "-"),
+        "RECEIVER" to (receiverVideo ?: "waiting"),
+    )
+}

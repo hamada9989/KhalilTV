@@ -1,0 +1,727 @@
+package com.aeriotv.android.core.sync
+
+import android.content.Context
+import android.os.Build
+import android.util.Log
+import androidx.room.withTransaction
+import com.aeriotv.android.core.data.db.AerioDatabase
+import com.aeriotv.android.core.data.db.dao.PlaylistDao
+import com.aeriotv.android.core.data.db.dao.ReminderDao
+import com.aeriotv.android.core.data.db.dao.WatchProgressDao
+import com.aeriotv.android.core.data.db.entity.FavoriteChannelEntity
+import com.aeriotv.android.core.data.db.entity.PlaylistEntity
+import com.aeriotv.android.core.data.db.entity.ReminderEntity
+import com.aeriotv.android.core.data.db.entity.WatchProgressEntity
+import com.aeriotv.android.core.preferences.AppPreferences
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+
+/**
+ * Orchestrates Drive AppData sync. Mirrors iOS SyncManager.swift surface:
+ *   - signIn() / signOut(), wraps GoogleDriveAuth.
+ *   - pushAll() / pullAll(), per-category JSON snapshots written to / read
+ *     from the appDataFolder.
+ *   - clearRemote(), Settings > "Clear Drive Data" hook.
+ *   - status flow exposed for SyncSettingsScreen badge.
+ *
+ * Conflict resolution: last-writer-wins by [SyncEnvelope.lastModified]. A
+ * pull only overwrites local rows when the remote envelope is newer; a push
+ * always wins over older remote data because the local DB is treated as the
+ * latest writer at sync time.
+ */
+@Singleton
+class DriveSyncManager @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val database: AerioDatabase,
+    private val playlistDao: PlaylistDao,
+    private val watchProgressDao: WatchProgressDao,
+    private val reminderDao: ReminderDao,
+    private val favoriteChannelDao: com.aeriotv.android.core.data.db.dao.FavoriteChannelDao,
+    private val appPreferences: AppPreferences,
+    private val watchlistStore: com.aeriotv.android.core.preferences.WatchlistStore,
+    private val hiddenTitlesStore: com.aeriotv.android.core.preferences.HiddenTitlesStore,
+    /** Provider: a replacing pull deletes local playlists through the
+     * repository's full cleanup path (guide, channel cache, VOD, tokens). */
+    private val playlistRepository: javax.inject.Provider<com.aeriotv.android.core.data.repository.PlaylistRepository>,
+) {
+
+    private val okHttp: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
+
+    private val driveClient = DriveAppDataClient(okHttp)
+    private val auth = GoogleDriveAuth(context)
+    private val json = Json {
+        ignoreUnknownKeys = true
+        prettyPrint = false
+        encodeDefaults = true
+    }
+
+    private val _status: MutableStateFlow<Status> = MutableStateFlow(Status.SignedOut)
+    val status: StateFlow<Status> = _status.asStateFlow()
+
+    /**
+     * Per-category progress for the onboarding restore screen. Empty when no
+     * tracked restore has run this process; otherwise one entry per category
+     * in pull order. Only [pullAllTracked] writes here -- the background
+     * worker and Settings "Sync Now" use the untracked [pullAll] so a routine
+     * sync never repaints the onboarding progress UI.
+     */
+    private val _restoreSteps: MutableStateFlow<List<RestoreStep>> = MutableStateFlow(emptyList())
+    val restoreSteps: StateFlow<List<RestoreStep>> = _restoreSteps.asStateFlow()
+
+    /** Reset the tracked restore progress (call when leaving the restore UI). */
+    fun clearRestoreProgress() {
+        _restoreSteps.value = emptyList()
+    }
+
+    private fun updateRestoreStep(category: SyncCategory, state: RestoreStepState, detail: String? = null) {
+        _restoreSteps.value = _restoreSteps.value.map { step ->
+            if (step.category == category) step.copy(state = state, detail = detail) else step
+        }
+    }
+
+    /**
+     * Step 1 of the two-step flow: open the Sign-in-with-Google sheet via
+     * Credential Manager. Returns the user's email on success so the caller
+     * can persist it; the resulting identity has no Drive scope yet, so the
+     * UI should call [requestDriveScope] next to obtain the bearer token.
+     */
+    suspend fun signInWithGoogle(activity: android.app.Activity): String? {
+        if (!SyncConfig.isConfigured()) {
+            _status.value = Status.MissingConfig
+            return null
+        }
+        val result = runCatching { auth.signIn(activity) }.getOrNull() ?: return null
+        appPreferences.setSyncAccountEmail(result.email)
+        return result.email
+    }
+
+    /**
+     * Step 2: ask AuthorizationClient for the Drive AppData scope. Returns
+     *  - [Status.SignedIn] when the user has already granted the scope.
+     *  - [Status.NeedsConsent] when consent UI must be shown by the caller.
+     *
+     * The caller (SyncSettingsScreen) is responsible for launching the
+     * consent intent via an ActivityResultLauncher and feeding the result
+     * back through [acceptConsentResult].
+     */
+    suspend fun requestDriveScope(): RequestResult? {
+        if (!SyncConfig.isConfigured()) return null
+        val authResult = runCatching { auth.requestDriveAuthorization() }.getOrNull()
+            ?: return RequestResult.Failed
+        val token = authResult.accessToken
+        if (token != null) {
+            setSignedIn(token)
+            return RequestResult.Authorized(token)
+        }
+        val pi = authResult.pendingIntent
+        return if (pi != null) {
+            RequestResult.NeedsConsent(pi.intentSender)
+        } else {
+            RequestResult.Failed
+        }
+    }
+
+    /** Consume the activity result intent from the consent flow. Persists the
+     * resulting token so the session survives a process restart. */
+    suspend fun acceptConsentResult(data: android.content.Intent?) {
+        val token = auth.extractAccessToken(data)
+        if (token != null) setSignedIn(token) else _status.value = Status.SignedOut
+    }
+
+    /**
+     * Restore a usable Drive access token across process restarts WITHOUT a
+     * manual re-login. Order:
+     *   1. Already [Status.SignedIn] this process -> return its token.
+     *   2. A persisted token that hasn't hit its estimated expiry -> adopt it
+     *      (pure disk read, no network, no consent UI). This is the common
+     *      "it just stays signed in" path.
+     *   3. Otherwise refresh silently via AuthorizationClient, which returns a
+     *      fresh token with NO UI because the Drive scope is already granted
+     *      (the access token Google issues only lives ~1h, so this fires after
+     *      long gaps). Returns null only when no token can be had without user
+     *      interaction (never signed in, scope revoked, offline) so background
+     *      callers just skip instead of popping a sheet.
+     */
+    suspend fun ensureSignedIn(): String? {
+        (status.value as? Status.SignedIn)?.let { return it.accessToken }
+        appPreferences.syncTokenOnce()?.let { (saved, expiry) ->
+            if (System.currentTimeMillis() < expiry) {
+                _status.value = Status.SignedIn(saved)
+                return saved
+            }
+        }
+        if (!SyncConfig.isConfigured()) return null
+        // Only refresh for a user who has opted into sync before -- never
+        // trigger an authorize() for someone who never signed in.
+        if (appPreferences.syncAccountEmailOnce().isBlank()) return null
+        val authResult = runCatching { auth.requestDriveAuthorization() }.getOrNull() ?: return null
+        val token = authResult.accessToken ?: return null
+        setSignedIn(token)
+        return token
+    }
+
+    /** Persist the token with a conservative expiry and flip status to signed-in. */
+    private suspend fun setSignedIn(token: String) {
+        appPreferences.saveSyncToken(token, System.currentTimeMillis() + TOKEN_TTL_MS)
+        _status.value = Status.SignedIn(token)
+    }
+
+    suspend fun signOut() {
+        runCatching { auth.signOut() }
+        appPreferences.setSyncAccountEmail("")
+        appPreferences.clearSyncToken()
+        _status.value = Status.SignedOut
+    }
+
+    /** Drop every appData file. Local DB rows are untouched (iOS parity). */
+    suspend fun clearRemote(token: String) {
+        val files = driveClient.listAll(token)
+        files.forEach { (id, _) -> driveClient.delete(token, id) }
+    }
+
+    /**
+     * Drop ONE category's appData file (Apple SyncCategoriesSettingsView's
+     * per-category "Delete from iCloud"). Local rows are untouched, so other
+     * devices keep their copy. Matches by name rather than findFileId so a
+     * duplicate left by an interrupted first upload goes too. Throws on the
+     * first failed delete, like [clearRemote]'s callers expect.
+     */
+    suspend fun clearRemoteCategory(token: String, category: SyncCategory) {
+        driveClient.listAll(token)
+            .filter { (_, name) -> name == category.fileName }
+            .forEach { (id, _) -> driveClient.delete(token, id).getOrThrow() }
+    }
+
+    /**
+     * Push enabled categories to Drive. Bails on the first failure but
+     * continues across categories, a Reminders push fail doesn't block
+     * Playlists. Returns a map of category → success.
+     */
+    suspend fun pushAll(token: String, enabled: Set<SyncCategory>): Map<SyncCategory, Boolean> {
+        Log.i(TAG, "pushAll: categories=${enabled.map { it.name }}")
+        val result = mutableMapOf<SyncCategory, Boolean>()
+        enabled.forEach { category ->
+            val ok = runCatching { pushCategory(token, category) }
+                .onFailure { Log.w(TAG, "push ${category.name} failed", it) }
+                .getOrDefault(false)
+            result[category] = ok
+        }
+        appPreferences.setSyncLastPushAt(System.currentTimeMillis())
+        return result
+    }
+
+    /**
+     * [replace] true is the explicit Settings "Pull from Drive": Playlists and
+     * Preferences REPLACE this device's copy (owner decision, Settings phase 3,
+     * iPhone parity) instead of merging onto it. Background and onboarding
+     * pulls keep merging.
+     */
+    suspend fun pullAll(
+        token: String,
+        enabled: Set<SyncCategory>,
+        replace: Boolean = false,
+    ): Map<SyncCategory, Boolean> {
+        val result = mutableMapOf<SyncCategory, Boolean>()
+        enabled.forEach { category ->
+            val ok = runCatching { pullCategory(token, category, replace) }
+                .onFailure { Log.w(TAG, "pull ${category.name} failed", it) }
+                .getOrDefault(false)
+            result[category] = ok
+        }
+        appPreferences.setSyncLastPullAt(System.currentTimeMillis())
+        // This install has seen the remote state; automatic pushes are now
+        // safe (see AppPreferences.syncInitialPullDone).
+        appPreferences.setSyncInitialPullDone(true)
+        return result
+    }
+
+    /**
+     * [pullAll] variant that publishes per-category progress through
+     * [restoreSteps] for the onboarding restore screen. Same return shape and
+     * same per-category semantics (a category maps to true only when a remote
+     * snapshot existed AND applied cleanly); the only addition is the step
+     * state machine: Pending -> Running -> Done/Failed. A category whose file
+     * simply doesn't exist in Drive yet settles as Done with a
+     * "Nothing in Drive yet" detail instead of Failed -- a fresh account
+     * isn't an error.
+     */
+    suspend fun pullAllTracked(token: String, enabled: Set<SyncCategory>): Map<SyncCategory, Boolean> {
+        _restoreSteps.value = enabled.map { RestoreStep(category = it) }
+        val result = mutableMapOf<SyncCategory, Boolean>()
+        enabled.forEach { category ->
+            updateRestoreStep(category, RestoreStepState.Running)
+            val outcome = runCatching { pullCategoryDetailed(token, category) }
+                .onFailure { Log.w(TAG, "pull ${category.name} failed", it) }
+                .getOrDefault(PullOutcome.Failed)
+            result[category] = outcome == PullOutcome.Applied
+            when (outcome) {
+                PullOutcome.Applied -> updateRestoreStep(category, RestoreStepState.Done)
+                PullOutcome.NoRemote -> updateRestoreStep(category, RestoreStepState.Done, "Nothing in Drive yet")
+                PullOutcome.Failed -> updateRestoreStep(category, RestoreStepState.Failed, "Couldn't restore")
+            }
+        }
+        appPreferences.setSyncLastPullAt(System.currentTimeMillis())
+        appPreferences.setSyncInitialPullDone(true)
+        return result
+    }
+
+    // Profiles phase 1: sync carries the DEFAULT profile only. defaultOnly()
+    // pins every scoped DAO/pref read and write to scope "" and makes the
+    // playlist DAO return the stored (default) login, so a non-default active
+    // profile never leaks into, or is overwritten by, the Drive snapshot.
+    // PHASE 2 HOOK: per-profile sync replaces this with a profile id per file.
+    private suspend fun pushCategory(token: String, category: SyncCategory): Boolean =
+        kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) {
+            pushCategoryDefaultProfile(token, category)
+        }
+
+    private suspend fun pushCategoryDefaultProfile(token: String, category: SyncCategory): Boolean {
+        val payload = when (category) {
+            SyncCategory.Playlists -> json.encodeToString(buildPlaylistsSnapshot())
+            SyncCategory.WatchProgress -> json.encodeToString(buildWatchProgressSnapshot())
+            SyncCategory.Reminders -> json.encodeToString(buildRemindersSnapshot())
+            SyncCategory.Favorites -> json.encodeToString(buildFavoritesSnapshot())
+            SyncCategory.Watchlist -> json.encodeToString(buildWatchlistSnapshot())
+            SyncCategory.Preferences -> json.encodeToString(buildPreferencesSnapshot())
+            SyncCategory.Credentials -> json.encodeToString(buildCredentialsSnapshot())
+        }
+        return driveClient.upload(token, category.fileName, payload).isSuccess
+    }
+
+    private suspend fun pullCategory(token: String, category: SyncCategory, replace: Boolean = false): Boolean =
+        pullCategoryDetailed(token, category, replace) == PullOutcome.Applied
+
+    /** Tri-state pull so [pullAllTracked] can tell "no remote snapshot yet"
+     * (fresh account, not an error) apart from a genuine failure. The Boolean
+     * [pullCategory] wrapper preserves the original semantics for [pullAll]. */
+    private suspend fun pullCategoryDetailed(
+        token: String,
+        category: SyncCategory,
+        replace: Boolean = false,
+    ): PullOutcome {
+        val fileId = driveClient.findFileId(token, category.fileName) ?: return PullOutcome.NoRemote
+        val body = driveClient.download(token, fileId) ?: return PullOutcome.Failed
+        return kotlinx.coroutines.withContext(com.aeriotv.android.core.profiles.ProfileScope.defaultOnly()) { runCatching {
+            when (category) {
+                SyncCategory.Playlists -> applyPlaylistsSnapshot(json.decodeFromString(body), replace)
+                SyncCategory.WatchProgress -> applyWatchProgressSnapshot(json.decodeFromString(body))
+                SyncCategory.Reminders -> applyRemindersSnapshot(json.decodeFromString(body))
+                SyncCategory.Favorites -> applyFavoritesSnapshot(json.decodeFromString(body))
+                SyncCategory.Watchlist -> applyWatchlistSnapshot(json.decodeFromString(body))
+                SyncCategory.Preferences -> applyPreferencesSnapshot(json.decodeFromString(body), replace)
+                SyncCategory.Credentials -> applyCredentialsSnapshot(json.decodeFromString(body))
+            }
+            PullOutcome.Applied
+        }.onFailure { Log.w(TAG, "decode ${category.name} failed", it) }
+            .getOrDefault(PullOutcome.Failed) }
+    }
+
+    private enum class PullOutcome { Applied, NoRemote, Failed }
+
+    // ── Snapshot builders ─────────────────────────────────────────────────
+
+    private fun envelope() = SyncEnvelope(
+        lastModified = System.currentTimeMillis(),
+        device = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+    )
+
+    private suspend fun buildPlaylistsSnapshot(): PlaylistsSnapshot {
+        val rows = playlistDao.allOnce()
+        val active = rows.firstOrNull { it.isActive }?.id
+        // Drop sensitive creds from this snapshot, they go in Credentials.
+        return PlaylistsSnapshot(
+            envelope = envelope(),
+            active = active,
+            playlists = rows.map { e ->
+                PlaylistSnapshotEntry(
+                    id = e.id,
+                    name = e.name,
+                    sourceType = e.sourceType,
+                    urlString = e.urlString,
+                    epgUrlString = e.epgUrl,
+                    lanUrlString = e.lanUrlString,
+                    username = null,
+                    apiKey = null,
+                    lastUsedMillis = e.lastRefreshedAt,
+                    dispatcharrAccountProfileIds = e.dispatcharrAccountProfileIds,
+                    vodEnabled = e.vodEnabled,
+                )
+            },
+        )
+    }
+
+    /** Task #52: favorites + the user's manual order (iOS parity). */
+    private suspend fun buildWatchlistSnapshot(): WatchlistSnapshot =
+        WatchlistSnapshot(
+            envelope = envelope(),
+            entries = watchlistStore.allOnce().map { e ->
+                WatchlistSnapshotEntry(
+                    vodId = e.key.substringAfter(':'),
+                    vodType = if (e.isMovie) "movie" else "series",
+                    title = e.title,
+                    posterUrl = e.posterUrl,
+                    releaseYear = e.year?.toString() ?: "",
+                    rating = e.rating ?: "",
+                    serverId = e.playlistId,
+                    addedAt = e.addedAt,
+                    removedAt = e.removedAt,
+                )
+            },
+            hidden = hiddenTitlesStore.allOnce().map { e ->
+                HiddenTitleSnapshotEntry(
+                    vodId = e.key.substringAfter(':'),
+                    vodType = if (e.key.startsWith("s:")) "series" else "movie",
+                    serverId = e.playlistId,
+                    hiddenAt = e.hiddenAt,
+                    unhiddenAt = e.unhiddenAt,
+                )
+            },
+        )
+
+    /** Tombstone-aware merge; see WatchlistStore.mergeRemote. */
+    private suspend fun applyWatchlistSnapshot(snapshot: WatchlistSnapshot) {
+        watchlistStore.mergeRemote(
+            snapshot.entries.map { r ->
+                val movie = r.vodType != "series"
+                com.aeriotv.android.core.preferences.WatchlistStore.Entry(
+                    key = (if (movie) "m:" else "s:") + r.vodId,
+                    title = r.title,
+                    posterUrl = r.posterUrl,
+                    year = r.releaseYear.toIntOrNull(),
+                    rating = r.rating.ifBlank { null },
+                    isMovie = movie,
+                    playlistId = r.serverId,
+                    addedAt = r.addedAt,
+                    removedAt = r.removedAt,
+                )
+            },
+        )
+        // Absent in payloads written before hidden titles shipped, in which
+        // case this is an empty list and the local rows are left alone.
+        hiddenTitlesStore.mergeRemote(
+            snapshot.hidden.map { r ->
+                com.aeriotv.android.core.preferences.HiddenTitlesStore.Entry(
+                    key = (if (r.vodType == "series") "s:" else "m:") + r.vodId,
+                    playlistId = r.serverId,
+                    hiddenAt = r.hiddenAt,
+                    unhiddenAt = r.unhiddenAt,
+                )
+            },
+        )
+    }
+
+    private suspend fun buildFavoritesSnapshot(): FavoritesSnapshot {
+        val rows = favoriteChannelDao.allOnce()
+        return FavoritesSnapshot(
+            envelope = envelope(),
+            entries = rows.map { row ->
+                FavoriteSnapshotEntry(
+                    channelId = row.channelId,
+                    channelName = row.channelName,
+                    displayOrder = row.displayOrder,
+                    addedAt = row.addedAt,
+                )
+            },
+        )
+    }
+
+    private suspend fun buildWatchProgressSnapshot(): WatchProgressSnapshot {
+        val rows = watchProgressDao.allOnce()
+        return WatchProgressSnapshot(
+            envelope = envelope(),
+            // URL-keyed rows never leave the device: they are device- and
+            // host-specific (LAN vs WAN base, file:// paths) so they can't
+            // match anywhere else, and they can leak hosts into the
+            // snapshot. Stable ids (movie/episode UUIDs, dvr-<id>) sync.
+            entries = rows.filter { !it.videoId.contains("://") }.map { row ->
+                WatchProgressSnapshotEntry(
+                    videoId = row.videoId,
+                    title = row.title,
+                    posterUrl = row.posterUrl,
+                    positionMs = row.positionMs,
+                    durationMs = row.durationMs,
+                    updatedAt = row.updatedAt,
+                    vodType = row.vodType,
+                    seriesId = row.seriesId,
+                    seasonNumber = row.seasonNumber,
+                    episodeNumber = row.episodeNumber,
+                    isFinished = row.isFinished,
+                )
+            },
+        )
+    }
+
+    private suspend fun buildRemindersSnapshot(): RemindersSnapshot {
+        val rows = reminderDao.allOnce()
+        return RemindersSnapshot(
+            envelope = envelope(),
+            entries = rows.map { row ->
+                ReminderSnapshotEntry(
+                    reminderKey = row.reminderKey,
+                    channelName = row.channelName,
+                    programTitle = row.programTitle,
+                    startMillis = row.startMillis,
+                    endMillis = row.endMillis,
+                )
+            },
+        )
+    }
+
+    private suspend fun buildPreferencesSnapshot(): PreferencesSnapshot {
+        // Synced subset, theme, default tab, palette overrides, UI toggles.
+        // Avoids syncing network/device-local settings (buffer size, custom
+        // DVR folder, network timeout) which are sensible per-device.
+        val keys = appPreferences.snapshotSyncablePreferences()
+        return PreferencesSnapshot(envelope = envelope(), keys = keys)
+    }
+
+    private suspend fun buildCredentialsSnapshot(): CredentialsSnapshot {
+        // playlistDao is the EncryptingPlaylistDao decorator, so allOnce() yields
+        // CLEARTEXT credentials (decrypted from their at-rest ciphertext). They
+        // are uploaded to Drive AppData in cleartext by design; see the trust
+        // model on CredentialsSnapshotEntry (audit task #53). The matching pull
+        // path (applyCredentialsSnapshot) writes back through the same decorator,
+        // re-encrypting at rest on the receiving device.
+        val rows = playlistDao.allOnce()
+        return CredentialsSnapshot(
+            envelope = envelope(),
+            entries = rows.mapNotNull { row ->
+                if (row.username == null && row.apiKey == null && row.password == null) null
+                else CredentialsSnapshotEntry(
+                    playlistId = row.id,
+                    username = row.username,
+                    password = row.password,
+                    apiKey = row.apiKey,
+                )
+            },
+        )
+    }
+
+    // ── Snapshot appliers ─────────────────────────────────────────────────
+
+    private suspend fun applyPlaylistsSnapshot(snapshot: PlaylistsSnapshot, replace: Boolean = false) {
+        if (replace && snapshot.playlists.isNotEmpty()) {
+            // Replace: a local playlist the snapshot does not carry is removed,
+            // through the same cleanup a manual delete runs. An EMPTY snapshot
+            // never wipes the device (a blank sender is not a real backup).
+            val keep = snapshot.playlists.map { it.id }.toSet()
+            playlistDao.allOnce().filter { it.id !in keep }.forEach { row ->
+                Log.i(TAG, "pull replace: removing local playlist ${row.id}")
+                playlistRepository.get().deletePlaylist(row.id)
+                    .onFailure { Log.w(TAG, "pull replace: delete ${row.id} failed", it) }
+            }
+        }
+        mergePlaylistsSnapshot(snapshot)
+    }
+
+    private suspend fun mergePlaylistsSnapshot(snapshot: PlaylistsSnapshot) = database.withTransaction {
+        val existing = playlistDao.allOnce().associateBy { it.id }
+        snapshot.playlists.forEach { entry ->
+            val current = existing[entry.id]
+            val merged = (current ?: PlaylistEntity(id = entry.id, name = entry.name, urlString = entry.urlString)).copy(
+                name = entry.name,
+                urlString = entry.urlString,
+                sourceType = entry.sourceType,
+                epgUrl = entry.epgUrlString,
+                // Old snapshots have no lanUrlString; keep whatever this
+                // device already has instead of wiping it.
+                lanUrlString = entry.lanUrlString ?: current?.lanUrlString,
+                // isActive is reconciled below so EXACTLY one row ends up active;
+                // don't trust the per-row flag here. Keep the existing flag for
+                // now (overwritten by switchActive).
+                isActive = current?.isActive ?: false,
+                // Adopt the synced child-safety account-profile filter. Empty
+                // from an older sender keeps this device's own value rather than
+                // wiping a good fail-closed snapshot; the next live load
+                // re-captures the real value regardless.
+                dispatcharrAccountProfileIds =
+                    entry.dispatcharrAccountProfileIds.takeIf { it.isNotBlank() }
+                        ?: current?.dispatcharrAccountProfileIds ?: "",
+                // Task #52: per-playlist On Demand opt-in follows the sync
+                // (iOS ServerConnection.vodEnabled parity). Old snapshots
+                // decode with the default true, matching the entity default.
+                vodEnabled = entry.vodEnabled,
+            )
+            playlistDao.upsert(merged)
+        }
+        // Enforce the single-active-row invariant that bootstrap relies on.
+        // The old code set isActive per row from snapshot.active, which left the
+        // app with TWO active rows when a local row outside the snapshot stayed
+        // active, or ZERO active when snapshot.active was missing/stale (deleted
+        // playlist). switchActive() deactivates every row and activates exactly
+        // one in a single transaction. Prefer the synced active id; fall back to
+        // the first row by display order so there is always exactly one active
+        // when any playlist exists.
+        val all = playlistDao.allOnce()
+        if (all.isNotEmpty()) {
+            // The active playlist is a PER-DEVICE choice (Streamer 2026-09-01:
+            // this device kept reverting to the "Kids" playlist because another
+            // device's snapshot said so). Keep this device's own active row when
+            // it still exists; consult the synced active id only when nothing
+            // here is active (first sync / the active playlist was deleted).
+            val localActive = all.firstOrNull { it.isActive }?.id
+            val targetId = localActive
+                ?: all.firstOrNull { it.id == snapshot.active }?.id
+                ?: all.minByOrNull { it.displayOrder }?.id
+                ?: all.first().id
+            playlistDao.switchActive(targetId)
+        }
+    }
+
+    private suspend fun applyWatchProgressSnapshot(snapshot: WatchProgressSnapshot) {
+        snapshot.entries.forEach { remote ->
+            // URL-keyed rows are legacy identity (dropped locally by
+            // MIGRATION_23_24 and excluded from pushes), but snapshots
+            // written by pre-fix builds still carry them and re-imported
+            // them on every restore (field find 2026-08-31: fresh install
+            // came back with http://...recordings/93/hls/... rows). Skip
+            // on apply too; the next push writes a clean snapshot.
+            if (remote.videoId.contains("://")) return@forEach
+            val local = watchProgressDao.getOnce(remote.videoId)
+            if (local == null || remote.updatedAt > local.updatedAt) {
+                // The snapshot only carries the synced position fields, so MERGE
+                // onto any existing local row to preserve its local-only episode
+                // metadata (vodType, seriesId, season/episode, streamUrl,
+                // isFinished, upNextQueue) and playlistId. Matches iOS, where the
+                // iCloud merge only overwrites the synced fields (Issue #19).
+                val base = local ?: WatchProgressEntity(
+                    videoId = remote.videoId,
+                    title = remote.title,
+                    posterUrl = remote.posterUrl,
+                    positionMs = remote.positionMs,
+                    durationMs = remote.durationMs,
+                    updatedAt = remote.updatedAt,
+                    // Fresh device: classification comes from the wire so the
+                    // row lands in the right rail (recordings/episodes were
+                    // arriving typed "movie" before the fields were synced).
+                    vodType = remote.vodType,
+                    seriesId = remote.seriesId,
+                    seasonNumber = remote.seasonNumber,
+                    episodeNumber = remote.episodeNumber,
+                    isFinished = remote.isFinished,
+                )
+                watchProgressDao.upsert(
+                    base.copy(
+                        title = remote.title,
+                        posterUrl = remote.posterUrl ?: base.posterUrl,
+                        positionMs = remote.positionMs,
+                        durationMs = remote.durationMs,
+                        updatedAt = remote.updatedAt,
+                        vodType = remote.vodType,
+                        seriesId = remote.seriesId ?: base.seriesId,
+                        seasonNumber = if (remote.seasonNumber > 0) remote.seasonNumber else base.seasonNumber,
+                        episodeNumber = if (remote.episodeNumber > 0) remote.episodeNumber else base.episodeNumber,
+                        isFinished = remote.isFinished || base.isFinished,
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Task #52: additive favorites merge, mirroring the reminders policy: a
+     * remote favorite this device lacks is added with its synced order; a
+     * favorite both sides have adopts the remote order only when the remote
+     * snapshot is fresher than the local add (so a reorder travels without a
+     * local drag being clobbered by a stale snapshot). Removals deliberately
+     * do NOT propagate - same create-only limitation as reminders (audit #24
+     * design note): a device can't tell "removed elsewhere" from "not added
+     * here yet" without tombstones.
+     */
+    private suspend fun applyFavoritesSnapshot(snapshot: FavoritesSnapshot) {
+        snapshot.entries.forEach { remote ->
+            val local = favoriteChannelDao.getOnce(remote.channelId)
+            if (local == null) {
+                favoriteChannelDao.upsert(
+                    FavoriteChannelEntity(
+                        channelId = remote.channelId,
+                        channelName = remote.channelName,
+                        displayOrder = remote.displayOrder,
+                        addedAt = remote.addedAt,
+                    ),
+                )
+            } else if (snapshot.envelope.lastModified > local.addedAt &&
+                local.displayOrder != remote.displayOrder
+            ) {
+                favoriteChannelDao.setDisplayOrder(remote.channelId, remote.displayOrder)
+            }
+        }
+    }
+
+    private suspend fun applyRemindersSnapshot(snapshot: RemindersSnapshot) {
+        snapshot.entries.forEach { remote ->
+            val local = reminderDao.getOnce(remote.reminderKey)
+            if (local == null) {
+                reminderDao.upsert(
+                    ReminderEntity(
+                        reminderKey = remote.reminderKey,
+                        channelName = remote.channelName,
+                        programTitle = remote.programTitle,
+                        startMillis = remote.startMillis,
+                        endMillis = remote.endMillis,
+                        alarmRequestCode = remote.reminderKey.hashCode(),
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun applyPreferencesSnapshot(snapshot: PreferencesSnapshot, replace: Boolean = false) {
+        appPreferences.applySyncedPreferences(snapshot.keys, replace)
+    }
+
+    private suspend fun applyCredentialsSnapshot(snapshot: CredentialsSnapshot) {
+        snapshot.entries.forEach { entry ->
+            val local = playlistDao.byId(entry.playlistId) ?: return@forEach
+            playlistDao.upsert(
+                local.copy(
+                    username = entry.username,
+                    password = entry.password,
+                    apiKey = entry.apiKey,
+                ),
+            )
+        }
+    }
+
+    sealed interface Status {
+        object SignedOut : Status
+        object MissingConfig : Status
+        data class SignedIn(val accessToken: String) : Status
+    }
+
+    /** One line on the onboarding restore screen: a category and where its
+     * pull currently stands. [detail] is an optional sub-line ("Nothing in
+     * Drive yet" / "Couldn't restore"), mirroring the iOS SyncStage detail. */
+    data class RestoreStep(
+        val category: SyncCategory,
+        val state: RestoreStepState = RestoreStepState.Pending,
+        val detail: String? = null,
+    )
+
+    enum class RestoreStepState { Pending, Running, Done, Failed }
+
+    /** Two outcomes from [requestDriveScope]: token in hand, or needs consent UI. */
+    sealed interface RequestResult {
+        data class Authorized(val accessToken: String) : RequestResult
+        data class NeedsConsent(val intentSender: android.content.IntentSender) : RequestResult
+        object Failed : RequestResult
+    }
+
+    companion object {
+        private const val TAG = "DriveSyncManager"
+        /** Conservative cache lifetime for a persisted access token. Google's
+         * tokens last ~1h; refreshing at 50min avoids handing out a token
+         * that's about to expire mid-sync. */
+        private const val TOKEN_TTL_MS = 50L * 60L * 1000L
+    }
+}

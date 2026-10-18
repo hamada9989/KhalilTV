@@ -1,0 +1,223 @@
+package com.aeriotv.android.core.cast.hlsproxy
+
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Pure-JVM checks for the cast HLS proxy server's segment store and
+ * playlist across a live splice (channel change or ingest reconnect).
+ * Exercises the store API directly, no sockets: the device-observed
+ * failure was the receiver 404ing on segments its cached playlist still
+ * promised because the old splice path wiped the ring and left a
+ * sequence numbering gap (Shaka error 1001, CAF CLIP_ENDED reload).
+ */
+class CastHlsProxyServerTest {
+
+    private val server = CastHlsProxyServer(log = {})
+
+    /** ~3 s of 90 kHz ticks, matching real segment cadence. */
+    private val ticks = 3L * TsToFmp4Remuxer.TICKS_PER_SECOND
+
+    private fun publish(gen: Int, count: Int, tag: Byte = 0) {
+        repeat(count) { i ->
+            val marker = byteArrayOf(tag, gen.toByte(), i.toByte())
+            server.addSegment(gen, videoData = marker, audioData = marker, durationTicks = ticks)
+        }
+    }
+
+    private fun addSegment(gen: Int, marker: Byte) =
+        server.addSegment(
+            gen,
+            videoData = byteArrayOf(marker),
+            audioData = byteArrayOf(marker),
+            durationTicks = ticks,
+        )
+
+    // ---- sequence continuity ----
+
+    @Test
+    fun `splice never leaves a sequence gap`() {
+        val gen1 = server.beginGeneration()
+        server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(11))
+        publish(gen1, 3) // seq 0..2
+        val gen2 = server.beginGeneration()
+        server.setInitSegments(gen2, byteArrayOf(2), byteArrayOf(22))
+        publish(gen2, 1)
+        // First post-splice segment is exactly lastPublishedSequence+1.
+        assertNotNull("seq 3 must follow seq 2 across the splice", server.awaitSegment(3, 0))
+        assertNull("seq 4 not yet published", server.awaitSegment(4, 0))
+    }
+
+    @Test
+    fun `stale ingest after splice claims no sequence number`() {
+        val gen1 = server.beginGeneration()
+        publish(gen1, 2) // seq 0..1
+        val gen2 = server.beginGeneration()
+        // Old remuxer racing the channel change: dropped, number unclaimed.
+        addSegment(gen1, 9)
+        publish(gen2, 1)
+        assertNotNull("new generation starts at seq 2", server.awaitSegment(2, 0))
+        assertNull(server.awaitSegment(3, 0))
+    }
+
+    // ---- playlist shape ----
+
+    @Test
+    fun `playlist across splice lists old entries then discontinuity then new map`() {
+        val gen1 = server.beginGeneration()
+        server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(11))
+        publish(gen1, 17) // seq 0..16; the 16-segment window will hold 3..18
+        val gen2 = server.beginGeneration()
+        server.setInitSegments(gen2, byteArrayOf(2), byteArrayOf(22))
+        publish(gen2, 2) // seq 17,18
+        val playlist = server.videoPlaylistText()
+        val lines = playlist.lines()
+        assertTrue(playlist.contains("#EXT-X-MEDIA-SEQUENCE:3"))
+        val oldMap = lines.indexOf("#EXT-X-MAP:URI=\"vinit$gen1.mp4\"")
+        val lastOldSeg = lines.indexOf("vseg16.m4s")
+        val disc = lines.indexOf("#EXT-X-DISCONTINUITY")
+        val newMap = lines.indexOf("#EXT-X-MAP:URI=\"vinit$gen2.mp4\"")
+        val firstNewSeg = lines.indexOf("vseg17.m4s")
+        assertTrue("old-generation MAP present", oldMap >= 0)
+        assertTrue("old-generation segments still listed", lastOldSeg > oldMap)
+        assertTrue("DISCONTINUITY after the old entries", disc > lastOldSeg)
+        assertTrue("new MAP after the DISCONTINUITY", newMap > disc)
+        assertTrue("new-generation segments after the new MAP", firstNewSeg > newMap)
+        assertTrue("new-generation live edge listed", playlist.contains("vseg18.m4s"))
+    }
+
+    @Test
+    fun `fresh session playlist has no discontinuity`() {
+        val gen1 = server.beginGeneration()
+        server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(11))
+        publish(gen1, 2)
+        assertFalse(server.videoPlaylistText().contains("#EXT-X-DISCONTINUITY"))
+    }
+
+    // ---- old-generation availability across the splice ----
+
+    @Test
+    fun `old segments and init stay servable after splice until eviction`() {
+        val gen1 = server.beginGeneration()
+        server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(11))
+        publish(gen1, 5) // seq 0..4
+        val gen2 = server.beginGeneration()
+        server.setInitSegments(gen2, byteArrayOf(2), byteArrayOf(22))
+        publish(gen2, 2) // seq 5,6; ring holds 0..6
+        for (seq in 0..4) {
+            assertNotNull("old-gen vseg$seq must survive the splice", server.awaitSegment(seq, 0))
+        }
+        assertNotNull("old-gen init must survive while listed", server.videoInitSegment(gen1))
+        assertNotNull(server.videoInitSegment(gen2))
+        // Ring capacity is 19 (16-segment window + 3 tail): publish enough new-gen segments to evict
+        // every old-gen entry, then the old init goes too.
+        publish(gen2, 19) // seq 7..25; ring now 7..25, all gen2
+        assertNull("evicted old segment 404s", server.awaitSegment(0, 0))
+        assertNull("unreferenced old init dropped", server.videoInitSegment(gen1))
+        assertNotNull(server.videoInitSegment(gen2))
+    }
+
+    // ---- live-edge hold ----
+
+    @Test
+    fun `held request for newest plus one completes when published`() {
+        val gen1 = server.beginGeneration()
+        publish(gen1, 3) // seq 0..2; newest+1 is 3
+        val result = AtomicReference<ByteArray?>()
+        val done = CountDownLatch(1)
+        Thread {
+            result.set(server.awaitSegment(3, 5_000))
+            done.countDown()
+        }.start()
+        // Let the fetch park on the monitor before publishing.
+        Thread.sleep(150)
+        addSegment(gen1, 42)
+        assertTrue("held fetch must complete on publish", done.await(2, TimeUnit.SECONDS))
+        assertNotNull(result.get())
+        assertEquals(42, result.get()!![0].toInt())
+    }
+
+    @Test
+    fun `held request spanning a splice completes with the new generation segment`() {
+        val gen1 = server.beginGeneration()
+        publish(gen1, 2) // seq 0..1; newest+1 is 2
+        val result = AtomicReference<ByteArray?>()
+        val done = CountDownLatch(1)
+        Thread {
+            result.set(server.awaitSegment(2, 5_000))
+            done.countDown()
+        }.start()
+        Thread.sleep(150)
+        // The device failure scenario: the receiver asks for the next
+        // number while the channel change splices underneath it.
+        val gen2 = server.beginGeneration()
+        addSegment(gen2, 7)
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        assertNotNull("seq 2 arrives from the new generation, never a 404", result.get())
+        assertEquals(7, result.get()!![0].toInt())
+    }
+
+    @Test
+    fun `requests far past the edge or behind the ring fail immediately`() {
+        val gen1 = server.beginGeneration()
+        publish(gen1, 3) // seq 0..2
+        val start = System.currentTimeMillis()
+        // The hold window is the next sequence plus MAX_FUTURE_SEGMENTS
+        // (seq 3, 4 and 5 here); anything further out is a bad URL and
+        // must 404 at once rather than pinning a connection thread.
+        assertNull("four past the edge is a bad URL", server.awaitSegment(7, 5_000))
+        assertTrue("no hold for far-future sequences", System.currentTimeMillis() - start < 1_000)
+        publish(gen1, 19) // evict seq 0..2
+        assertNull("behind the ring is gone", server.awaitSegment(0, 5_000))
+        assertTrue(System.currentTimeMillis() - start < 2_000)
+    }
+
+    // ---- init segments the playlists name (nothing4.log 2026-09-27) ----
+
+    private fun mapUris(text: String) =
+        Regex("#EXT-X-MAP:URI=\"([^\"]+)\"").findAll(text).map { it.groupValues[1] }.toList()
+
+    private fun assertEveryMapResolves() {
+        for ((text, lookup) in listOf(
+            server.videoPlaylistText() to { g: Int -> server.videoInitSegment(g) },
+            server.audioPlaylistText() to { g: Int -> server.audioInitSegment(g) },
+        )) {
+            val uris = mapUris(text)
+            assertTrue("playlist names an init: $text", uris.isNotEmpty())
+            for (uri in uris) {
+                val gen = uri.removeSuffix(".mp4").filter { it.isDigit() }.toInt()
+                assertNotNull("$uri is served", lookup(gen))
+            }
+        }
+    }
+
+    @Test
+    fun `stale tail published after stop never names a missing init in the next session`() {
+        server.start()
+        try {
+            val gen1 = server.beginGeneration()
+            server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(2))
+            publish(gen1, 5)
+            server.stop()
+            // The old ingest thread's splice tail lands after stop().
+            addSegment(gen1, 9)
+            server.setInitSegments(gen1, byteArrayOf(1), byteArrayOf(2))
+            server.start()
+            // HEVC passthrough session: hvcC init, passthrough segments.
+            val gen2 = server.beginGeneration()
+            server.setInitSegments(gen2, byteArrayOf(3), byteArrayOf(4))
+            publish(gen2, 4)
+            assertEveryMapResolves()
+            assertFalse(server.videoPlaylistText().contains("vinit$gen1"))
+        } finally {
+            server.stop()
+        }
+    }
+}

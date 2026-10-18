@@ -1,0 +1,4365 @@
+package com.aeriotv.android.core.data.repository
+
+import com.aeriotv.android.core.data.EPGProgramme
+import com.aeriotv.android.core.data.M3UChannel
+import com.aeriotv.android.core.data.SourceType
+import androidx.room.withTransaction
+import com.aeriotv.android.core.data.db.dao.ChannelSnapshotDao
+import com.aeriotv.android.core.data.db.dao.EpgChunkCoverageDao
+import com.aeriotv.android.core.data.db.dao.EpgProgrammeDao
+import com.aeriotv.android.core.data.db.dao.PlaylistDao
+import com.aeriotv.android.core.data.db.entity.ChannelSnapshotEntity
+import com.aeriotv.android.core.data.db.entity.EpgProgrammeEntity
+import com.aeriotv.android.core.data.db.entity.PlaylistEntity
+import com.aeriotv.android.core.data.db.entity.dispatcharrVersionAtLeast
+import com.aeriotv.android.core.data.db.entity.capabilitiesNeedProbe
+import com.aeriotv.android.core.data.db.entity.isDispatcharrDirectConnect
+import com.aeriotv.android.core.data.db.entity.canSwitchStream
+import com.aeriotv.android.core.data.capability.CAPABILITIES_SCHEMA
+import com.aeriotv.android.core.data.capability.Capability
+import com.aeriotv.android.core.data.capability.CapabilityCorrections
+import com.aeriotv.android.core.data.capability.CapabilityState
+import com.aeriotv.android.core.data.capability.parseCustomProperties
+import com.aeriotv.android.core.data.db.entity.capabilities
+import com.aeriotv.android.core.data.db.entity.dispatcharrEffectiveDvrAccess
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import com.aeriotv.android.core.data.db.entity.dispatcharrAccountProfileIdList
+import com.aeriotv.android.core.data.db.entity.dispatcharrCanUseCatchup
+import com.aeriotv.android.core.data.db.entity.dispatcharrCanViewSeries
+import com.aeriotv.android.core.data.db.entity.dispatcharrCanViewVod
+import com.aeriotv.android.core.data.db.entity.EPG_CHUNK_TTL_MS
+import com.aeriotv.android.core.data.db.entity.EpgChunkCoverage
+import com.aeriotv.android.core.data.db.entity.sanitizeGuideDays
+import com.aeriotv.android.core.guide.guideChannelId
+import com.aeriotv.android.core.data.db.entity.resolveGuideDays
+import com.aeriotv.android.core.data.db.entity.GUIDE_DAYS_ALL_MAX_BACK
+import com.aeriotv.android.core.data.db.entity.GUIDE_DAYS_ALL_MAX_AHEAD
+import android.content.Context
+import android.util.Log
+import com.aeriotv.android.core.network.DispatcharrAuthBroker
+import com.aeriotv.android.core.network.DispatcharrClient
+import com.aeriotv.android.core.network.LanReachability
+import com.aeriotv.android.core.network.DispatcharrChannel
+import com.aeriotv.android.core.network.DispatcharrEpgData
+import com.aeriotv.android.core.network.DispatcharrEpgEntry
+import com.aeriotv.android.core.network.DispatcharrEpgSource
+import com.aeriotv.android.core.network.DispatcharrTokenStore
+import com.aeriotv.android.core.network.PlaylistFetcher
+import com.aeriotv.android.core.parser.M3UParser
+import com.aeriotv.android.core.parser.XMLTVParser
+import com.aeriotv.android.core.preferences.AppPreferences
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.time.Instant
+import java.time.OffsetDateTime
+import java.util.UUID
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Single source of truth for playlist persistence + fetch + parse.
+ * Mirrors how iOS Aerio handles playlists: row stored in SwiftData, channels
+ * re-parsed from source on every refresh (NOT cached individually).
+ *
+ * Derives the M3U URL, EPG URL, and HTTP headers from the playlist's
+ * [PlaylistEntity.sourceType]:
+ *  - M3uUrl: use [PlaylistEntity.urlString] directly + optional [PlaylistEntity.epgUrl].
+ *  - DispatcharrApiKey: M3U = `${urlString}/output/m3u`, EPG = `${urlString}/output/epg`,
+ *    headers = `{X-API-Key: ${apiKey}, Accept: application/json}` (Phase 4a).
+ *  - DispatcharrUserPass: log in to /api/auth/token/, exchange the JWT access
+ *    token for the user's API key via /api/accounts/users/me/, then proceed
+ *    exactly like DispatcharrApiKey. Mirrors iOS DispatcharrDirectConnect's
+ *    silent-rebootstrap pattern.
+ *  - XtreamCodes: TODO Phase 4c (player_api.php enumeration -> get.php m3u_plus).
+ */
+/** GH #31: channel-snapshot insert batch size. Small enough that one chunk's
+ *  entities are trivially cheap against the heap, large enough that per-chunk
+ *  SQLite bind overhead stays negligible across a ~100k-row XC catalog. */
+private const val CHANNEL_CACHE_CHUNK = 2_000
+
+/** Ceiling on one EPG load (network + parse). Wide enough for a multi-hundred
+ *  MB provider XMLTV on a slow link; exists so a wedged load releases the
+ *  in-flight latch in [PlaylistRepository.loadEpg] instead of blocking every
+ *  future EPG refresh until the process dies. */
+private const val EPG_LOAD_TIMEOUT_MS = 5L * 60L * 1000L
+
+/** Upstream Dispatcharr XMLTV feeds to layer for catch-up depth (task #210).
+ *  Was 8. A Direct Connect server can list many sources, and each one is a
+ *  FULL XMLTV download; the value of the 4th feed is negligible next to the
+ *  cost of fetching it on every EPG load. */
+private const val MAX_UPSTREAM_EPG_SOURCES = 3
+
+/** Ceiling on ONE upstream feed. A single slow or enormous XMLTV must not be
+ *  able to stall the EPG load behind it. */
+// Raised 90s -> 5min (2026-09-01): the parse now runs on the background-
+// priority EpgWork pool, so a long parse no longer competes with playback;
+// at 90s the 224MB national feed kept 6,575 programmes and dropped the rest.
+private const val UPSTREAM_EPG_PER_SOURCE_MS = 5L * 60L * 1000L
+
+/** Ceiling on the whole upstream-layering phase. This is bonus history, not
+ *  the user's guide: past this the grid ships as-is. */
+private const val UPSTREAM_EPG_TOTAL_BUDGET_MS = 12L * 60L * 1000L
+
+/** Orphaned download temp files older than this are swept at startup. The
+ *  download path deletes its temp in a `finally`, but a process death mid
+ *  download (force-stop while "syncing", low-memory kill) skips that entirely,
+ *  and each orphan is the full size of whatever was being fetched. The Discord
+ *  report of a 4GB app cache was exactly this, repeated. */
+private const val ORPHAN_TEMP_MAX_AGE_MS = 60L * 60L * 1000L
+
+/**
+ * Quiet EPG sweep pacing (Logan 2026-09-12). The sweep exists to correct a
+ * cache that is still being served, so every number here is chosen to be
+ * unnoticeable rather than fast:
+ *  - settle: how long after launch / foreground return before the first
+ *    request, giving the guide time to paint from cache and any tune time to
+ *    reach its first frame,
+ *  - gap: the pause between two day chunks,
+ *  - poll: how often a paused sweep re-asks [EpgSweepGate],
+ *  - interval: the foreground re-check gate on the sources fingerprint.
+ */
+const val EPG_SWEEP_SETTLE_MS: Long = 20_000L
+const val EPG_SWEEP_CHUNK_GAP_MS: Long = 1_500L
+const val EPG_SWEEP_PAUSE_POLL_MS: Long = 2_000L
+const val EPG_SOURCES_CHECK_INTERVAL_MS: Long = 15L * 60L * 1000L
+
+/** E-6: minimum gap between EPG retention sweeps for one playlist. Upstream
+ *  layering saves once per source; the cutoff is days out, so re-pruning
+ *  seconds later only costs a full-table DELETE scan. */
+private const val RETENTION_SWEEP_COOLDOWN_MS = 5L * 60L * 1000L
+
+@Singleton
+class PlaylistRepository @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val dao: PlaylistDao,
+    private val fetcher: PlaylistFetcher,
+    private val dispatcharrClient: DispatcharrClient,
+    private val dispatcharrAuth: DispatcharrAuthBroker,
+    private val dispatcharrTokenStore: DispatcharrTokenStore,
+    private val appPreferences: AppPreferences,
+    private val epgProgrammeDao: EpgProgrammeDao,
+    private val epgChunkCoverageDao: EpgChunkCoverageDao,
+    private val channelSnapshotDao: ChannelSnapshotDao,
+    // GH #31: injected so the channel-snapshot persist can delete-then-insert in
+    // CHUNKS inside one transaction (see saveChannelsToCache) instead of binding
+    // the whole ~100k-row catalog at once. Same pattern DriveSyncManager uses.
+    private val database: com.aeriotv.android.core.data.db.AerioDatabase,
+    private val activeCredentials: com.aeriotv.android.core.network.ActivePlaylistCredentials,
+    private val lanReachability: LanReachability,
+    private val xtreamApi: com.aeriotv.android.core.network.XtreamCodesApi,
+    // Retained live-rewind fillers are invisible network connections held
+    // open under whichever account opened them; a credential edit has to
+    // drop them (see the credential-change block in loadAndPersist).
+    // Cycle-free: TimeshiftController only depends on its buffer store and
+    // AppPreferences.
+    private val timeshiftController: com.aeriotv.android.core.timeshift.TimeshiftController,
+    // Holds the connected account's XC output credentials, memoized by base
+    // URL; a credential edit has to drop them or catch-up keeps playing as
+    // the previous user.
+    private val catchupResolver: com.aeriotv.android.core.playback.CatchupPlaybackResolver,
+    // Playlist DELETE is the only caller: it drops that playlist's VOD
+    // catalog rows and its snapshot metadata file. Both depend on nothing
+    // but the database / context, so there is no cycle back to here.
+    private val vodCatalogStore: com.aeriotv.android.core.data.vod.VodCatalogStore,
+    private val vodSnapshotStore: com.aeriotv.android.core.preferences.VodLibrarySnapshotStore,
+    private val snapshotStamps: com.aeriotv.android.core.profiles.ChannelSnapshotStamps,
+) {
+
+    /** Last successful cast-profile re-resolve per playlist id, so the launch
+     *  and foreground triggers coalesce to one lookup per 15 minutes. */
+
+    /**
+     * Audit task #54: push the active playlist's apiKey + URL prefix set into
+     * the synchronous [com.aeriotv.android.core.network.ActivePlaylistCredentials]
+     * cache so Coil's OkHttp interceptor can attach `X-API-Key` to image
+     * fetches against the same source. Called from every code path that
+     * mutates or selects the active playlist; safe to call with null on a
+     * source that doesn't need auth (clears the cache).
+     */
+    private fun publishActiveCredentials(playlist: PlaylistEntity?) {
+        // Connection-limit notice gate: Direct Connect playlists only.
+        com.aeriotv.android.core.playback.DispatcharrConnectionLimit.directConnectActive =
+            playlist?.sourceType == SourceType.DispatcharrApiKey.name ||
+                playlist?.sourceType == SourceType.DispatcharrUserPass.name
+        if (playlist == null) {
+            activeCredentials.clear()
+            return
+        }
+        val prefixes = listOfNotNull(
+            playlist.urlString.takeIf { it.isNotBlank() },
+            playlist.lanUrlString?.takeIf { it.isNotBlank() },
+        )
+        activeCredentials.set(prefixes, playlist.apiKey)
+    }
+
+    /**
+     * Returns [PlaylistEntity.lanUrlString] when the server actually answers
+     * at that address; otherwise [PlaylistEntity.urlString]. Replaced the old
+     * home-SSID match (fine-location permission + per-device saved networks
+     * that never synced, so fresh installs silently routed WAN) with a cached
+     * reachability probe; see [LanReachability] for the trigger points.
+     */
+    suspend fun effectiveBaseUrl(playlist: PlaylistEntity): String {
+        // Task #49: every Dispatcharr call path resolves its base through
+        // here, so this is the one choke point that guarantees the client's
+        // per-host auth-mode registry is primed from the persisted row
+        // before the request goes out (no-op for the legacy empty mode).
+        dispatcharrClient.seedAuthMode(playlist)
+        // Same choke point primes the per-playlist User-Agent override, so a
+        // Dispatcharr request can never go out under the default UA after the
+        // user set one in Edit Playlist.
+        dispatcharrClient.seedUserAgent(playlist)
+        val lan = playlist.lanUrlString?.takeIf { it.isNotBlank() } ?: return playlist.urlString
+        return if (lanReachability.isReachable(lan)) lan else playlist.urlString
+    }
+
+    /**
+     * The verdict-flip signal from [LanReachability] (LAN URL key that just
+     * flipped LAN<->WAN). The player collects this to re-tune a live Dispatcharr
+     * stream onto the now-reachable base. iOS analog: TVLANProbe -> PlayerSession
+     * .retuneCurrentToActiveURL() (commit e6ca1d207).
+     */
+    val lanVerdictFlips: kotlinx.coroutines.flow.SharedFlow<String> =
+        lanReachability.verdictFlips
+
+    /** Force a fresh LAN/WAN probe of the active playlist's LAN URL, returning
+     *  the resolved effective base afterward. Used by the player's terminal-
+     *  error failover (iOS failoverRetryCurrent: reprobeAndWait then re-tune). */
+    suspend fun reprobeActiveBase(): String? {
+        val pl = activePlaylist() ?: return null
+        pl.lanUrlString?.takeIf { it.isNotBlank() }?.let { lanReachability.refresh(it) }
+        return effectiveBaseUrl(pl)
+    }
+
+    /**
+     * Rebuild the canonical /proxy/ts/stream/<uuid> URL for a Dispatcharr
+     * channel from the active playlist's CURRENT effective base (LAN vs WAN),
+     * rather than trusting a cached channel.url baked at last fetch. Returns
+     * null when there is no active playlist, the source is not Dispatcharr, or
+     * the playlist has no LAN URL (nothing to flip). Mirrors the streamUrlFor
+     * idiom in AutoBrowseTree.kt and iOS ChannelStore.dispatcharrStreamURLs.
+     */
+    suspend fun rebuildLiveStreamUrl(channelUuid: String): String? {
+        val pl = activePlaylist() ?: return null
+        val sourceType = pl.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return null
+        val base = effectiveBaseUrl(pl)
+        return dispatcharrClient.streamUrl(base, channelUuid)
+    }
+
+    // Cast audio, 2026-09-13: the Dispatcharr output-profile lookup and the
+    // launch / foreground re-resolve that lived here are GONE. Cast sessions
+    // ingest the plain stream and AC-3 / E-AC-3 passes through to the
+    // receiver's own audio/mp4 SourceBuffer, so there is nothing to resolve
+    // or persist. The `dispatcharrCastAacProfileId` column stays on the row
+    // (untouched) rather than forcing a migration.
+
+    /** Inputs for creating or updating a playlist row. */
+    data class SaveRequest(
+        val sourceType: SourceType,
+        val name: String?,
+        val url: String,
+        val lanUrl: String? = null,
+        val epgUrl: String? = null,
+        val apiKey: String? = null,
+        val username: String? = null,
+        val password: String? = null,
+        /** Dispatcharr channel-profile id to scope this playlist to, or null
+         * for "All Channels". Ignored for non-Dispatcharr sources. */
+        val dispatcharrProfileId: Int? = null,
+        /** Per-playlist On Demand opt-in (iOS ServerConnection.vodEnabled).
+         *  Default true. UI exposes this for Dispatcharr / Xtream sources; M3U
+         *  doesn't carry VOD so the field is ignored downstream for it. */
+        val vodEnabled: Boolean = true,
+        /** Days of already-aired EPG kept for catch-up browsing (task #135). */
+        val epgRetentionDays: Int = 7,
+        /**
+         * Per-playlist Dispatcharr User-Agent (Apple `customUserAgent`).
+         * Blank = the app default. Null means "leave whatever the row has",
+         * which is what every caller other than Edit Playlist wants.
+         */
+        val customUserAgent: String? = null,
+    )
+
+    /**
+     * The coarse phases of [loadAndPersist], reported to the caller so Edit
+     * Playlist (and Add Playlist) can say what a multi-second save is actually
+     * doing instead of showing an unexplained spinner.
+     *
+     * Only the stages that RUN are reported: a non-credential edit (a rename, a
+     * Guide Days change) re-authenticates nothing, so it starts at
+     * [LoadingChannels]. Never guess these with a timer - they are emitted at
+     * the real call boundaries.
+     *
+     * The declaration order is also the order a save screen lists them in. The
+     * two On Demand stages are not run by this class: the save only decides
+     * whether the catalog has to be rebuilt (see [SavePlan.rebuildVod]) and the
+     * caller drives the rebuild after the row has landed, reporting these two
+     * itself.
+     */
+    enum class SaveStage {
+        /** Dispatcharr login / api_key verification against the server. */
+        VerifyingCredentials,
+
+        /** Account metadata + the channel fetch, which is usually the long one. */
+        LoadingChannels,
+
+        /** The movies half of the On Demand catalog, rebuilt by the caller. */
+        LoadingMovies,
+
+        /** The TV Shows half of the On Demand catalog, rebuilt by the caller. */
+        LoadingSeries,
+
+        /** Row persist, identity drop, snapshot cache, capability probe. */
+        Finishing,
+    }
+
+    /**
+     * What this save is actually going to do, published to the caller as soon
+     * as each part of it is known so a save screen can list exactly those steps
+     * and no others (Logan 2026-09-18: the rows must be truthful - a row is
+     * shown only when the work behind it really runs).
+     *
+     * [stages] is in display order and only ever GROWS, so a screen following
+     * it never sees a step disappear or the current one move backwards.
+     */
+    data class SavePlan(
+        val stages: List<SaveStage>,
+        /**
+         * True when the credentials or the URL changed on the ACTIVE playlist,
+         * so its stored On Demand catalog belongs to an account the app is no
+         * longer connected as and has to be wiped and rebuilt.
+         */
+        val rebuildVod: Boolean = false,
+    ) {
+        val hasMovies: Boolean get() = SaveStage.LoadingMovies in stages
+        val hasSeries: Boolean get() = SaveStage.LoadingSeries in stages
+    }
+
+    /**
+     * Edit Playlist > Refresh Session (Apple `refreshDirectConnectSession`).
+     * Re-runs the Direct Connect login from the saved username + password,
+     * caches the fresh JWT pair and re-reads /api/accounts/users/me/ so a
+     * server-side api_key rotation is picked up. Returns true when the cached
+     * api_key actually changed, false when it was already current, and a
+     * failure when there are no credentials to re-mint from or the login was
+     * rejected.
+     *
+     * The whole exchange is [DispatcharrAuthBroker.silentRebootstrapApiKey],
+     * i.e. exactly the path a 401 already takes; this only lets the user ask
+     * for it before anything fails.
+     */
+    suspend fun refreshDispatcharrSession(playlistId: String): Result<Boolean> {
+        val playlist = dao.byId(playlistId)
+            ?: return Result.failure(IllegalStateException("Playlist not found."))
+        val previousKey = playlist.apiKey?.trim().orEmpty()
+        if (playlist.username.isNullOrBlank() || playlist.password.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Username and password required."))
+        }
+        val fresh = dispatcharrAuth.silentRebootstrapApiKey(playlist)
+            ?: return Result.failure(IllegalStateException("Refresh failed. Check the URL and credentials."))
+        return Result.success(fresh.trim() != previousKey)
+    }
+
+    /** Any saved playlist by id, active or not (Edit Playlist on a non-active row). */
+    suspend fun playlistById(id: String): PlaylistEntity? = dao.byId(id)
+
+    suspend fun activePlaylist(): PlaylistEntity? {
+        val pl = dao.firstActive()
+        // Keep the sync credential cache in lockstep with the DB; covers the
+        // cold-launch path where AerioTVApplication kicks off a read on
+        // startup. Read-only callers benefit too -- they're cheap.
+        publishActiveCredentials(pl)
+        return pl
+    }
+
+    /**
+     * What an Edit Playlist save actually has to do, decided from the fields
+     * that CHANGED against the stored row (Apple parity: it has always skipped
+     * the reload for a non-identity edit).
+     *
+     * Measured on device 2026-09-18: a save that only renamed the playlist cost
+     * 9 to 11 s, because [loadAndPersist] always refetched all 650 channels (6
+     * to 9 s) and then spent ~2 s in [SaveStage.Finishing] on a user-level read,
+     * a forced capability probe and the 650-row snapshot write. None of that
+     * work can change anything a rename affects, so a rename now takes the
+     * [instant] path: one row UPDATE, no network, no loading screen.
+     */
+    data class EditPlan(
+        /** URL / credentials / auth mode / source type: the full reload. */
+        val fullReload: Boolean,
+        /**
+         * Channel Profile change: it decides WHICH channels exist, so the fetch
+         * is real work the user has to wait for, but nothing re-authenticates.
+         */
+        val channelRefetch: Boolean,
+        /** Guide Days, or an EPG URL edit on a source that owns its own EPG. */
+        val reloadGuide: Boolean,
+        /** On Demand was switched on for the active playlist: sweep it. */
+        val vodTurnedOn: Boolean,
+        /** On Demand was switched off: the catalog is hidden, as before. */
+        val vodTurnedOff: Boolean,
+        /** The per-playlist User-Agent changed: reseed the per-host cache. */
+        val userAgentChanged: Boolean,
+        /** The LAN URL changed: re-probe its reachability. */
+        val lanUrlChanged: Boolean,
+    ) {
+        /** No network stage: the row update lands and the screen pops at once. */
+        val instant: Boolean get() = !fullReload && !channelRefetch
+
+        /** True when a save screen has something truthful to show. */
+        val hasNetworkStage: Boolean get() = !instant
+    }
+
+    /**
+     * Classify an Edit Playlist save against the row as it stands now. Returns
+     * null when there is no such row (the caller then runs the full path, which
+     * is what an Add does anyway).
+     *
+     * [sourceTypeOverride] is Edit Playlist's Authentication toggle: moving a
+     * Dispatcharr playlist between API Key and Username & Password IS an
+     * identity change even when every visible field reads the same.
+     */
+    suspend fun classifyEdit(request: SaveRequest, existingId: String): EditPlan? {
+        val prior = dao.byId(existingId) ?: return null
+        val normalisedBase = request.url.trimEnd('/')
+        // Only a SUPPLIED credential that differs counts; Edit Playlist sends
+        // only the fields of the auth mode on screen, so the nulls mean
+        // "untouched" (same rule as loadAndPersist).
+        val suppliedKey = request.apiKey?.trim()?.takeIf { it.isNotBlank() }
+        val suppliedUser = request.username?.trim()?.takeIf { it.isNotBlank() }
+        val suppliedPass = request.password?.takeIf { it.isNotBlank() }
+        val credentialsChanged =
+            (suppliedKey != null && suppliedKey != prior.apiKey?.trim()?.takeIf { it.isNotBlank() }) ||
+                (suppliedUser != null && suppliedUser != prior.username?.trim()?.takeIf { it.isNotBlank() }) ||
+                (suppliedPass != null && suppliedPass != prior.password?.takeIf { it.isNotBlank() })
+        val urlChanged = prior.urlString.trimEnd('/') != normalisedBase
+        val sourceTypeChanged = request.sourceType.name != prior.sourceType
+        val newLan = request.lanUrl?.trimEnd('/')?.takeIf { it.isNotBlank() }
+        val lanChanged = newLan != prior.lanUrlString?.trimEnd('/')?.takeIf { it.isNotBlank() }
+        val newEpg = request.epgUrl?.takeIf { it.isNotBlank() }
+        val epgChanged = newEpg != prior.epgUrl?.takeIf { it.isNotBlank() }
+        val daysChanged =
+            sanitizeGuideDays(request.epgRetentionDays) != sanitizeGuideDays(prior.epgRetentionDays)
+        val profileChanged = request.dispatcharrProfileId != prior.dispatcharrProfileId
+        val uaChanged = request.customUserAgent != null &&
+            request.customUserAgent.trim() != prior.customUserAgent.trim()
+        val vodChanged = request.vodEnabled != prior.vodEnabled
+        return EditPlan(
+            fullReload = credentialsChanged || urlChanged || sourceTypeChanged,
+            channelRefetch = profileChanged,
+            // An EPG URL edit only changes where the NEXT guide refresh reads
+            // from, so it is a background reload, never a channel fetch.
+            reloadGuide = (daysChanged || epgChanged) && prior.isActive,
+            vodTurnedOn = vodChanged && request.vodEnabled && prior.isActive,
+            vodTurnedOff = vodChanged && !request.vodEnabled,
+            userAgentChanged = uaChanged,
+            lanUrlChanged = lanChanged,
+        )
+    }
+
+    /**
+     * The instant Edit Playlist save: write the edited fields to the existing
+     * row and nothing else. No login, no channel fetch, no capability probe, no
+     * [SaveStage.Finishing] work, so no loading screen either.
+     *
+     * Every surface that shows the playlist (the Settings rows, the detail page,
+     * the On Demand gate) reads the row through a Room flow, so the single
+     * UPDATE here is what repaints them; that is also how the On Demand toggle
+     * takes effect, since OnDemandViewModel collects the same flow.
+     */
+    suspend fun applyInstantEdit(
+        request: SaveRequest,
+        existingId: String,
+        plan: EditPlan,
+    ): Result<PlaylistEntity> = runCatching {
+        val startedAt = System.currentTimeMillis()
+        val previous = dao.byId(existingId)
+            ?: throw IllegalStateException("Playlist not found.")
+        val normalisedBase = request.url.trimEnd('/')
+        val updated = previous.copy(
+            name = request.name?.takeIf { it.isNotBlank() } ?: previous.name,
+            urlString = normalisedBase,
+            lanUrlString = request.lanUrl?.trimEnd('/')?.takeIf { it.isNotBlank() },
+            epgUrl = request.epgUrl?.takeIf { it.isNotBlank() },
+            vodEnabled = request.vodEnabled,
+            epgRetentionDays = sanitizeGuideDays(request.epgRetentionDays),
+            customUserAgent = request.customUserAgent ?: previous.customUserAgent,
+        )
+        dao.update(updated)
+        // A changed User-Agent has to apply to the NEXT request, not the next
+        // launch: the client keeps a per-host override cache and PlaybackHeaders
+        // reads the row, so reseeding the cache is the whole of it.
+        if (plan.userAgentChanged) dispatcharrClient.seedUserAgent(updated)
+        if (plan.lanUrlChanged &&
+            hostChanged(previous.urlString, normalisedBase, previous.lanUrlString, request.lanUrl)
+        ) {
+            // A Local URL edit alone takes this instant path; it still moves
+            // the playlist to another host, so it invalidates the same state
+            // the full save does and re-reads permissions like Refresh
+            // Permissions.
+            invalidateForHostChange(previous, normalisedBase, request.lanUrl)
+            updated.lanUrlString?.takeIf { it.isNotBlank() }?.let { lanReachability.refresh(it) }
+            if (updated.isDispatcharrDirectConnect()) {
+                runCatching { probeCapabilities(updated.id, force = true, trigger = "playlist host change") }
+                    .onFailure { Log.w(TAG_CAPS, "host-change capability probe failed", it) }
+            }
+        } else if (plan.lanUrlChanged) {
+            updated.lanUrlString?.takeIf { it.isNotBlank() }?.let { lanReachability.refresh(it) }
+        }
+        if (updated.isActive) publishActiveCredentials(updated)
+        Log.i(
+            TAG_SAVE,
+            "plan=InstantUpdate elapsedMs=${System.currentTimeMillis() - startedAt} " +
+                "guideReload=${plan.reloadGuide} vodOn=${plan.vodTurnedOn} " +
+                "vodOff=${plan.vodTurnedOff} ua=${plan.userAgentChanged}",
+        )
+        updated
+    }.onFailure { Log.w(TAG_SAVE, "plan=InstantUpdate failed", it) }
+
+    suspend fun loadAndPersist(
+        request: SaveRequest,
+        existingId: String? = null,
+        /**
+         * Called as each [SaveStage] begins, on the calling coroutine's
+         * dispatcher. Edit Playlist renders the stage as a status line; every
+         * other caller passes nothing.
+         */
+        onStage: ((SaveStage) -> Unit)? = null,
+        /**
+         * Called whenever the [SavePlan] becomes more definite (once up front,
+         * again if a login runs, again once the account's On Demand permissions
+         * are known). Edit Playlist renders the plan as its list of rows.
+         */
+        onPlan: ((SavePlan) -> Unit)? = null,
+    ): Result<Pair<PlaylistEntity, List<M3UChannel>>> {
+        // Where the seconds go, per stage, so a slow save can be attributed
+        // (Logan 2026-09-18: "a successful save takes several seconds"). No
+        // credential values are ever logged.
+        val saveStartedAt = System.currentTimeMillis()
+        var stageStartedAt = saveStartedAt
+        var currentStage: SaveStage? = null
+        // The plan starts at the two steps every save runs and grows as the
+        // save learns what else it will do. Never shrinks (see [SavePlan]).
+        var plan = SavePlan(stages = listOf(SaveStage.LoadingChannels, SaveStage.Finishing))
+        fun publishPlan(next: SavePlan) {
+            plan = next
+            Log.i(TAG_SAVE, "plan=${next.stages.joinToString("+")} rebuildVod=${next.rebuildVod}")
+            onPlan?.invoke(next)
+        }
+        /**
+         * [report] false keeps the timing log but leaves the VISIBLE stage
+         * where it is. Used for [SaveStage.Finishing] when the plan puts the On
+         * Demand rows in front of it: the caller drives those and reports
+         * Finishing itself once they are done, so the screen never jumps to the
+         * last row and back up.
+         */
+        fun enterStage(stage: SaveStage, report: Boolean = true) {
+            // "Verifying credentials..." is only a row when a login or a key
+            // verification actually runs, which is known the moment it starts.
+            if (stage == SaveStage.VerifyingCredentials && stage !in plan.stages) {
+                publishPlan(plan.copy(stages = listOf(stage) + plan.stages))
+            }
+            val now = System.currentTimeMillis()
+            currentStage?.let {
+                Log.i(TAG_SAVE, "stage=$it elapsedMs=${now - stageStartedAt}")
+            }
+            currentStage = stage
+            stageStartedAt = now
+            if (report) onStage?.invoke(stage)
+        }
+        fun closeStages(outcome: String) {
+            val now = System.currentTimeMillis()
+            currentStage?.let {
+                Log.i(TAG_SAVE, "stage=$it elapsedMs=${now - stageStartedAt}")
+            }
+            currentStage = null
+            Log.i(TAG_SAVE, "save $outcome totalMs=${now - saveStartedAt}")
+        }
+        return runCatching {
+        val normalisedBase = request.url.trimEnd('/')
+        val sourceType = request.sourceType
+        if (!sourceType.isImplemented) {
+            throw UnsupportedOperationException(
+                "${sourceType.displayName} support lands in a later phase",
+            )
+        }
+        // The two steps every save runs; anything else is added as it is decided.
+        publishPlan(plan)
+
+        // Generate the playlist id up front so the JWT pair from a UserPass login
+        // can land in DispatcharrTokenStore under the same key the rest of the
+        // flow uses (refresh, warmup, silent rebootstrap on subsequent 401s).
+        val playlistId = existingId ?: UUID.randomUUID().toString()
+
+        // Did this EDIT swap the account the playlist connects as?
+        //
+        // Reported 2026-09-15 (iPad, same shape here): an existing Direct
+        // Connect playlist was edited from an admin login to a different
+        // user and the app went on behaving as the old account. Everything
+        // the app remembers per playlist ROW -- the cached api_key, the
+        // process-local JWT pair, the capability snapshot, the assigned
+        // channel profiles -- is keyed by playlist id, which does not change
+        // across an edit, so none of it was invalidated. In API Key mode
+        // nothing even re-authenticates: the previous account's key was
+        // still valid server-side, so no call ever 401'd and the
+        // AuthBroker's silent rebootstrap never ran.
+        //
+        // Compared against the row as it stands BEFORE this save. Only the
+        // credential fields take part, so renaming a playlist or changing
+        // its EPG retention still costs nothing extra.
+        val priorRow = existingId?.let { dao.byId(it) }
+        // A null credential field means "this form did not carry one", NOT
+        // "clear it". Edit Playlist only ever sends the fields of the auth
+        // mode on screen, so an API-Key-mode save sends no username and no
+        // password. Treating those nulls as a change wiped the stored pair -
+        // flipping the mode toggle back showed two empty fields and Refresh
+        // Session had nothing to re-mint from, which is the "I changed the
+        // credentials and it did not stick" report (Logan 2026-09-18). Only a
+        // SUPPLIED value that differs counts, and the writes below fall back
+        // to the prior value for anything not supplied.
+        val suppliedKey = request.apiKey?.trim()?.takeIf { it.isNotBlank() }
+        val suppliedUser = request.username?.trim()?.takeIf { it.isNotBlank() }
+        val suppliedPass = request.password?.takeIf { it.isNotBlank() }
+        val credentialsChanged = priorRow != null && run {
+            val keyChanged = suppliedKey != null &&
+                suppliedKey != priorRow.apiKey?.trim()?.takeIf { it.isNotBlank() }
+            val userChanged = suppliedUser != null &&
+                suppliedUser != priorRow.username?.trim()?.takeIf { it.isNotBlank() }
+            val passChanged = suppliedPass != null &&
+                suppliedPass != priorRow.password?.takeIf { it.isNotBlank() }
+            keyChanged || userChanged || passChanged
+        }
+        // VERIFY BEFORE DESTROYING (Logan 2026-09-18). The drop below used to
+        // run HERE, a second before the login it was preparing for: a typo in
+        // the password 401'd, the save failed, and the playlist had already
+        // lost its JWT pair, its capability snapshot and its correction cache
+        // for an account it was still connected as. Nothing is invalidated now
+        // until the typed credentials have proven themselves against the
+        // server; on failure this whole call throws with the stored row and
+        // cached session untouched.
+
+        // For Dispatcharr User/Pass, do the JWT exchange up front and resolve to an api_key
+        // so the rest of the flow looks identical to API-key mode. iOS does this too
+        // (silent rebootstrap pattern, DispatcharrDirectConnect.swift line 534-588).
+        // Held back until the verification below passes: dropCachedIdentity
+        // clears this very store, so storing the new pair first would have it
+        // wiped, and storing it before the drop-or-fail decision would leave
+        // the NEW account's tokens behind after a failed save.
+        var pendingJwt: com.aeriotv.android.core.network.JwtPair? = null
+        val resolvedApiKey: String? = when (sourceType) {
+            SourceType.DispatcharrUserPass -> {
+                // A playlist ORIGINALLY added with username/password can be
+                // switched to API Key mode in Edit Playlist; its stored
+                // sourceType stays DispatcharrUserPass while the credential it
+                // now carries is a key. Demanding a username here made that
+                // save throw "Username is required", so the entered key was
+                // silently discarded and the STALE key kept 401ing every VOD
+                // call. Reported 2026-08-08 (Logan, Z Fold + Streamer): "I
+                // keep entering a new API Key and it isn't taking it", while
+                // channels and the test button kept working from cache and
+                // the token path. Honour the key when that is what was
+                // supplied; only demand credentials when there is no key.
+                val suppliedKey = request.apiKey?.takeIf { it.isNotBlank() }
+                val u = request.username?.takeIf { it.isNotBlank() }
+                val p = request.password?.takeIf { it.isNotBlank() }
+                if (suppliedKey != null && (u == null || p == null)) {
+                    Log.i(
+                        "PlaylistRepo",
+                        "UserPass playlist saved in API Key mode; using the supplied key",
+                    )
+                    suppliedKey
+                } else if (
+                    priorRow != null &&
+                    !credentialsChanged &&
+                    priorRow.urlString.trimEnd('/') == normalisedBase &&
+                    !priorRow.apiKey.isNullOrBlank()
+                ) {
+                    // A name / Guide Days / User-Agent edit on an unchanged
+                    // account and an unchanged URL has nothing to re-login for:
+                    // reuse the stored api_key. The old code minted a fresh JWT
+                    // pair on every such save, so a server that was briefly
+                    // unreachable failed a rename. If the stored key has since
+                    // been rotated the fetch below 401s and the AuthBroker's
+                    // silent rebootstrap re-mints from the stored credentials,
+                    // exactly as it does outside this screen.
+                    priorRow.apiKey
+                } else {
+                    val user = u ?: throw IllegalArgumentException("Username is required")
+                    val pass = p ?: throw IllegalArgumentException("Password is required")
+                    // First stage the user can see: this login is the only
+                    // thing standing between Save and the channel fetch.
+                    enterStage(SaveStage.VerifyingCredentials)
+                    val jwt = dispatcharrClient.login(normalisedBase, user, pass)
+                    // The JWT pair is stashed AFTER the drop decision below, so
+                    // the warmup coordinator picks up the refresh token on the
+                    // next app foreground and bearer-mode calls don't re-login
+                    // from scratch every session.
+                    pendingJwt = jwt
+                    dispatcharrClient.fetchCurrentUserApiKey(normalisedBase, jwt.access)
+                }
+            }
+            else -> request.apiKey
+        }
+
+        val isDispatcharrSource = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (credentialsChanged) {
+            // A User/Pass change already proved itself in the login above. An
+            // API-key change has authenticated nothing yet, so spend one
+            // /api/core/version/ call on it: verifyConnection throws on 401 and
+            // on any non-2xx, which is the only way a pasted bad key can fail
+            // loudly instead of quietly replacing a working one.
+            if (isDispatcharrSource && pendingJwt == null) {
+                resolvedApiKey?.takeIf { it.isNotBlank() }?.let { key ->
+                    enterStage(SaveStage.VerifyingCredentials)
+                    dispatcharrClient.verifyConnection(normalisedBase, key)
+                }
+            }
+            Log.i(TAG_CAPS, "credentials verified for ${playlistId.take(8)}; dropping the old account's cached identity")
+            dropCachedIdentity(priorRow!!)
+        }
+        // A new host, scheme, or port on either route: drop what was learned
+        // against the old host BEFORE the new JWT pair lands (the drop clears
+        // that store), so this save's fetches start clean.
+        if (priorRow != null && hostChanged(
+                priorRow.urlString, normalisedBase,
+                priorRow.lanUrlString, request.lanUrl,
+            )
+        ) {
+            invalidateForHostChange(priorRow, normalisedBase, request.lanUrl)
+        }
+        pendingJwt?.let { dispatcharrTokenStore.store(playlistId, it.access, it.refresh) }
+
+        // Everything from here to the channel list is what the user is waiting
+        // on. A non-credential edit enters the save at exactly this point.
+        enterStage(SaveStage.LoadingChannels)
+
+        // Capture the connected account's assigned Channel Profile id(s) for the
+        // FAIL-CLOSED child-safety filter (iOS 3eb4ae3d8). Best-effort: a failed
+        // whoami returns null -> emptyList (no account filter) on first add; the
+        // value self-heals on every subsequent refresh.
+        val accountProfileIds: List<Int> =
+            if (sourceType == SourceType.DispatcharrApiKey ||
+                sourceType == SourceType.DispatcharrUserPass
+            ) {
+                resolvedApiKey?.takeIf { it.isNotBlank() }
+                    ?.let { dispatcharrClient.fetchCurrentUserProfileIds(normalisedBase, it) }
+                    ?: emptyList()
+            } else {
+                emptyList()
+            }
+
+        // GH #83: an EDIT shows its new values immediately. The full entity
+        // used to land only after the channel fetch, so the Playlists page
+        // kept showing the old URL (or credentials) for the whole sync and
+        // users re-opened Edit thinking the save was lost. Write the editable
+        // fields to the existing row now; a failed fetch restores the row.
+        val previous = existingId?.let { dao.byId(it) }
+        if (previous != null) {
+            dao.update(
+                previous.copy(
+                    name = request.name?.takeIf { it.isNotBlank() } ?: previous.name,
+                    urlString = normalisedBase,
+                    lanUrlString = request.lanUrl?.trimEnd('/')?.takeIf { it.isNotBlank() },
+                    epgUrl = request.epgUrl?.takeIf { it.isNotBlank() },
+                    // The `?: previous.apiKey` keep-what-we-had fallback is
+                    // correct for an edit that did not touch credentials,
+                    // and wrong the moment they change: it would restore the
+                    // PREVIOUS account's key, which is exactly how an edited
+                    // playlist went on acting as the old user.
+                    apiKey = resolvedApiKey?.takeIf { it.isNotBlank() }
+                        ?: previous.apiKey.takeUnless { credentialsChanged },
+                    // Not supplied = untouched (see the note on
+                    // credentialsChanged above), so the auth mode that is off
+                    // screen keeps its stored credential.
+                    username = suppliedUser ?: previous.username,
+                    password = suppliedPass ?: previous.password,
+                    dispatcharrProfileId = request.dispatcharrProfileId,
+                    vodEnabled = request.vodEnabled,
+                    epgRetentionDays = sanitizeGuideDays(request.epgRetentionDays),
+                    customUserAgent = request.customUserAgent ?: previous.customUserAgent,
+                ),
+            )
+            // The channel + permission fetches below run under the edited row,
+            // so register the (possibly new) User-Agent before they go out.
+            dispatcharrClient.seedUserAgent(
+                previous.copy(
+                    urlString = normalisedBase,
+                    lanUrlString = request.lanUrl?.trimEnd('/')?.takeIf { it.isNotBlank() },
+                    customUserAgent = request.customUserAgent ?: previous.customUserAgent,
+                ),
+            )
+        }
+
+        // Dispatcharr 0.30 granular permissions + server version, same
+        // best-effort shape as the level capture above.
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        val perms = if (isDispatcharr) {
+            resolvedApiKey?.takeIf { it.isNotBlank() }
+                ?.let { dispatcharrClient.fetchAccountPermissions(normalisedBase, it) }
+        } else null
+        val serverVersion = if (isDispatcharr) {
+            resolvedApiKey?.takeIf { it.isNotBlank() }
+                ?.let { dispatcharrClient.fetchServerVersion(normalisedBase, it) }
+        } else null
+        // ---- On Demand rebuild decision (Logan 2026-09-18) --------------
+        // The stored VOD catalog is per playlist ROW, and the row id does not
+        // change across an edit, so after a credential or URL change every
+        // vod_title row on disk belongs to an account this playlist is no
+        // longer connected as. That catalog has to be wiped and re-swept, and
+        // the save screen is where the user watches it happen - but ONLY when
+        // the work is real: the playlist has to be the active one (nothing
+        // sweeps for an inactive playlist), On Demand has to be enabled for it,
+        // and the source has to serve VOD at all. A rename / Guide Days /
+        // User-Agent edit changes no account, so nothing here runs.
+        val urlChanged = priorRow != null && priorRow.urlString.trimEnd('/') != normalisedBase
+        val sourceServesVod = isDispatcharr || sourceType == SourceType.XtreamCodes
+        val rebuildVod = priorRow != null && priorRow.isActive &&
+            (credentialsChanged || urlChanged) && request.vodEnabled && sourceServesVod
+        if (rebuildVod) {
+            // Which halves the NEW account may view. Direct Connect answers
+            // this per user, so take the capability snapshot NOW, before the
+            // rows are decided, instead of at the end of the save: a row for a
+            // library this account cannot see would be a lie, and one that
+            // never appears hides a rebuild that is really running.
+            //
+            // The snapshot this probe persists is carried onto the fresh
+            // entity upsert further down; the probe at the end of the save
+            // still re-reads it so the row ends on the newest answer.
+            if (isDispatcharr) {
+                runCatching { probeCapabilities(playlistId, force = true) }
+                    .onFailure { Log.w(TAG_CAPS, "pre-rebuild capability probe failed", it) }
+            }
+            val probed = dao.byId(playlistId)
+            val movies = if (isDispatcharr) probed?.dispatcharrCanViewVod() ?: true else true
+            val series = if (isDispatcharr) probed?.dispatcharrCanViewSeries() ?: true else true
+            val vodStages = buildList {
+                if (movies) add(SaveStage.LoadingMovies)
+                if (series) add(SaveStage.LoadingSeries)
+            }
+            if (vodStages.isNotEmpty()) {
+                publishPlan(
+                    SavePlan(
+                        stages = plan.stages.filter { it != SaveStage.Finishing } + vodStages +
+                            SaveStage.Finishing,
+                        rebuildVod = true,
+                    ),
+                )
+            }
+        }
+        val channelFetchStartedAt = System.currentTimeMillis()
+        val channels = try {
+            fetchChannelsFor(
+                sourceType = sourceType,
+                base = normalisedBase,
+                userEpgUrl = request.epgUrl,
+                apiKey = resolvedApiKey,
+                profileId = request.dispatcharrProfileId,
+                accountProfileIds = accountProfileIds,
+                username = request.username,
+                password = request.password,
+                catchupEnabled = perms?.catchupEnabled ?: true,
+            )
+        } catch (t: Throwable) {
+            if (previous != null) runCatching { dao.update(previous) }
+            throw t
+        }
+        Log.i(
+            TAG_SAVE,
+            "channelFetch elapsedMs=${System.currentTimeMillis() - channelFetchStartedAt} " +
+                "channels=${channels.size}",
+        )
+
+        // Capture the connected user's Dispatcharr account level (10 = admin,
+        // 1 = standard, 0 = streamer). Only admins can POST server recordings,
+        // so this gates the Record affordances; best-effort, a failed read
+        // keeps the recording-capable default (10). Mirrors iOS d8aa76b.
+        enterStage(SaveStage.Finishing, report = !(plan.hasMovies || plan.hasSeries))
+        val dispatcharrUserLevel: Int =
+            if (sourceType == SourceType.DispatcharrApiKey ||
+                sourceType == SourceType.DispatcharrUserPass
+            ) {
+                resolvedApiKey?.takeIf { it.isNotBlank() }
+                    ?.let { dispatcharrClient.fetchUserLevel(normalisedBase, it) }
+                    ?: 10
+            } else {
+                10
+            }
+
+        // The capability snapshot already on the row (the pre-rebuild probe's
+        // answer, or the unchanged account's last good one; a credential
+        // change cleared it in dropCachedIdentity) is carried onto the fresh
+        // entity. Building it bare reset the snapshot columns, so between this
+        // upsert and the probe below every reader saw an UNKNOWN account and
+        // the probe logged "level unknown -> 1" a second time (Nothing Phone,
+        // 2026-10-05).
+        val snapshotRow = dao.byId(playlistId)
+        val bareEntity = PlaylistEntity(
+            id = playlistId,
+            name = request.name?.takeIf { it.isNotBlank() } ?: deriveName(normalisedBase),
+            urlString = normalisedBase,
+            lanUrlString = request.lanUrl?.trimEnd('/')?.takeIf { it.isNotBlank() },
+            epgUrl = request.epgUrl?.takeIf { it.isNotBlank() },
+            sourceType = sourceType.name,
+            apiKey = resolvedApiKey?.takeIf { it.isNotBlank() },
+            username = suppliedUser ?: priorRow?.username,
+            password = suppliedPass ?: priorRow?.password,
+            channelCount = channels.size,
+            lastRefreshedAt = System.currentTimeMillis(),
+            // Editing a NON-active playlist keeps it non-active: an edit
+            // never switches playlists (owner decision, Settings phase 3).
+            isActive = priorRow?.isActive ?: true,
+            dispatcharrProfileId = request.dispatcharrProfileId,
+            dispatcharrUserLevel = dispatcharrUserLevel,
+            dispatcharrAccountProfileIds = accountProfileIds.joinToString(","),
+            dispatcharrDvrAccess = perms?.dvrAccess ?: "",
+            dispatcharrCatchupEnabled = perms?.catchupEnabled ?: true,
+            dispatcharrVodMoviesEnabled = perms?.vodMoviesEnabled ?: true,
+            dispatcharrVodSeriesEnabled = perms?.vodSeriesEnabled ?: true,
+            dispatcharrServerVersion = serverVersion ?: "",
+            vodEnabled = request.vodEnabled,
+            epgRetentionDays = sanitizeGuideDays(request.epgRetentionDays),
+            // A fresh entity would otherwise drop the stored override on every
+            // save and every refresh: carry the prior row's value when the
+            // caller did not supply one.
+            customUserAgent = request.customUserAgent ?: priorRow?.customUserAgent ?: "",
+        )
+        val entity = snapshotRow?.let { row ->
+            bareEntity.copy(
+                dispatcharrIsStaff = row.dispatcharrIsStaff,
+                dispatcharrIsSuperuser = row.dispatcharrIsSuperuser,
+                dispatcharrCustomProperties = row.dispatcharrCustomProperties,
+                dispatcharrCapabilitiesFetchedAt = row.dispatcharrCapabilitiesFetchedAt,
+                dispatcharrCapabilitiesSchema = row.dispatcharrCapabilitiesSchema,
+                dispatcharrCapabilitiesStale = row.dispatcharrCapabilitiesStale,
+                dispatcharrSystemCatchupEnabled = row.dispatcharrSystemCatchupEnabled,
+            )
+        } ?: bareEntity
+        // New / re-loaded playlist becomes the active one. Mirrors iOS commit
+        // f72b942: wrap "deactivate others + upsert" in a transactional DAO
+        // method so two concurrent server-add calls can't interleave between
+        // the deactivate pass and the upsert, leaving zero or two active rows.
+        // Editing the already-active row skips the deactivate step.
+        val editingInactive = priorRow != null && !priorRow.isActive
+        if (editingInactive) {
+            dao.upsert(entity)
+        } else if (existingId == null || dao.byId(existingId)?.isActive != true) {
+            dao.upsertAsActive(entity)
+        } else {
+            dao.upsert(entity)
+        }
+        // Cache the first-load channels so the very next launch is instant
+        // (Phase 130 channel snapshot cache).
+        try {
+            saveChannelsToCache(playlistId, channels)
+        } catch (t: Throwable) {
+            android.util.Log.w("PlaylistRepository", "saveChannelsToCache failed (loadAndPersist)", t)
+        }
+        if (!editingInactive) publishActiveCredentials(entity)
+        // Playlist creation / edit: take the per-user capability snapshot now,
+        // so the very first frame of Live TV, DVR and On Demand reflects what
+        // THIS account can actually do. Best-effort; a failure just leaves the
+        // snapshot unprobed, which renders every affordance enabled and lets
+        // the server speak.
+        runCatching { probeCapabilities(playlistId, force = true, trigger = "playlist save") }
+            .onFailure { Log.w(TAG_CAPS, "initial capability probe failed", it) }
+        // The user just edited connection details: probe the LAN URL now so
+        // the very next request routes correctly instead of waiting for a
+        // network change.
+        if (!editingInactive) {
+            entity.lanUrlString?.takeIf { it.isNotBlank() }?.let { lanReachability.refresh(it) }
+        }
+        entity to channels
+        }.also { result ->
+            closeStages(if (result.isSuccess) "ok" else "failed")
+        }
+    }
+
+    /**
+     * Re-fetch channels for an existing playlist row, updating channelCount and
+     * lastRefreshedAt without changing identity fields.
+     */
+    /**
+     * Re-read this playlist's per-user capability snapshot from Dispatcharr and
+     * persist it.
+     *
+     * Runs on playlist creation, on every app launch / foreground, on manual
+     * refresh, and opportunistically when a gated surface (DVR, On Demand) is
+     * entered with a stale snapshot. [force] skips the TTL check.
+     *
+     * Failure policy, deliberately asymmetric:
+     *  - A failed probe KEEPS the last good snapshot and only flags it stale.
+     *    An empty snapshot is NEVER written over a good one, because that would
+     *    read as a demotion and silently hide features on a network blip.
+     *  - A SUCCESSFUL probe is authoritative and REPLACES the stored values,
+     *    including clearing keys the admin removed. The old code coalesced a
+     *    null live value onto the stored one (`live ?: stored`), so removing
+     *    dvr_access server-side left the app pinned to the old value forever.
+     *
+     * Returns true when a fresh snapshot landed.
+     */
+    /**
+     * Forget everything the app holds that was derived from the account a
+     * playlist USED to be connected as.
+     *
+     * Two callers: an Edit Playlist save that changed the credentials, and
+     * the self-heal in [probeCapabilitiesUncoalesced] for a row whose
+     * stored key turned out to belong to somebody else.
+     */
+    /** "scheme://host:port", lowercased, default port filled in; "" when blank or unparseable. */
+    private fun hostKey(raw: String?): String {
+        var v = raw?.trim().orEmpty()
+        if (v.isEmpty()) return ""
+        if (!v.startsWith("http://", true) && !v.startsWith("https://", true)) v = "http://$v"
+        val uri = runCatching { java.net.URI(v) }.getOrNull() ?: return ""
+        val host = uri.host?.lowercase()?.takeIf { it.isNotBlank() } ?: return ""
+        val scheme = (uri.scheme ?: "http").lowercase()
+        val port = if (uri.port > 0) uri.port else if (scheme == "https") 443 else 80
+        return "$scheme://$host:$port"
+    }
+
+    /** True when either route of the playlist now points at another host, scheme, or port. */
+    private fun hostChanged(oldBase: String?, newBase: String?, oldLan: String?, newLan: String?): Boolean =
+        hostKey(oldBase) != hostKey(newBase) || hostKey(oldLan) != hostKey(newLan)
+
+    /**
+     * Forget everything learned against a playlist's OLD host after an edit
+     * moved it to another one (Discord report 2026-10-14: a playlist moved
+     * from its LAN address to a public one behind an SSO proxy only worked
+     * after Refresh Permissions). The playlist id is untouched, so favorites,
+     * recents, and DVR stay attached.
+     *
+     * Cleared: the process-local JWT pair, the 403-derived capability
+     * corrections (a proxy's refusals on the old route are not the
+     * account's), retained live-rewind fillers (open connections to the old
+     * host), the memoized catch-up credentials, the persisted auth header
+     * shape (learned against whatever sat in front of the old host; the 401
+     * path re-detects it against the new one), and the probe throttle so the
+     * next capability probe reads through the new host at once. The callers
+     * then probe permissions unthrottled, exactly as Refresh Permissions does.
+     */
+    private suspend fun invalidateForHostChange(prior: PlaylistEntity, newBase: String, newLan: String?) {
+        val cleared = mutableListOf<String>()
+        dispatcharrTokenStore.clear(prior.id)
+        cleared += "JWT pair"
+        CapabilityCorrections.clear(prior.id)
+        cleared += "capability corrections"
+        timeshiftController.stopAllRetained("playlist host changed")
+        cleared += "retained rewind connections"
+        catchupResolver.invalidateCredentialMemos()
+        cleared += "catch-up credentials"
+        lastCapabilityProbeAt.remove(prior.id)
+        cleared += "probe throttle"
+        val current = dao.byId(prior.id)
+        if (current != null && current.dispatcharrAuthMode.isNotBlank()) {
+            cleared += "auth header mode '${current.dispatcharrAuthMode}'"
+            runCatching { dao.update(current.copy(dispatcharrAuthMode = "")) }
+                .onFailure { Log.w(TAG_SAVE, "host-change auth mode reset failed", it) }
+        } else {
+            cleared += "auth header mode (default)"
+        }
+        val oldLan = hostKey(prior.lanUrlString).takeIf { it.isNotEmpty() }?.let { " (local $it)" } ?: ""
+        val newLanKey = hostKey(newLan).takeIf { it.isNotEmpty() }?.let { " (local $it)" } ?: ""
+        Log.i(
+            TAG_SAVE,
+            "[PLAYLIST] host changed ${hostKey(prior.urlString)}$oldLan -> ${hostKey(newBase)}$newLanKey: " +
+                "cleared ${cleared.joinToString(", ")} playlist=${prior.id.take(8)}",
+        )
+    }
+
+    private suspend fun dropCachedIdentity(priorRow: PlaylistEntity) {
+        // The JWT pair was minted for the OLD account. In User/Pass mode a
+        // re-login replaces it, but only on success; in API Key mode nothing
+        // would ever replace it, and bearer-mode calls (users/me, the
+        // capability probe) would keep answering as the previous user for
+        // the rest of the process.
+        dispatcharrTokenStore.clear(priorRow.id)
+        // Session guesses recorded from 403s the OLD account collected.
+        CapabilityCorrections.clear(priorRow.id)
+        // Retained live-rewind fillers are open connections counted against
+        // the OLD user's stream limit.
+        timeshiftController.stopAllRetained("playlist credentials changed")
+        // Memoized XC username + xc_password used by catch-up playback.
+        catchupResolver.invalidateCredentialMemos()
+        // Forget the stored per-user snapshot outright rather than letting
+        // the next probe merge onto it. probeCapabilities deliberately keeps
+        // the last good snapshot when a probe FAILS, which is right when the
+        // account is unchanged and wrong here: a failed probe must not leave
+        // the previous user's DVR / VOD / catch-up grants in force.
+        runCatching {
+            dao.update(
+                priorRow.copy(
+                    dispatcharrUserLevel = 10,
+                    dispatcharrIsStaff = false,
+                    dispatcharrIsSuperuser = false,
+                    dispatcharrCustomProperties = "",
+                    dispatcharrCapabilitiesFetchedAt = 0L,
+                    dispatcharrCapabilitiesSchema = 0,
+                    dispatcharrCapabilitiesStale = true,
+                    dispatcharrSystemCatchupEnabled = -1,
+                    dispatcharrDvrAccess = "",
+                    dispatcharrCatchupEnabled = true,
+                    dispatcharrVodMoviesEnabled = true,
+                    dispatcharrVodSeriesEnabled = true,
+                    dispatcharrAccountProfileIds = "",
+                ),
+            )
+        }.onFailure { Log.w(TAG_CAPS, "cached-identity reset failed", it) }
+        // The display-only facts describe the OLD account; drop them with it.
+        runCatching { appPreferences.clearDispatcharrAccountFacts(priorRow.id) }
+            .onFailure { Log.w(TAG_CAPS, "account facts reset failed", it) }
+    }
+
+    suspend fun probeCapabilities(
+        playlistId: String,
+        force: Boolean = false,
+        trigger: String = "gated surface",
+    ): Boolean {
+        // One pass per playlist at a time. Launch fires the coordinator probe
+        // while a gated surface (DVR / On Demand) can fire its own within the
+        // same second; without this the server saw two identical probes and the
+        // log printed two "probe OK" lines. Late callers join the running pass
+        // instead of starting a second one.
+        val pending = CompletableDeferred<Boolean>()
+        val running = inFlightCapabilityProbes.putIfAbsent(playlistId, pending)
+        if (running != null) return running.await()
+        return try {
+            val before = dao.byId(playlistId)
+            val oldLevel = before?.permsLevelLabel() ?: "unknown"
+            val willProbe = before != null && before.isDispatcharrDirectConnect() &&
+                (force || before.capabilitiesNeedProbe())
+            if (willProbe) lastCapabilityProbeAt[playlistId] = System.currentTimeMillis()
+            val result = probeCapabilitiesUncoalesced(playlistId, force)
+            if (willProbe) {
+                val newLevel = dao.byId(playlistId)?.permsLevelLabel() ?: "unknown"
+                Log.i(
+                    TAG_PERMS,
+                    "level $oldLevel -> $newLevel trigger=$trigger" +
+                        if (result) "" else " (refresh failed, kept last good)",
+                )
+            }
+            pending.complete(result)
+            result
+        } catch (t: Throwable) {
+            // Includes cancellation: joiners must never hang on a dropped pass.
+            pending.complete(false)
+            throw t
+        } finally {
+            inFlightCapabilityProbes.remove(playlistId, pending)
+        }
+    }
+
+    private suspend fun probeCapabilitiesUncoalesced(playlistId: String, force: Boolean): Boolean {
+        val playlist = dao.byId(playlistId) ?: return false
+        if (!playlist.isDispatcharrDirectConnect()) return false
+        if (!force && !playlist.capabilitiesNeedProbe()) return false
+        val base = effectiveBaseUrl(playlist)
+        val key = playlist.apiKey?.takeIf { it.isNotBlank() }
+        val snapshot = key?.let {
+            runCatching {
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                    dispatcharrClient.fetchAccountSnapshot(base, k)
+                }
+            }.getOrNull()
+        }
+        if (snapshot == null) {
+            // Keep the last good snapshot; just mark it stale so the next
+            // opportunity re-probes. Nothing is downgraded here.
+            val current = dao.byId(playlistId) ?: return false
+            if (!current.dispatcharrCapabilitiesStale) {
+                runCatching { dao.update(current.copy(dispatcharrCapabilitiesStale = true)) }
+            }
+            Log.w(TAG_CAPS, "probe failed for ${playlistId.take(8)}; keeping last good snapshot")
+            return false
+        }
+        // SELF-HEAL: does the stored key actually authenticate as the account
+        // whose username this playlist carries?
+        //
+        // users/me answers as whoever the key belongs to. A playlist edited
+        // from one Dispatcharr user to another before the credential-change
+        // path existed kept the previous account's api_key, and that key was
+        // still valid server-side, so nothing ever 401'd and nothing
+        // re-authenticated. The username the user typed is the statement of
+        // intent; the username the server echoes is the fact. When they
+        // disagree the cached identity is stale by definition, so repair it
+        // exactly like a credential change and a broken playlist fixes
+        // itself on the next probe instead of needing a manual re-save.
+        //
+        // Only with a username to compare against: in pure API Key mode the
+        // user asserted nothing about WHICH account, so a mismatch cannot be
+        // detected and must not be guessed at.
+        if (healIdentityMismatchIfNeeded(playlist, snapshot.username)) {
+            // The repair re-probed with the fresh key; that pass owns the
+            // snapshot, and writing this stale payload over it would put the
+            // old account's answers straight back.
+            return true
+        }
+
+        // system_settings.catchup_enabled needs level >= 1; null (unreadable or
+        // absent) leaves the capability Unknown rather than denying catch-up.
+        val systemCatchup = key.let {
+            runCatching {
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                    dispatcharrClient.fetchSystemCatchupEnabled(base, k)
+                }
+            }.getOrNull()
+        }
+        val props = parseCustomProperties(snapshot.customPropertiesJson)
+        fun flag(name: String): Boolean =
+            (props?.get(name) as? JsonPrimitive)?.booleanOrNull != false
+        val current = dao.byId(playlistId) ?: return false
+        val updated = current.copy(
+            dispatcharrUserLevel = snapshot.userLevel,
+            dispatcharrIsStaff = snapshot.isStaff,
+            dispatcharrIsSuperuser = snapshot.isSuperuser,
+            dispatcharrCustomProperties = snapshot.customPropertiesJson,
+            dispatcharrCapabilitiesFetchedAt = System.currentTimeMillis(),
+            dispatcharrCapabilitiesSchema = CAPABILITIES_SCHEMA,
+            dispatcharrCapabilitiesStale = false,
+            dispatcharrSystemCatchupEnabled = when (systemCatchup) {
+                true -> 1
+                false -> 0
+                null -> -1
+            },
+            // Legacy derived mirrors, written UNCONDITIONALLY from the fresh
+            // payload (no coalescing) so a removed key clears our copy too.
+            dispatcharrDvrAccess =
+                (props?.get("dvr_access") as? JsonPrimitive)?.contentOrNull?.lowercase().orEmpty(),
+            dispatcharrCatchupEnabled = flag("catchup_enabled"),
+            dispatcharrVodMoviesEnabled = flag("vod_movies_enabled"),
+            dispatcharrVodSeriesEnabled = flag("vod_series_enabled"),
+            dispatcharrAccountProfileIds = snapshot.channelProfiles.joinToString(","),
+        )
+        runCatching { dao.update(updated) }
+            .onFailure { Log.w(TAG_CAPS, "capability persist failed", it) }
+        // Display-only facts for the Playlist Detail permissions section (iOS
+        // Models.swift parity): the username the server echoed (an API-key
+        // playlist never typed one) and the names of the assigned Channel
+        // Profiles. Names are only asked for when the account actually has
+        // profiles; a failure just leaves the ids to be shown instead.
+        runCatching {
+            val profileNames = if (snapshot.channelProfiles.isEmpty()) {
+                emptyList()
+            } else {
+                val all = key.let {
+                    runCatching {
+                        dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                            dispatcharrClient.listProfiles(base, k)
+                        }
+                    }.getOrNull()
+                }.orEmpty()
+                snapshot.channelProfiles.mapNotNull { id -> all.firstOrNull { it.id == id }?.name }
+            }
+            val prior = appPreferences.dispatcharrAccountFactsOnce(playlistId)
+            appPreferences.setDispatcharrAccountFacts(
+                playlistId,
+                com.aeriotv.android.core.preferences.DispatcharrAccountFacts(
+                    username = snapshot.username,
+                    // Keep the last known names when this pass could not read
+                    // them, so a transient 403 does not blank the row.
+                    profileNames = profileNames.ifEmpty {
+                        if (snapshot.channelProfiles.isEmpty()) emptyList() else prior.profileNames
+                    },
+                ),
+            )
+        }.onFailure { Log.w(TAG_CAPS, "account facts persist failed", it) }
+        // Session corrections are guesses; persisted truth supersedes them.
+        CapabilityCorrections.clear(playlistId)
+        // Log the DERIVED verdicts, not just the raw level: the raw level alone
+        // cannot tell you whether a demotion actually closed the gates.
+        val caps = updated.capabilities()
+        fun verdict(capability: Capability): String = when (caps[capability]) {
+            CapabilityState.Allowed -> "true"
+            CapabilityState.Denied -> "false"
+            CapabilityState.Unknown -> "unknown"
+        }
+        Log.i(
+            TAG_CAPS,
+            "probe OK ${playlistId.take(8)} level=${caps.effectiveUserLevel} " +
+                "staff=${snapshot.isStaff} su=${snapshot.isSuperuser} " +
+                "dvr=${updated.dispatcharrEffectiveDvrAccess()} " +
+                "vod=${verdict(Capability.CanViewVod)} " +
+                "series=${verdict(Capability.CanViewSeries)} " +
+                "catchup=${verdict(Capability.CanUseCatchup)} " +
+                "switch=${if (caps.isDenied(Capability.CanSwitchStream)) "denied" else "allowed"}",
+        )
+        return true
+    }
+
+    /**
+     * Playlists whose identity mismatch has already been acted on in this
+     * process. One repair per playlist per app run: if the re-authenticated
+     * key STILL answers as somebody else, the server is doing something we
+     * do not model (a shared key, a proxy rewriting the account) and
+     * repairing again would spin -- log it and leave it alone.
+     */
+    private val identityRepaired = java.util.Collections.newSetFromMap(
+        ConcurrentHashMap<String, Boolean>(),
+    )
+
+    /**
+     * Compare the username the server echoed against the one saved on the
+     * playlist and, on a genuine mismatch, re-authenticate.
+     *
+     * Returns true when a repair ran, in which case the caller must abandon
+     * the payload it was about to persist: the repair took a fresh snapshot
+     * of its own.
+     */
+    private suspend fun healIdentityMismatchIfNeeded(
+        playlist: PlaylistEntity,
+        serverUsername: String,
+    ): Boolean {
+        val typed = playlist.username?.trim()?.lowercase().orEmpty()
+        val actual = serverUsername.trim().lowercase()
+        if (typed.isEmpty() || actual.isEmpty() || typed == actual) return false
+
+        if (!identityRepaired.add(playlist.id)) {
+            Log.w(
+                TAG_CAPS,
+                "stored key STILL authenticates as '$serverUsername' but the playlist is " +
+                    "'${playlist.username}' after a repair this run; leaving it alone " +
+                    "(${playlist.id.take(8)})",
+            )
+            return false
+        }
+        Log.i(
+            TAG_CAPS,
+            "stored key authenticates as '$serverUsername' but the playlist is " +
+                "'${playlist.username}'; re-authenticating (${playlist.id.take(8)})",
+        )
+
+        dropCachedIdentity(playlist)
+        // Re-mint from the saved username + password. API-Key-mode rows have
+        // no password to re-mint from, so they keep the key they were given
+        // and the repair is limited to clearing the stale derived state.
+        val fresh = dispatcharrAuth.silentRebootstrapApiKey(dao.byId(playlist.id) ?: playlist)
+        if (fresh == null) {
+            Log.w(TAG_CAPS, "identity repair could not re-mint a key for ${playlist.id.take(8)}")
+        }
+        // The in-flight guard for THIS pass is still held by probeCapabilities,
+        // so go straight to the uncoalesced probe or the repair's own read
+        // would be swallowed as a duplicate.
+        runCatching { probeCapabilitiesUncoalesced(playlist.id, force = true) }
+            .onFailure { Log.w(TAG_CAPS, "post-repair probe failed", it) }
+        // Account-scoped content: the channel snapshot is keyed by playlist
+        // id alone, so it still holds the OLD account's list (and its
+        // channel-profile filtering). Re-fetch it under the repaired
+        // identity. The Movies / TV Shows and DVR caches key on the api_key
+        // as well, so the fresh key misses them and they rebuild on their
+        // own.
+        runCatching { dao.byId(playlist.id)?.let { refresh(it) } }
+            .onFailure { Log.w(TAG_CAPS, "post-repair channel reload failed", it) }
+        return true
+    }
+
+    /** One in-flight probe per playlist id; concurrent callers join it. */
+    /** When each playlist was last probed this process (throttles the
+     *  foreground and gate-check triggers; nothing polls on its own). */
+    private val lastCapabilityProbeAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Milliseconds since [playlistId] was last probed this process. */
+    fun msSinceCapabilityProbe(playlistId: String): Long =
+        lastCapabilityProbeAt[playlistId]?.let { System.currentTimeMillis() - it } ?: Long.MAX_VALUE
+
+    /**
+     * Re-read the ACTIVE playlist's user level and permission flags now
+     * (Switch Stream open, reorder save, a 403 on either). Joins a probe that
+     * is already running. Returns the fresh Switch Stream gate, failing
+     * closed: an unknown level is false.
+     */
+    suspend fun recheckSwitchStreamAllowed(trigger: String): Boolean {
+        val playlist = dao.firstActive() ?: return false
+        if (!playlist.isDispatcharrDirectConnect()) return false
+        runCatching { probeCapabilities(playlist.id, force = true, trigger = trigger) }
+        return dao.byId(playlist.id)?.canSwitchStream() ?: false
+    }
+
+    private val inFlightCapabilityProbes =
+        ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+
+    /**
+     * Probe every Dispatcharr playlist.
+     *
+     * [force] true = a COLD APP LAUNCH, which always re-reads the account
+     * regardless of TTL: an admin can demote a user while the app is closed,
+     * and a 6 h TTL meant a relaunch still showed admin affordances. Softer
+     * triggers (return to foreground, gated-surface entry) pass false and keep
+     * the TTL.
+     */
+    suspend fun probeAllCapabilities(
+        force: Boolean = false,
+        trigger: String = "foreground",
+        minIntervalMs: Long = 0L,
+    ) {
+        // ACTIVE PLAYLIST ONLY (Logan 2026-09-16). A saved-but-inactive
+        // playlist is not being used by anything on screen, and probing it
+        // meant every launch and every foreground fired a users/me (plus a
+        // system_settings read) against every server the user has ever
+        // saved. Those rows are probed when they are SET ACTIVE
+        // (switchActive), and the cold-launch / foreground rules then apply
+        // to the newly active one.
+        val playlist = dao.firstActive() ?: return
+        if (!playlist.isDispatcharrDirectConnect()) return
+        // Foreground: once a minute per playlist re-reads for real, so an
+        // admin's grant or revoke applies on the next return to the app.
+        val due = force ||
+            (minIntervalMs > 0L && msSinceCapabilityProbe(playlist.id) >= minIntervalMs)
+        runCatching { probeCapabilities(playlist.id, due, trigger) }
+    }
+
+    suspend fun refresh(playlist: PlaylistEntity): Result<List<M3UChannel>> = runCatching {
+        val sourceType = playlist.resolvedSourceType()
+        val base = effectiveBaseUrl(playlist)
+        // Dispatcharr branches go through the AuthBroker so a rotated api_key
+        // gets silently rebootstrapped instead of surfacing a 401. M3U / Xtream
+        // fall straight through to fetchChannelsFor.
+        // Self-heal the account's assigned Channel Profile id(s) on every load
+        // (the server-side assignment can change). A failed whoami (null) falls
+        // back to the persisted snapshot so a network blip never widens a kids
+        // account to all channels. iOS 1cc51fc59.
+        val liveAccountIds: List<Int>? =
+            if (sourceType == SourceType.DispatcharrApiKey ||
+                sourceType == SourceType.DispatcharrUserPass
+            ) {
+                playlist.apiKey?.takeIf { it.isNotBlank() }
+                    ?.let { dispatcharrClient.fetchCurrentUserProfileIds(base, it) }
+            } else {
+                null
+            }
+        val effectiveAccountIds = liveAccountIds ?: playlist.dispatcharrAccountProfileIdList()
+        // Audit gap: re-capture the account level on every refresh so a
+        // server-side demote/promote is reflected without a full Edit-Playlist
+        // Save. Best-effort: a null read keeps the persisted level (never
+        // clobbers a good value with the recording-capable default). Mirrors
+        // the loadAndPersist level capture and the liveAccountIds self-heal
+        // just above. iOS d8aa76b re-reads dispatcharrUserLevel on reconnect.
+        // Per-user capabilities: a manual refresh always re-probes, so a
+        // server-side grant or revoke applies without an Edit-Playlist Save.
+        // The probe is authoritative on success (it clears keys the admin
+        // removed) and a no-op on failure (last good snapshot kept, flagged
+        // stale). Re-read the row so THIS pass uses the fresh values.
+        val probed = if (playlist.isDispatcharrDirectConnect()) {
+            runCatching { probeCapabilities(playlist.id, force = true, trigger = "playlist refresh") }
+                .getOrDefault(false)
+        } else false
+        val fresh = if (probed) dao.byId(playlist.id) ?: playlist else playlist
+        val liveVersion = if (probed) {
+            playlist.apiKey?.takeIf { it.isNotBlank() }
+                ?.let { dispatcharrClient.fetchServerVersion(base, it) }
+        } else null
+        val channels = when (sourceType) {
+            SourceType.DispatcharrApiKey, SourceType.DispatcharrUserPass ->
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                    fetchChannelsFor(
+                        sourceType, base, playlist.epgUrl, key,
+                        playlist.dispatcharrProfileId, effectiveAccountIds,
+                        catchupEnabled = fresh.dispatcharrCanUseCatchup(),
+                    )
+                }
+            else -> fetchChannelsFor(
+                sourceType, base, playlist.epgUrl, playlist.apiKey,
+                playlist.dispatcharrProfileId, emptyList(),
+                playlist.username, playlist.password,
+            )
+        }
+        val refreshed = fresh.copy(
+            channelCount = channels.size,
+            lastRefreshedAt = System.currentTimeMillis(),
+            // Persist the self-healed snapshot ONLY when the live whoami
+            // succeeded (liveAccountIds != null); a transient failure must not
+            // clobber a good fail-closed snapshot via the fallback value.
+            dispatcharrAccountProfileIds =
+                if (liveAccountIds != null) liveAccountIds.joinToString(",")
+                else fresh.dispatcharrAccountProfileIds,
+            // The level / permission columns are owned by probeCapabilities()
+            // above; `fresh` already carries them, so nothing is re-derived (or
+            // re-coalesced) here.
+            dispatcharrServerVersion = liveVersion ?: fresh.dispatcharrServerVersion,
+        )
+        dao.update(refreshed)
+        // Persist the freshly-fetched channels so the next cold launch repaints
+        // the rail INSTANTLY from disk (Phase 130 channel snapshot cache).
+        // Best-effort: a cache-write failure must NOT fail the refresh.
+        try {
+            saveChannelsToCache(playlist.id, channels)
+        } catch (t: Throwable) {
+            android.util.Log.w("PlaylistRepository", "saveChannelsToCache failed (refresh)", t)
+        }
+        publishActiveCredentials(refreshed)
+        channels
+    }
+
+    /**
+     * Dispatcharr-only follow-up that fans `/api/epg/programs/<id>/` requests
+     * for every channel's currently-airing programme, in parallel with a cap
+     * of 4 concurrent in-flight fetches. Mirrors iOS
+     * `EPGGuideView.enrichDispatcharrCategories` (post v1.6.22), the bulk
+     * `/api/epg/grid/` endpoint deliberately strips `<category>` for perf, so
+     * we lazily backfill the category on the now-airing program per channel
+     * after the grid lands. Categories are propagated to every same-titled
+     * future programme on the same channel so a recurring show (SportsCenter,
+     * Dateline) keeps its tint across re-airings.
+     *
+     * Returns the input list when [playlist] isn't a Dispatcharr source.
+     * Failures on individual program fetches are swallowed silently, a
+     * single 404 shouldn't blank out the whole channel's tint.
+     */
+    suspend fun enrichNowPlayingCategories(
+        playlist: PlaylistEntity,
+        programmes: List<EPGProgramme>,
+    ): List<EPGProgramme> {
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr || programmes.isEmpty()) return programmes
+
+        val now = System.currentTimeMillis()
+        // Group nominees: channels whose currently-airing program has a real
+        // integer programID and a blank category (so we don't re-fetch
+        // already-enriched data or Dummy EPG string-id rows).
+        val nowPlayingByChannel: Map<String, EPGProgramme> = programmes.asSequence()
+            .filter { it.startMillis <= now && it.endMillis > now }
+            .filter { it.category.isBlank() && it.dispatcharrProgramId != null }
+            .associateBy { it.channelId }
+        if (nowPlayingByChannel.isEmpty()) return programmes
+
+        val base = effectiveBaseUrl(playlist)
+
+        // Cap-of-4 fan-out matches iOS `enrichCategories(programIDs:)`.
+        // Anything higher and Dispatcharr starts shedding connections; lower
+        // and a thousand-channel playlist takes minutes to fully tint.
+        val gate = Semaphore(4)
+        val categoryByProgramId: Map<Int, String> = coroutineScope {
+            nowPlayingByChannel.values.mapNotNull { p ->
+                val pid = p.dispatcharrProgramId ?: return@mapNotNull null
+                async {
+                    gate.withPermit {
+                        runCatching {
+                            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                                dispatcharrClient.getProgramDetail(base, key, pid)
+                            }
+                        }.getOrNull()?.let { detail ->
+                            val joined = detail.categories
+                                ?.filter { it.isNotBlank() }
+                                ?.joinToString(",")
+                                .orEmpty()
+                            if (joined.isNotBlank()) pid to joined else null
+                        }
+                    }
+                }
+            }.awaitAll().filterNotNull().toMap()
+        }
+
+        if (categoryByProgramId.isEmpty()) return programmes
+
+        // Title-match propagation: for each channel that just got a fresh
+        // category on its now-airing program, stamp that category onto every
+        // future programme of the SAME title on the same channel. iOS does
+        // the same so a recurring news/sports show keeps its tint across the
+        // schedule without N more enrichment fetches per channel.
+        val titleCategoryByChannel: Map<String, Pair<String, String>> = buildMap {
+            nowPlayingByChannel.forEach { (channelId, p) ->
+                val pid = p.dispatcharrProgramId ?: return@forEach
+                val cat = categoryByProgramId[pid] ?: return@forEach
+                put(channelId, p.title to cat)
+            }
+        }
+
+        return programmes.map { p ->
+            if (p.category.isNotBlank()) return@map p
+            val pid = p.dispatcharrProgramId
+            val direct = pid?.let { categoryByProgramId[it] }
+            if (direct != null) return@map p.copy(category = direct)
+            // Title-match: same channel + same title gets the same category.
+            val (matchTitle, matchCat) = titleCategoryByChannel[p.channelId] ?: return@map p
+            if (p.title == matchTitle) p.copy(category = matchCat) else p
+        }
+    }
+
+    /**
+     * In-flight [loadEpg] deferreds keyed by `playlist.id`. Two callers that
+     * start an EPG fetch for the same source before the first one returns
+     * share the same [CompletableDeferred] and the same network roundtrip,
+     * instead of each independently parsing 60K-programme XMLTV or hitting
+     * Dispatcharr's `/api/epg/grid/` twice. Mirrors iOS GuideStore's
+     * `inFlightLoadTask` / `inFlightXMLTVTask` coalescing
+     * (EPGGuideView.swift lines 1300-1340).
+     *
+     * Entries are removed in the `finally` block of the winning caller so
+     * SEQUENTIAL re-fetches (cache went stale between two visits) still
+     * round-trip; only OVERLAPPING calls coalesce.
+     */
+    private val inFlightLoads = ConcurrentHashMap<String, CompletableDeferred<Result<List<EPGProgramme>>>>()
+
+    /** Owns the background upstream-layering jobs. Supervisor so one playlist's
+     *  failed layering never cancels another's; Default because the work is a
+     *  CPU-bound parse. Repository is a @Singleton, so this scope lives for the
+     *  process -- layering outlives the screen that triggered it, which is the
+     *  point: the user keeps browsing on the grid while history accumulates. */
+    /** Two threads at THREAD_PRIORITY_BACKGROUND for every EPG/playlist
+     *  download + gunzip + parse. simpleperf on the Google TV Streamer
+     *  (2026-08-31) showed this work at normal priority costing ~34% of the
+     *  app's CPU while four multiview decoders ran; the MediaCodec loops spent
+     *  22s of a 20s window combined waiting for a core. Thread priority only
+     *  bites under contention: idle, this parses exactly as fast as
+     *  Dispatchers.Default did; under playback, decoders win every time.
+     *  NOT Dispatchers.IO for the hops either: IO shares Default's
+     *  normal-priority worker pool. */
+    private val layeringDispatcher = java.util.concurrent.Executors.newFixedThreadPool(2) { r ->
+        Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+            r.run()
+        }, "EpgWork").apply { priority = Thread.MIN_PRIORITY }
+    }.asCoroutineDispatcher()
+
+    private val layeringScope = CoroutineScope(SupervisorJob() + layeringDispatcher)
+
+    /** One layering job per playlist. A refresh while one is running reuses it
+     *  rather than downloading the same feeds twice in parallel. */
+    private val layeringJobs = ConcurrentHashMap<String, Job>()
+
+    private val _upstreamEpgLayered = MutableSharedFlow<String>(extraBufferCapacity = 4)
+
+    /** Emits a playlistId after that playlist's upstream catch-up history has
+     *  been merged into the EPG cache. Collectors re-read the cache (the
+     *  existing mergeEpgHistory path) rather than receiving rows directly, so
+     *  there is exactly one merge/dedup implementation. */
+    val upstreamEpgLayered = _upstreamEpgLayered.asSharedFlow()
+
+    /**
+     * Fetch + parse the upstream XMLTV sources OFF the EPG critical path and
+     * merge the result into the cache. Same budget model as 0.4.5, with the
+     * enforcement fixed: the wall-clock deadline is checked INSIDE the parse
+     * loop (XMLTVParser.shouldAbort), because a multi-million-programme feed
+     * parses for minutes without ever reaching a suspension point where
+     * withTimeout could fire. A source that blows its ceiling keeps what it
+     * parsed (partial history is still history) and yields to the next.
+     */
+    /**
+     * Dispatcharr 0.30 window extension (iOS 076d041 parity): the base grid
+     * paints the default -1h..+24h fast; this fills history back to the
+     * playlist's Guide Days (6 h of history on very large playlists) and forward to
+     * the Guide Window, one day per request via `start`/`end`, merging each
+     * chunk into the cache (non-authoritative, like an upstream layer).
+     */
+    /**
+     * Guide jump (Apple parity, GuideStore.ensureForwardWindow): fetch
+     * [fromMs, throughMs) from Dispatcharr's grid one day per request and
+     * merge each chunk into the cache. Returns the number of programmes
+     * merged; 0 for non-Dispatcharr sources (their feed already holds
+     * whatever future it has).
+     */
+    suspend fun fetchDispatcharrGridRange(playlist: PlaylistEntity, fromMs: Long, throughMs: Long): Int {
+        val sourceType = SourceType.entries.firstOrNull { it.name == playlist.sourceType }
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey || sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr || playlist.apiKey.isNullOrBlank() || throughMs <= fromMs) return 0
+        val base = effectiveBaseUrl(playlist)
+        val dayMs = 86_400_000L
+        var total = 0
+        var start = fromMs
+        while (start < throughMs) {
+            val end = minOf(throughMs, start + dayMs)
+            val programmes = runCatching {
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                    dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
+                }
+            }.getOrElse {
+                if (it is CancellationException) throw it
+                Log.w("PlaylistRepo", "grid range chunk failed; stopping: $it")
+                return total
+            }
+            if (programmes.isNotEmpty()) {
+                runCatching { saveEpgToCache(playlist.id, programmes, authoritative = false) }
+                    .onFailure { Log.w("PlaylistRepo", "grid range merge failed", it) }
+                total += programmes.size
+            }
+            start = end
+        }
+        Log.i("PlaylistRepo", "grid range: merged $total programmes through ${java.time.Instant.ofEpochMilli(throughMs)}")
+        return total
+    }
+
+    /**
+     * One grid chunk: fetch + merge. Returns the programme count, or null when
+     * the request failed (the caller stops that direction).
+     */
+    private suspend fun fetchGridChunk(
+        playlist: PlaylistEntity,
+        base: String,
+        start: Long,
+        end: Long,
+        /** True only when the server told us its EPG sources were refreshed
+         *  since this cache was built. The merge then REPLACES the window it
+         *  covers for every channel it touches instead of only inserting, so a
+         *  programme the server moved to another day cannot survive as a
+         *  ghost row at its old time. A normal incremental fill stays
+         *  non-authoritative: each chunk is a fragment of the guide and must
+         *  not delete what the neighbouring chunks put there. */
+        authoritative: Boolean = false,
+    ): Int? {
+        val programmes = runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.getEpgGrid(base, key, start, end).toProgrammes()
+            }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            Log.w("PlaylistRepo", "grid window chunk failed; stopping: $it")
+            return null
+        }
+        if (programmes.isEmpty()) return 0
+        runCatching { saveEpgToCache(playlist.id, programmes, authoritative = authoritative) }
+            .onFailure { Log.w("PlaylistRepo", "grid window merge failed", it) }
+        return programmes.size
+    }
+
+    /**
+     * UTC day-grid floor. Coverage chunk keys MUST be stable across launches:
+     * anchoring chunks at "now - 1h" (what this pass used to do) mints a new
+     * start millisecond on every launch, so no cached row would ever be
+     * reusable and the incremental walk would degenerate back into the full
+     * 30-chunk refetch it exists to eliminate.
+     */
+    private fun dayFloorMs(ms: Long): Long = Math.floorDiv(ms, 86_400_000L) * 86_400_000L
+
+    /**
+     * Fetch one aligned day chunk, merge it, and record its coverage row.
+     * Returns the programme count (0 is a legitimate answer, and the coverage
+     * row still lands so the chunk is not refetched), or null when the request
+     * failed, which stops the caller's walk exactly as before.
+     */
+    private suspend fun fetchAndRecordChunk(
+        playlist: PlaylistEntity,
+        base: String,
+        start: Long,
+        end: Long,
+    ): Int? {
+        val n = fetchGridChunk(playlist, base, start, end) ?: return null
+        DeletedPlaylists.ensureAlive(playlist.id, "EPG chunk coverage")
+        runCatching {
+            epgChunkCoverageDao.upsert(
+                EpgChunkCoverage(
+                    playlistId = playlist.id,
+                    chunkStartMs = start,
+                    chunkEndMs = end,
+                    fetchedAtMs = System.currentTimeMillis(),
+                    programCount = n,
+                ),
+            )
+        }.onFailure { Log.w("PlaylistRepo", "grid window coverage upsert failed", it) }
+        return n
+    }
+
+    /**
+     * Post-walk pruning: drop what is no longer valid instead of letting the
+     * cache grow without bound.
+     *
+     * Programmes are pruned at the RETENTION bound (the playlist's Guide Days,
+     * or the hard 30-day floor for All Available), NOT at the fetch-history
+     * bound: a huge panel clamps how far back it FETCHES to 6 h, and pruning
+     * there would delete exactly the catch-up archive task #135 accumulated.
+     *
+     * Coverage rows are pruned to the walk's own aligned range, so shrinking
+     * Guide Days forgets the chunks outside the new range and growing it leaves
+     * every kept row alone, which is what makes only the NEW chunks fetch.
+     */
+    private suspend fun pruneEpgToGuideRange(
+        playlistId: String,
+        retentionHistoryStart: Long,
+        coverageFromMs: Long,
+        coverageToMs: Long,
+    ) {
+        runCatching {
+            epgProgrammeDao.deleteEndedBeforeForPlaylist(playlistId, retentionHistoryStart)
+        }.onFailure { Log.w("PlaylistRepo", "grid window programme prune failed", it) }
+        runCatching {
+            epgChunkCoverageDao.pruneOutside(playlistId, coverageFromMs, coverageToMs)
+        }.onFailure { Log.w("PlaylistRepo", "grid window coverage prune failed", it) }
+    }
+
+    /**
+     * Maximum catch-up reach of a playlist, in MILLIS, floored at 24 h.
+     *
+     * This is how far back cached history can still be WATCHED: past that, a
+     * programme row is dead weight (the "Watch" action has nothing to resolve
+     * against). The per-channel value comes from Dispatcharr's `catchup_days`
+     * or an XC panel's `tv_archive_duration`, persisted on the channel
+     * snapshot, and is capped at 30 days exactly as `M3UChannel.canReplay`
+     * caps it (Dispatcharr clamps server side at 30).
+     *
+     * The 24 h floor is the no-catch-up case: a playlist whose channels have
+     * no archive at all still keeps the last day of history, which is what
+     * feeds "what was just on" in the guide.
+     */
+    private suspend fun maxCatchupReachMs(playlistId: String): Long {
+        val days = runCatching { channelSnapshotDao.maxCatchupDays(playlistId) }
+            .getOrNull() ?: 0
+        return maxOf(1, minOf(days, GUIDE_DAYS_ALL_MAX_BACK)) * 86_400_000L
+    }
+
+    /**
+     * Delete the EPG history that is no longer reachable for catch-up
+     * (Logan 2026-09-12).
+     *
+     * Per channel, a programme survives only while its end is inside that
+     * channel's own catch-up window; channels with no archive keep just the
+     * last 24 h. Channels are BUCKETED by catch-up days so this costs one
+     * indexed DELETE per bucket (a panel where every channel has the same
+     * retention is therefore a single statement), not one per channel and
+     * certainly not one per row.
+     *
+     * A final playlist-wide sweep at the maximum reach catches rows whose
+     * channelId belongs to no cached channel at all (an EPG-only key, or a
+     * channel the provider dropped): nothing can ever replay those, and
+     * enumerating them is not possible, so the widest bucket bounds them.
+     *
+     * Coverage rows for fully-expired UTC days go too, so the incremental walk
+     * and the background sweep never re-fetch the days this just emptied (both
+     * clamp their history bound to the same reach).
+     *
+     * Runs on the background-priority EPG dispatcher; the future side of Guide
+     * Days is untouched.
+     */
+    suspend fun pruneEpgBeyondCatchupReach(playlistId: String) = withContext(layeringDispatcher) {
+        val now = System.currentTimeMillis()
+        val dayMs = 86_400_000L
+        val snapshot = runCatching { channelSnapshotDao.forPlaylist(playlistId) }
+            .getOrElse {
+                Log.w("PlaylistRepo", "[EPG] catch-up reach prune: channel snapshot unreadable", it)
+                return@withContext
+            }
+        if (snapshot.isEmpty()) return@withContext
+        // Bucket the guide keys by the retention that applies to them. The key
+        // is the canonical guide channel id, which is what cached programmes
+        // carry after the ingest bridge rewrote their channelId.
+        val keysByDays = HashMap<Int, MutableList<String>>()
+        for (row in snapshot) {
+            val days = minOf(maxOf(row.catchupDays, 0), GUIDE_DAYS_ALL_MAX_BACK)
+            val key = row.toChannel().guideChannelId().value
+            keysByDays.getOrPut(days) { mutableListOf() }.add(key)
+        }
+        var deleted = 0
+        for ((days, keys) in keysByDays) {
+            // days == 0 means no archive: keep only the last 24 h.
+            val cutoff = now - maxOf(days, 1) * dayMs
+            keys.chunked(900).forEach { chunk ->
+                deleted += runCatching {
+                    epgProgrammeDao.deleteEndedBeforeForChannels(playlistId, cutoff, chunk)
+                }.getOrElse {
+                    Log.w("PlaylistRepo", "[EPG] catch-up reach prune chunk failed", it)
+                    0
+                }
+            }
+        }
+        val reachMs = maxOf(1, keysByDays.keys.maxOrNull() ?: 0) * dayMs
+        // Orphan rows: no cached channel claims their key, so no bucket above
+        // could name them. Bounded by the widest reach on the playlist.
+        deleted += runCatching {
+            epgProgrammeDao.deleteEndedBeforeForPlaylist(playlistId, now - reachMs)
+        }.getOrElse {
+            Log.w("PlaylistRepo", "[EPG] catch-up reach orphan prune failed", it)
+            0
+        }
+        runCatching { epgChunkCoverageDao.pruneOlderThan(playlistId, dayFloorMs(now - reachMs)) }
+            .onFailure { Log.w("PlaylistRepo", "[EPG] catch-up reach coverage prune failed", it) }
+        Log.i(
+            "PlaylistRepo",
+            "[EPG] pruned $deleted programmes older than catch-up reach " +
+                "(max ${reachMs / dayMs} days)",
+        )
+    }
+
+    /** Playlists whose launch catch-up reach prune has already run this
+     *  process, so a second guide load does not repeat a sweep whose result
+     *  cannot have changed in the same minute. The sweep's own end-of-run
+     *  prune is separate and always runs. */
+    private val catchupReachPrunedAtLaunch =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+
+    /**
+     * Launch-time trigger: once the guide has painted from cache, prune the
+     * unreachable history in the background. Deliberately AFTER the paint and
+     * on the low-priority EPG dispatcher, so a delete over a 267K-row table
+     * can never sit in front of the first frame of the guide or of a tune.
+     */
+    fun startCatchupReachPruneAfterGuidePainted(
+        playlistId: String,
+        awaitGuidePainted: suspend () -> Unit,
+    ) {
+        if (!catchupReachPrunedAtLaunch.add(playlistId)) return
+        layeringScope.launch {
+            awaitGuidePainted()
+            runCatching { pruneEpgBeyondCatchupReach(playlistId) }
+                .onFailure { Log.w("PlaylistRepo", "[EPG] launch catch-up reach prune failed", it) }
+        }
+    }
+
+    /**
+     * Fingerprint of a Dispatcharr server's EPG sources list: the sorted
+     * "id:updated_at" pairs, comma joined.
+     *
+     * Dispatcharr's ProgramData rows carry NO updated_at, so there is nothing
+     * per-programme to diff against. EPGSource.updated_at, though, is "time
+     * when this source was last successfully refreshed", and a refresh
+     * replaces that source's programs wholesale. So the sources list answers
+     * the only question worth asking -- "has the server re-ingested its guide
+     * since I stored mine?" -- in ONE cheap request, instead of redownloading
+     * 90 day-chunks to find out.
+     *
+     * Sorted so the server's own list order can never fake a change. Sources
+     * with no updated_at (dummy sources, which never refresh) contribute
+     * "id:none" rather than dropping out, so adding or removing one still
+     * registers as a change.
+     */
+    // r3: rows a start-only program id re-resolve (pre-release build,
+    // 2026-10-12) pointed at another channel's program are re-fetched.
+    private val EPG_GRID_DECODER_REVISION = 3
+
+    private fun epgSourcesFingerprint(sources: List<DispatcharrEpgSource>): String =
+        sources
+            .map { "${it.id}:${it.updatedAt?.takeIf { u -> u.isNotBlank() } ?: "none"}" }
+            .sorted()
+            // Grid decoder revision: bumping it re-sweeps cached guides once.
+            // r2 = dummy-EPG artwork from custom_properties (Android#132).
+            .plus("grid-decoder:$EPG_GRID_DECODER_REVISION")
+            .joinToString(",")
+
+    /** Playlists we have already logged an unreadable sources list for, so the
+     *  "falling back to the TTL" line is logged once per process instead of on
+     *  every check. */
+    private val epgSourcesUnreadableLogged = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>(),
+    )
+
+    /** Last time the sources gate was evaluated per playlist; the 15 min
+     *  foreground re-check gate. */
+    private val lastEpgSourcesCheckAtMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** One background sweep per playlist. A second trigger while one is still
+     *  walking reuses it instead of double-fetching every chunk. */
+    private val epgSweepJobs = ConcurrentHashMap<String, Job>()
+
+    /**
+     * Read the server's EPG sources list and compare it against the
+     * fingerprint the cached guide was built from.
+     *
+     * Returns the new fingerprint when it DIFFERS (so the caller can store it
+     * once its sweep finishes), null when it is identical or the list could not
+     * be read. Read-only on purpose: nothing here drops the cache. Logan
+     * 2026-09-12 refreshes EPG in Dispatcharr every few hours, so a stamp
+     * change must never make the user wait for a download; it only decides
+     * whether the quiet background sweep below is worth running at all.
+     */
+    private suspend fun changedEpgSourcesFingerprint(
+        playlist: PlaylistEntity,
+        base: String,
+    ): String? {
+        val sources = runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.listEpgSources(base, key)
+            }
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            // Degraded servers (sources list unreadable): the 12 h per-chunk
+            // TTL stays the only staleness signal, exactly as before this
+            // check existed. Logged once per process per playlist.
+            if (epgSourcesUnreadableLogged.add(playlist.id)) {
+                Log.w(
+                    "PlaylistRepo",
+                    "[EPG] sources list unreadable; falling back to the " +
+                        "${EPG_CHUNK_TTL_MS / 3_600_000}h chunk TTL: $it",
+                )
+            }
+            return null
+        }
+        val fingerprint = epgSourcesFingerprint(sources)
+        if (fingerprint == playlist.dispatcharrEpgSourceFingerprint) {
+            Log.i("PlaylistRepo", "[EPG] sources unchanged, background sweep skipped")
+            Log.i("PlaylistRepo", "[EPG] sources fingerprint unchanged (${sources.size} sources)")
+            return null
+        }
+        val storedPairs = playlist.dispatcharrEpgSourceFingerprint
+            ?.split(",")?.filter { it.isNotBlank() }?.toSet() ?: emptySet()
+        val refreshed = fingerprint.split(",").count { it.isNotBlank() && it !in storedPairs }
+        Log.i(
+            "PlaylistRepo",
+            "[EPG] sources changed ($refreshed refreshed since cache): background sweep queued",
+        )
+        return fingerprint
+    }
+
+    /**
+     * The chunk order the background sweep walks: today first, then forward
+     * days, then history. The user is looking at today and tomorrow; the past
+     * is catch-up browsing and can wait several minutes for its turn.
+     *
+     * Same fixed UTC day grid and the same Guide Days bounds the incremental
+     * walk uses, so a swept chunk refreshes the very row the coverage map
+     * vouches for instead of minting a parallel one.
+     */
+    private suspend fun sweepChunkOrder(playlist: PlaylistEntity, now: Long): List<Pair<Long, Long>> {
+        val dayMs = 86_400_000L
+        val guideDays = resolveGuideDays(playlist.epgRetentionDays) ?: GUIDE_DAYS_ALL_MAX_BACK
+        val hugePanel = playlist.channelCount > 5_000
+        val today = dayFloorMs(now)
+        val forward = (1..guideDays).map { today + it * dayMs }
+        // Huge panels only ever FETCH 6 h of history, so there is no point
+        // sweeping days that were never downloaded. History is also clamped to
+        // the playlist's maximum catch-up reach: a day nothing can replay is a
+        // day the reach prune deletes, so re-fetching it would only rebuild
+        // rows the next prune drops again.
+        val reachDays = (maxCatchupReachMs(playlist.id) / dayMs).toInt()
+        val historyDays = if (hugePanel) 0 else minOf(guideDays, reachDays)
+        val history = (1..historyDays).map { today - it * dayMs }
+        return (listOf(today) + forward + history).map { it to (it + dayMs) }
+    }
+
+    /**
+     * Very low resource background EPG sweep (Logan 2026-09-12).
+     *
+     * The foreground path NEVER waits on this and NEVER drops coverage: launch
+     * and guide open keep serving every covered chunk from cache ("0 of 90
+     * chunk(s) fetched"). Once the app has SETTLED -- the guide has painted
+     * from cache, a tune (if any) is past its first frame, and
+     * [EPG_SWEEP_SETTLE_MS] has passed -- this walks the day chunks one at a
+     * time, [EPG_SWEEP_CHUNK_GAP_MS] apart, on the background-priority EPG
+     * dispatcher. Each chunk REPLACES the cached programs for its day as it
+     * lands (authoritative merge), so the open guide corrects itself quietly
+     * and a sporting event the provider moved to another day cannot keep
+     * showing its old time.
+     *
+     * Pauses while a tune is in flight (before first frame) and while the app
+     * is backgrounded, resuming at the chunk it stopped on: a guide refresh is
+     * never worth a frame of playback. The sources fingerprint is stored only
+     * when the sweep COMPLETES, so an interrupted sweep is retried rather than
+     * being remembered as done.
+     *
+     * Note on request priority: okhttp exposes no per-request network priority
+     * here, so "low resource" is the dispatcher (THREAD_PRIORITY_BACKGROUND,
+     * two threads), the one-at-a-time pacing, and the inter-chunk gap.
+     */
+    fun startEpgBackgroundSweep(playlistId: String) {
+        epgSweepJobs.compute(playlistId) { _, existing ->
+            if (existing?.isActive == true) return@compute existing
+            layeringScope.launch {
+                // Settle window: the guide paints from cache, the cold-launch
+                // channel load finishes, and a tune started from the launch
+                // screen reaches its first frame before we touch the network.
+                delay(EPG_SWEEP_SETTLE_MS)
+                val playlist = dao.byId(playlistId) ?: return@launch
+                val sourceType = playlist.resolvedSourceType()
+                val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+                    sourceType == SourceType.DispatcharrUserPass
+                if (!isDispatcharr || playlist.apiKey.isNullOrBlank()) return@launch
+                if (!playlist.dispatcharrVersionAtLeast("0.30.0")) return@launch
+                val base = effectiveBaseUrl(playlist)
+                // The GATE: no server-side re-ingest, no sweep at all.
+                val fingerprint = changedEpgSourcesFingerprint(playlist, base) ?: return@launch
+                val now = System.currentTimeMillis()
+                val chunks = sweepChunkOrder(playlist, now)
+                var refreshed = 0
+                for ((start, end) in chunks) {
+                    awaitSweepWindow()
+                    val n = fetchGridChunk(playlist, base, start, end, authoritative = true)
+                    if (n == null) {
+                        // A failed chunk stops the sweep exactly like the
+                        // incremental walk stops: the fingerprint is NOT
+                        // stored, so the next 15 min gate retries from the top.
+                        Log.w("PlaylistRepo", "[EPG] background sweep stopped after $refreshed chunk(s)")
+                        return@launch
+                    }
+                    // Keep the coverage map honest: this day was just
+                    // re-fetched, so its TTL clock restarts here.
+                    runCatching {
+                        epgChunkCoverageDao.upsert(
+                            EpgChunkCoverage(
+                                playlistId = playlist.id,
+                                chunkStartMs = start,
+                                chunkEndMs = end,
+                                fetchedAtMs = System.currentTimeMillis(),
+                                programCount = n,
+                            ),
+                        )
+                    }.onFailure { Log.w("PlaylistRepo", "[EPG] sweep coverage upsert failed", it) }
+                    refreshed++
+                    delay(EPG_SWEEP_CHUNK_GAP_MS)
+                }
+                // Completed: remember this server state so the gate skips the
+                // sweep until Dispatcharr re-ingests again.
+                runCatching { dao.updateEpgSourceFingerprint(playlistId, fingerprint) }
+                    .onFailure { Log.w("PlaylistRepo", "[EPG] sources fingerprint persist failed", it) }
+                Log.i(
+                    "PlaylistRepo",
+                    "[EPG] background sweep complete: $refreshed of ${chunks.size} chunk(s) refreshed",
+                )
+                // End of every sweep: drop the history that is no longer
+                // reachable for catch-up, including the coverage rows for those
+                // days, so the cache does not keep growing a past nothing can
+                // play back.
+                runCatching { pruneEpgBeyondCatchupReach(playlistId) }
+                    .onFailure { Log.w("PlaylistRepo", "[EPG] sweep catch-up reach prune failed", it) }
+            }
+        }
+    }
+
+    /**
+     * Block until the sweep is allowed to spend a request: the app is in the
+     * foreground and no tune is waiting on its first frame. Polls rather than
+     * subscribing, because the whole point is to be cheap and late.
+     */
+    private suspend fun awaitSweepWindow() {
+        while (!EpgSweepGate.sweepAllowed) {
+            delay(EPG_SWEEP_PAUSE_POLL_MS)
+        }
+    }
+
+    /**
+     * Periodic foreground gate re-check (Logan 2026-09-12): every 15 minutes,
+     * and on return to the foreground after 15 minutes, ask the server whether
+     * its EPG sources moved and start the quiet sweep if they did. Rate limited
+     * per playlist so the caller can fire it from both places.
+     */
+    suspend fun maybeSweepEpgForSourceChanges(playlistId: String) {
+        val now = System.currentTimeMillis()
+        val last = lastEpgSourcesCheckAtMs[playlistId] ?: 0L
+        if (now - last < EPG_SOURCES_CHECK_INTERVAL_MS) return
+        lastEpgSourcesCheckAtMs[playlistId] = now
+        startEpgBackgroundSweep(playlistId)
+    }
+
+    /**
+     * INCREMENTAL Dispatcharr grid window pass (Logan 2026-09-11). The previous
+     * revision refetched EVERY one-day chunk of the Guide Days range on every
+     * single launch ("grid window: 30 chunk(s)" in the Streamer log each time),
+     * 30 HTTP round trips plus 30 merges for data already sitting in Room.
+     *
+     * Now: the live -1h..+24h window is still fetched unconditionally on the
+     * critical path by [loadEpgInternal] (its coverage is recorded here), and
+     * this background walk only loads the chunks that are MISSING or STALE,
+     * then prunes what is no longer valid. Chunks live on the fixed UTC day
+     * grid so a row written last launch is reusable this launch.
+     *
+     * [liveProgrammeCount] is the base grid's size, recorded on the live
+     * window's coverage rows so they read as non-empty bookkeeping.
+     */
+    private fun extendGridWindowInBackground(
+        playlist: PlaylistEntity,
+        base: String,
+        liveProgrammeCount: Int,
+    ) {
+        layeringJobs.compute(playlist.id) { _, existing ->
+            if (existing?.isActive == true) return@compute existing
+            layeringScope.launch {
+                val now = System.currentTimeMillis()
+                val dayMs = 86_400_000L
+                // Logan 2026-09-11: the playlist's Guide Days setting
+                // (epgRetentionDays) governs the grid in BOTH directions. The
+                // Settings > Network "Guide Window" preference no longer has
+                // any say here. Huge panels still clamp HISTORY to 6h only.
+                val guideDays = resolveGuideDays(playlist.epgRetentionDays)
+                val hugePanel = playlist.channelCount > 5_000
+                // Catch-up reach clamp (Logan 2026-09-12): never FETCH history
+                // older than the furthest back any channel on this playlist can
+                // replay. Those days are deleted by the reach prune, so the 30
+                // day (All Available) or Guide Days history bound below must not
+                // reach past them or the walk would refetch rows on every launch
+                // only for the prune to delete them again.
+                val reachMs = maxCatchupReachMs(playlist.id)
+                val baseStart = now - 3_600_000L
+                val baseEnd = now + dayMs
+                // Record the aligned day chunks the live window FULLY covers.
+                // Days it merely clips stay uncovered so the walk still fills
+                // them; claiming a partially-fetched day would leave holes that
+                // no later launch would ever repair.
+                val liveRows = mutableListOf<EpgChunkCoverage>()
+                var liveDay = dayFloorMs(baseStart)
+                while (liveDay + dayMs <= baseEnd) {
+                    if (liveDay >= baseStart) {
+                        liveRows += EpgChunkCoverage(
+                            playlistId = playlist.id,
+                            chunkStartMs = liveDay,
+                            chunkEndMs = liveDay + dayMs,
+                            fetchedAtMs = now,
+                            programCount = liveProgrammeCount,
+                        )
+                    }
+                    liveDay += dayMs
+                }
+                if (liveRows.isNotEmpty()) {
+                    runCatching { epgChunkCoverageDao.upsertAll(liveRows) }
+                        .onFailure { Log.w("PlaylistRepo", "live window coverage upsert failed", it) }
+                }
+                // Read AFTER the live upsert so the live days are already in
+                // the map and the walk treats them as cached.
+                val coverage = runCatching { epgChunkCoverageDao.forPlaylist(playlist.id) }
+                    .getOrDefault(emptyList())
+                    .associateBy { it.chunkStartMs }
+                fun isCovered(chunkStart: Long): Boolean {
+                    val row = coverage[chunkStart] ?: return false
+                    return now - row.fetchedAtMs < EPG_CHUNK_TTL_MS
+                }
+                if (guideDays == null) {
+                    // All Available: walk one-day chunks outward until the
+                    // server runs dry (two consecutive empty chunks), bounded
+                    // at 30 days back / 60 days ahead. A chunk that is already
+                    // COVERED counts as covered, never as an empty: letting a
+                    // cached empty day feed the terminator would stop the walk
+                    // two days out on every launch after the first.
+                    var total = 0
+                    var fetched = 0
+                    var cached = 0
+                    val historyMs = if (hugePanel) 6L * 3_600_000L
+                        else minOf(GUIDE_DAYS_ALL_MAX_BACK * dayMs, reachMs)
+                    val historyFloor = dayFloorMs(now - historyMs)
+                    var stopped = false
+                    var cursor = dayFloorMs(baseStart) + dayMs
+                    var empties = 0
+                    while (cursor > historyFloor && empties < 2) {
+                        val chunkStart = cursor - dayMs
+                        if (isCovered(chunkStart)) {
+                            cached++
+                        } else {
+                            val n = fetchAndRecordChunk(playlist, base, chunkStart, cursor)
+                            if (n == null) { stopped = true; break }
+                            fetched++
+                            if (n == 0) empties++ else { empties = 0; total += n }
+                            delay(250)
+                        }
+                        cursor = chunkStart
+                    }
+                    val backFloor = cursor
+                    val forwardCeiling = dayFloorMs(now + GUIDE_DAYS_ALL_MAX_AHEAD * dayMs)
+                    cursor = dayFloorMs(baseEnd)
+                    empties = 0
+                    while (cursor < forwardCeiling && empties < 2 && !stopped) {
+                        val chunkEnd = cursor + dayMs
+                        if (isCovered(cursor)) {
+                            cached++
+                        } else {
+                            val n = fetchAndRecordChunk(playlist, base, cursor, chunkEnd)
+                            if (n == null) { stopped = true; break }
+                            fetched++
+                            if (n == 0) empties++ else { empties = 0; total += n }
+                            delay(250)
+                        }
+                        cursor = chunkEnd
+                    }
+                    val walked = fetched + cached
+                    Log.i(
+                        "PlaylistRepo",
+                        "grid window: $fetched of $walked chunk(s) fetched ($cached cached), " +
+                            "history ${(now - backFloor) / 3_600_000}h, " +
+                            "forward +${(cursor - now) / 3_600_000}h",
+                    )
+                    Log.i("PlaylistRepo", "grid window: merged $total programmes (all available)")
+                    if (!stopped) {
+                        pruneEpgToGuideRange(
+                            playlistId = playlist.id,
+                            retentionHistoryStart = now - GUIDE_DAYS_ALL_MAX_BACK * dayMs,
+                            coverageFromMs = backFloor,
+                            coverageToMs = cursor,
+                        )
+                    }
+                    return@launch
+                }
+                val historyMs = if (hugePanel) 6L * 3_600_000L
+                    else minOf(guideDays * dayMs, reachMs)
+                val forwardEnd = now + guideDays * dayMs
+                val chunks = mutableListOf<Pair<Long, Long>>()
+                var cursor = dayFloorMs(now - historyMs)
+                val coverageFrom = cursor
+                while (cursor < forwardEnd) {
+                    chunks += cursor to (cursor + dayMs)
+                    cursor += dayMs
+                }
+                val coverageTo = cursor
+                if (chunks.isEmpty()) return@launch
+                var total = 0
+                var fetched = 0
+                var cached = 0
+                var stopped = false
+                for ((start, end) in chunks) {
+                    if (isCovered(start)) { cached++; continue }
+                    val n = fetchAndRecordChunk(playlist, base, start, end)
+                    if (n == null) { stopped = true; break }
+                    fetched++
+                    total += n
+                    delay(250)
+                }
+                Log.i(
+                    "PlaylistRepo",
+                    "grid window: $fetched of ${chunks.size} chunk(s) fetched ($cached cached), " +
+                        "history ${historyMs / 3_600_000}h, forward +${guideDays * 24}h",
+                )
+                Log.i("PlaylistRepo", "grid window: merged $total programmes over ${chunks.size} chunk(s)")
+                if (!stopped) {
+                    pruneEpgToGuideRange(
+                        playlistId = playlist.id,
+                        retentionHistoryStart = now - guideDays * dayMs,
+                        coverageFromMs = coverageFrom,
+                        coverageToMs = coverageTo,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun layerUpstreamInBackground(
+        playlistId: String,
+        base: String,
+        customXmltvUrl: String?,
+        knownChannelKeys: Set<String>?,
+    ) {
+        layeringJobs.compute(playlistId) { _, existing ->
+            if (existing?.isActive == true) return@compute existing
+            layeringScope.launch {
+                // GH #53: source discovery moved in here with the fetching. It
+                // needs /api/epg/epgdata/ as well as /api/epg/sources/ now (to
+                // learn which feed each tvg-id came from), and neither belongs
+                // in front of the guide paint.
+                val layers = runCatching {
+                    dispatcharrAuth.withApiKeyRetry(playlistId) { key ->
+                        dispatcharrEpgLayers(
+                            epgData = dispatcharrClient.listEpgData(base, key),
+                            sources = dispatcharrClient.listEpgSources(base, key),
+                            knownChannelKeys = knownChannelKeys,
+                            customXmltvUrl = customXmltvUrl,
+                        )
+                    }
+                }.getOrElse {
+                    if (it is CancellationException) throw it
+                    Log.w("PlaylistRepo", "upstream layering: source discovery failed: $it")
+                    emptyList()
+                }.take(MAX_UPSTREAM_EPG_SOURCES)
+                if (layers.isEmpty()) return@launch
+                val phaseDeadline = System.currentTimeMillis() + UPSTREAM_EPG_TOTAL_BUDGET_MS
+                var collected = 0
+                var downloadMs = 0L
+                for (layer in layers) {
+                    // Phase budget gates STARTING another source only, and it
+                    // must not count download time either: one 224MB feed at
+                    // ~3MB/s is 75s of the 3-minute phase before a byte is
+                    // parsed. Extend the phase by each source's download time
+                    // so the cap still bounds parse work, not the user's link.
+                    if (System.currentTimeMillis() >= phaseDeadline + downloadMs) {
+                        Log.w("PlaylistRepo", "upstream layering: phase budget spent; stopping")
+                        break
+                    }
+                    // The per-source budget clocks the PARSE only, from the
+                    // moment the download lands. It used to start before the
+                    // fetch, so a 224MB national feed spent all 90s downloading
+                    // and the parser aborted at 0 programmes (Streamer log
+                    // 2026-09-01: "parse aborted by budget; keeping 0") -- the
+                    // guide silently lost every channel that feed carried. The
+                    // download has its own stall floor in PlaylistFetcher.
+                    var sourceDeadline = Long.MAX_VALUE
+                    val truncated = java.util.concurrent.atomic.AtomicBoolean(false)
+                    // Conditional GET: an upstream feed the server says is
+                    // unchanged since the last complete parse is neither
+                    // downloaded nor parsed (validators are stored only after
+                    // an untruncated parse, so a budget-cut feed retries).
+                    val stored = runCatching { appPreferences.feedValidators(layer.url).first() }.getOrNull()
+                    val sent = stored?.let { (etag, lastModified) ->
+                        if (etag == null && lastModified == null) null
+                        else com.aeriotv.android.core.network.FeedValidators(etag, lastModified)
+                    }
+                    var fresh: com.aeriotv.android.core.network.FeedValidators? = null
+                    val xmltv = runCatching {
+                        // GH #53: parse against THIS feed's own guide keys, not
+                        // the playlist's whole key set. tvg-id values are
+                        // broadcaster strings and collide freely across
+                        // unrelated feeds; parsing globally let one provider's
+                        // schedule land on another provider's channel.
+                        val fetchStartMs = System.currentTimeMillis()
+                        val result = fetchViaTempFileIfChanged(layer.url, ".xmltv", sent) { file ->
+                            downloadMs += System.currentTimeMillis() - fetchStartMs
+                            sourceDeadline = minOf(
+                                System.currentTimeMillis() + UPSTREAM_EPG_PER_SOURCE_MS,
+                                phaseDeadline + downloadMs,
+                            )
+                            XMLTVParser.parseFile(
+                                file,
+                                layer.channelKeys,
+                                shouldAbort = { System.currentTimeMillis() >= sourceDeadline },
+                                truncated = truncated,
+                            )
+                        }
+                        if (result == null) {
+                            Log.i("PlaylistRepo", "upstream source unchanged (304); parse skipped")
+                            emptyList()
+                        } else {
+                            fresh = result.second
+                            result.first
+                        }
+                    }.getOrElse {
+                        if (it is CancellationException) throw it
+                        Log.w("PlaylistRepo", "upstream EPG source skipped: ${it.javaClass.simpleName}")
+                        emptyList()
+                    }
+                    val complete = fresh?.takeIf { !truncated.get() && (it.etag != null || it.lastModified != null) }
+                    if (complete != null) {
+                        runCatching { appPreferences.setFeedValidators(layer.url, complete.etag, complete.lastModified) }
+                    }
+                    if (xmltv.isNotEmpty()) {
+                        // Merge per-source so a kill mid-phase loses at most
+                        // one feed, not all of them. saveEpgToCache merges and
+                        // prunes to the retention window.
+                        // A parse that ran out of budget returns a FRAGMENT of
+                        // the feed. Insert what it got, but do not let it delete
+                        // the covered window: the channels it mentions are not
+                        // the channels it fully carries, and the rows it never
+                        // reached are usually somebody else's good data.
+                        if (truncated.get()) {
+                            Log.w(
+                                "PlaylistRepo",
+                                "upstream source truncated by budget; merging insert-only " +
+                                    "(${xmltv.size} programmes)",
+                            )
+                        }
+                        // Insert-only, ALWAYS (2026-09-01): the Dispatcharr grid is
+                        // the authority for now/future. An authoritative layer
+                        // merge deletes each mentioned channel's covered window
+                        // and re-inserts only what the feed carries, so a feed
+                        // that merely mentions a channel (or lands on it through
+                        // a key collision) wiped the grid's rows and left holes
+                        // (ESPN HD 4:00-6:00 on the Streamer). Layering exists to
+                        // ADD history and detail; dedupSameAiring collapses any
+                        // same-airing overlap downstream.
+                        runCatching {
+                            saveEpgToCache(playlistId, xmltv, authoritative = false)
+                        }.onFailure { Log.w("PlaylistRepo", "layered cache merge failed", it) }
+                        collected += xmltv.size
+                    }
+                }
+                if (collected > 0) {
+                    Log.i(
+                        "PlaylistRepo",
+                        "upstream layering: merged $collected programmes from " +
+                            "${layers.size} source-scoped feed(s) in background",
+                    )
+                    _upstreamEpgLayered.tryEmit(playlistId)
+                }
+            }
+        }
+    }
+
+    suspend fun loadEpg(
+        playlist: PlaylistEntity,
+        knownChannelKeys: Set<String>? = null,
+    ): Result<List<EPGProgramme>> {
+        val key = playlist.id
+        val mine = CompletableDeferred<Result<List<EPGProgramme>>>()
+        val winner = inFlightLoads.putIfAbsent(key, mine)
+        if (winner != null) {
+            // Another caller already started the fetch; await their result.
+            // Log the join: the 2026-08 "no EPG" report showed a load that
+            // never returned wedging every later call on this latch. If that
+            // recurs, this line is the tell.
+            Log.i("PlaylistRepo", "loadEpg: joining in-flight load for ${key.take(8)}")
+            return winner.await()
+        }
+        return try {
+            // Hard ceiling so a load that hangs pre-network (same report:
+            // "fetching EPG" logged, then silence -- no grid request, no
+            // success, no failure) completes the latch as a failure instead
+            // of wedging this playlist's EPG until force-stop. Generous
+            // because M3U XMLTV sources legitimately stream hundreds of MB.
+            val result = withTimeout(EPG_LOAD_TIMEOUT_MS) {
+                loadEpgInternal(playlist, knownChannelKeys)
+            }
+            mine.complete(result)
+            result
+        } catch (timeout: TimeoutCancellationException) {
+            // The wedge this fix exists for. Report it as a failure so the
+            // latch releases and the next refresh actually retries.
+            Log.w(
+                "PlaylistRepo",
+                "loadEpg: timed out after ${EPG_LOAD_TIMEOUT_MS / 1000}s; releasing the in-flight latch",
+            )
+            val r: Result<List<EPGProgramme>> = Result.failure(timeout)
+            mine.complete(r)
+            r
+        } catch (cancel: CancellationException) {
+            // NOT a failure: the caller's scope went away (screen left
+            // composition, process winding down). Release the latch for any
+            // joiner, then let cancellation propagate rather than reporting a
+            // bogus EPG error and continuing work in a dead scope. The
+            // timeout arm above runs first, so this only sees real
+            // cancellation -- TimeoutCancellationException is a subclass.
+            mine.complete(Result.failure(cancel))
+            throw cancel
+        } catch (t: Throwable) {
+            val r: Result<List<EPGProgramme>> = Result.failure(t)
+            mine.complete(r)
+            r
+        } finally {
+            // Drop the entry so the next (sequential) call hits the network
+            // again instead of awaiting a long-stale completed Deferred.
+            inFlightLoads.remove(key, mine)
+        }
+    }
+
+    private suspend fun loadEpgInternal(
+        playlist: PlaylistEntity,
+        knownChannelKeys: Set<String>? = null,
+    ): Result<List<EPGProgramme>> =
+        // Parse + grid-mapping run on Default, NOT the caller's (Main) dispatcher.
+        // A large provider EPG is hundreds of thousands of programmes; parsing
+        // that XMLTV / mapping the Dispatcharr grid on Main froze the UI for
+        // minutes before the guide could paint.
+        withContext(layeringDispatcher) { runCatching {
+        val sourceType = playlist.resolvedSourceType()
+        // Breadcrumbs bracketing base resolution: the 2026-08 hang sat
+        // somewhere between the ViewModel's "fetching EPG" line and the first
+        // AerioNet request, and nothing in that stretch logged. Which of
+        // these two lines is the last one out pins the stall to either the
+        // LAN probe (before) or the auth-broker Room read (after).
+        Log.i("PlaylistRepo", "loadEpg: resolving base (source=$sourceType)")
+        val base = effectiveBaseUrl(playlist)
+        Log.i("PlaylistRepo", "loadEpg: base resolved, starting fetch")
+        val programmes = when (sourceType) {
+            SourceType.M3uUrl -> {
+                // A pasted XC get.php link now loads through player_api (see
+                // loadChannels), so its channels carry epg_channel_id and the
+                // panel's own xmltv.php will match them. Derive that URL when
+                // the user supplied no XMLTV, otherwise those playlists end up
+                // with guide ids and no guide to match against. An explicit
+                // epgUrl always wins -- the user chose it deliberately.
+                val epgUrl = playlist.epgUrl?.takeIf { it.isNotBlank() }
+                    ?: xtreamCredsFromGetPhpUrl(base)?.let { xc ->
+                        "${xc.base}/xmltv.php?username=${xtreamEncode(xc.username)}" +
+                            "&password=${xtreamEncode(xc.password)}"
+                    }
+                    ?: return@runCatching emptyList()
+                // GH #26: constant-memory download + parse (multi-hundred-MB
+                // provider XMLTVs OOM'd fetchBytes the same way big M3Us did).
+                fetchViaTempFile(epgUrl, ".xmltv") { XMLTVParser.parseFile(it, knownChannelKeys) }
+            }
+            SourceType.DispatcharrApiKey, SourceType.DispatcharrUserPass -> {
+                if (playlist.apiKey.isNullOrBlank()) return@runCatching emptyList()
+                // iOS GuideStore audit P2 #9 (EPGGuideView.swift:903-947):
+                // try the bulk grid first, fall back to current-programs +
+                // bulk-upcoming when the grid endpoint is unavailable (older
+                // Dispatcharr versions ship with only the legacy endpoints)
+                // or returns a 5xx / parse-fail. The fallback path produces
+                // a strict subset of the grid's information (no `is_new` /
+                // `is_live` / `is_premiere` flags, and no rich descriptions
+                // on legacy installs) but keeps the guide useful instead of
+                // blank.
+                val grid = dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                    runCatching { dispatcharrClient.getEpgGrid(base, key).toProgrammes() }
+                        .getOrElse { gridErr ->
+                            Log.w(
+                                "PlaylistRepo",
+                                "Dispatcharr grid failed; falling back to current + bulk-upcoming",
+                                gridErr,
+                            )
+                            val current = runCatching {
+                                dispatcharrClient.getCurrentPrograms(base, key)
+                            }.getOrDefault(emptyList())
+                            val upcoming = runCatching {
+                                dispatcharrClient.getBulkUpcomingPrograms(base, key)
+                            }.getOrDefault(emptyList())
+                            if (current.isEmpty() && upcoming.isEmpty()) {
+                                // Both fallbacks failed too -- re-throw the
+                                // grid error so the outer loadEpg returns a
+                                // proper failure Result, not a silently-
+                                // empty success.
+                                throw gridErr
+                            }
+                            (current + upcoming).toProgrammes()
+                        }
+                }
+                // iOS parity (EPGGuideView.swift Dispatcharr branch + the user-
+                // configurable custom-XMLTV URL on the source): when the user
+                // sets a separate XMLTV URL on a Dispatcharr playlist (Edit
+                // Playlist > EPG URL), fetch that XMLTV too and layer it on
+                // top of the grid. The Dispatcharr grid usually keys by
+                // channel number and is sparse on category tags; a richer
+                // provider's XMLTV fills in categories, descriptions, and
+                // covers channels the grid misses. Same-airing dedup at
+                // groupByChannel time (PlaylistViewModel.dedupSameAiring)
+                // collapses any pair that overlaps > 80% or shares a title
+                // within 60s, so the same programme never appears twice.
+                val customXmltv = playlist.epgUrl?.takeIf { it.isNotBlank() }
+                // Catch-up depth (task #210): Dispatcharr's grid only retains a
+                // couple of days of history, so Direct Connect users could not
+                // browse catch-up content older than that even when the playlist's
+                // Guide Days setting allows more. The server knows where its
+                // guide comes from, though: /api/epg/sources/ lists the XMLTV
+                // feeds assigned to channels, and those upstream feeds usually
+                // carry a much deeper past window. Fetch each active xmltv source
+                // directly and layer it on the grid exactly like the manual EPG
+                // URL override below; saveEpgToCache retention + dedupSameAiring
+                // handle accumulation and overlap downstream. Sources that are
+                // unreachable from the app (LAN-only paths, file:// mounts on the
+                // server) fail silently per-source; the grid is never at risk.
+                // The user's OWN EPG URL is not optional work and stays on
+                // the critical path (it is guide data they configured).
+                var layered = grid
+                customXmltv?.let { own ->
+                    val xmltv = runCatching {
+                        fetchViaTempFile(own, ".xmltv") { XMLTVParser.parseFile(it, knownChannelKeys) }
+                    }.getOrElse { emptyList() }
+                    if (xmltv.isNotEmpty()) layered = layered + xmltv
+                }
+                // Discord reports 2026-08-08 (rmebast; needcoffee, measured
+                // directly against their server): the upstream layering used
+                // to run HERE, between the grid fetch and the return, so the
+                // guide could not paint until every feed was downloaded and
+                // parsed. The 0.4.5 budget capped the damage but kept the
+                // architecture: on a server with four epg.guru 7-day national
+                // feeds the user still stared at an empty "syncing" guide for
+                // the full budget on EVERY load, because a CPU-bound XMLTV
+                // parse never hits a suspension point and withTimeout cannot
+                // fire mid-parse. Meanwhile the grid itself had returned in
+                // ~1s (3.9MB measured on the affected server).
+                //
+                // The grid now returns IMMEDIATELY and the layering runs in
+                // [layerUpstreamInBackground]: same source list, same budget,
+                // but off the critical path, cancellable mid-parse, merged
+                // through the EPG cache, and announced via [upstreamEpgLayered]
+                // so the ViewModel folds it in when it lands. Source discovery
+                // moved in there too (GH #53), so nothing before the guide
+                // paint touches /api/epg/sources/ or /api/epg/epgdata/.
+                // Nothing Phone 2026-09-11: a playlist added before the 0.30
+                // code shipped has NO stored server version (it is captured
+                // only at add and at refresh), so the gate below read false,
+                // the guide took the upstream XMLTV layering path, and the
+                // grid window pass never ran -- while a device whose playlist
+                // had been refreshed did run it. Capture the version (and the
+                // 0.30 permissions, same shape) once here when the persisted
+                // value is missing, persist it, and gate on the fresh value in
+                // THIS run. Never refetch when a value is already stored; the
+                // refresh path keeps it current.
+                var gated = playlist
+                if (playlist.dispatcharrServerVersion.isBlank()) {
+                    val captured = runCatching {
+                        dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                            val v = dispatcharrClient.fetchServerVersion(base, key)
+                            val p = dispatcharrClient.fetchAccountPermissions(base, key)
+                            v to p
+                        }
+                    }.getOrNull()
+                    val version = captured?.first
+                    val perms = captured?.second
+                    if (!version.isNullOrBlank()) {
+                        val updated = playlist.copy(
+                            dispatcharrServerVersion = version,
+                            dispatcharrDvrAccess = perms?.dvrAccess ?: playlist.dispatcharrDvrAccess,
+                            dispatcharrCatchupEnabled =
+                                perms?.catchupEnabled ?: playlist.dispatcharrCatchupEnabled,
+                            dispatcharrVodMoviesEnabled =
+                                perms?.vodMoviesEnabled ?: playlist.dispatcharrVodMoviesEnabled,
+                            dispatcharrVodSeriesEnabled =
+                                perms?.vodSeriesEnabled ?: playlist.dispatcharrVodSeriesEnabled,
+                        )
+                        runCatching { dao.update(updated) }
+                            .onFailure { Log.w("PlaylistRepo", "version capture persist failed", it) }
+                        gated = updated
+                        Log.i("PlaylistRepo", "[EPG] server version captured $version at EPG load")
+                    }
+                }
+                // Re-read the row here so the rest of this pass sees
+                // whatever the warmup / permissions paths persisted.
+                dao.byId(playlist.id)?.let { gated = it }
+                if (gated.dispatcharrVersionAtLeast("0.30.0")) {
+                    // Dispatcharr 0.30: the grid serves history and days ahead
+                    // itself; no third-party XMLTV layering needed.
+                    extendGridWindowInBackground(gated, base, grid.size)
+                    // Logan 2026-09-12: the cache is NEVER dropped on the
+                    // foreground path. Once the app has settled, a very low
+                    // resource sweep re-fetches the day chunks one at a time
+                    // IF the server's EPG sources moved since this cache was
+                    // built; the fingerprint is only that gate. Rate limited
+                    // inside, so a second guide load is free.
+                    layeringScope.launch { maybeSweepEpgForSourceChanges(playlist.id) }
+                } else {
+                    layerUpstreamInBackground(playlist.id, base, customXmltv, knownChannelKeys)
+                }
+                layered
+            }
+            SourceType.XtreamCodes -> {
+                // Xtream EPG is a standard XMLTV feed at xmltv.php. Reuse the
+                // XMLTV parser; programmes map to channels by tvg-id like M3U.
+                //
+                // Audit task #19: if the user has set a custom XMLTV URL on
+                // the playlist (Edit Playlist -> EPG URL field), prefer
+                // that. iOS parity: a separate XMLTV provider often supplies
+                // richer category/genre tags than the Xtream server's own
+                // xmltv.php, which the channel tinting + category list
+                // depend on. Fall back to xmltv.php only when no override
+                // is set.
+                val override = playlist.epgUrl?.takeIf { it.isNotBlank() }
+                val xmltvUrl = override ?: run {
+                    val user = playlist.username?.takeIf { it.isNotBlank() }
+                        ?: return@runCatching emptyList()
+                    val b = base.trimEnd('/')
+                    "$b/xmltv.php?username=${xtreamEncode(user)}" +
+                        "&password=${xtreamEncode(playlist.password.orEmpty())}"
+                }
+                // GH #26: constant-memory download + parse.
+                fetchViaTempFile(xmltvUrl, ".xmltv") { XMLTVParser.parseFile(it, knownChannelKeys) }
+            }
+        }
+        // Targeted column write, NOT a whole-row update: `playlist` is the
+        // snapshot this run started with, so writing it back here used to
+        // revert everything the run itself had just captured and persisted
+        // (server version, 0.30 permissions, cast AAC output profile id).
+        dao.updateLastEpgRefreshedAt(playlist.id, System.currentTimeMillis())
+        programmes
+    } }
+
+    /**
+     * Disk-cached EPG (iOS GuideStore parity). [loadCachedEpg] returns the last
+     * persisted guide for a source so the UI can paint now-playing + the guide
+     * instantly on relaunch; [newestEpgFetch] drives the freshness check; and
+     * [saveEpgToCache] replaces the source's rows after a network fetch, pruning
+     * programmes that have already ended.
+     */
+    suspend fun loadCachedEpg(playlistId: String): List<EPGProgramme> =
+        withContext(layeringDispatcher) {
+            epgProgrammeDao.forPlaylist(playlistId).map { it.toProgramme() }
+        }
+
+    /**
+     * Time-windowed cached-EPG read (iOS GuideStore parity --
+     * EPGGuideView.swift `loadFromCache` predicate). Returns only programmes
+     * whose airing overlaps [[fromMillis]..[toMillis]], so cold-launch paint
+     * loads ~5-15% of the cache (a 24h window over a 7-day grid) instead of
+     * every row. The playlist's Guide Days setting (epgRetentionDays)
+     * dictates [toMillis] in the calling ViewModel; [fromMillis] is
+     * typically now minus that same span, or now-1h on the quick pass, so the
+     * "currently airing" programme is always inside the result regardless of
+     * how long it's been running.
+     */
+    suspend fun loadCachedEpg(
+        playlistId: String,
+        fromMillis: Long,
+        toMillis: Long,
+    ): List<EPGProgramme> =
+        withContext(layeringDispatcher) {
+            epgProgrammeDao
+                .forPlaylistInWindow(playlistId, fromMillis, toMillis)
+                .map { it.toProgramme() }
+        }
+
+    /**
+     * EPG-scope search (iOS SearchView EPG scope). Returns near-term
+     * programmes whose title/description match [query] for the active
+     * source, ordered soonest-first. The returned EPGProgramme.channelId is
+     * the canonical guideMatchKey (bridgeChannelIds already rewrote it at
+     * fetch time), so a Search result can be handed straight to the
+     * guide-jump path without further tvg-id/uuid resolution.
+     *
+     * TODO(parity task #41): consumed by the #41 global-Search ViewModel
+     * (EPG scope), which is not built yet. Exposed here now so the deep-link
+     * guide-jump path is complete; wire this into the Search VM when #41 lands.
+     */
+    suspend fun searchEpg(playlistId: String, query: String): List<EPGProgramme> =
+        withContext(layeringDispatcher) {
+            val q = query.trim()
+            if (q.isBlank()) return@withContext emptyList()
+            val like = "%" + q.replace("%", "\\%").replace("_", "\\_") + "%"
+            epgProgrammeDao
+                .searchInWindow(playlistId, like, System.currentTimeMillis())
+                .map { it.toProgramme() }
+        }
+
+    suspend fun newestEpgFetch(playlistId: String): Long? =
+        epgProgrammeDao.newestFetchedAt(playlistId)
+
+    /**
+     * Span (earliest start .. latest end) of what is cached for this source,
+     * or null when nothing is cached. Two indexed MIN/MAX aggregates, so this
+     * costs nothing next to reading the rows.
+     *
+     * Launch no longer decodes the whole retention window into the guide
+     * catalog (see PlaylistViewModel.rebuildGuideCatalog), so "how many days
+     * can the user jump to" can no longer be inferred from what the catalog
+     * happens to hold. This is that answer, straight from the cache, which is
+     * what Guide Days semantics actually promise.
+     */
+    suspend fun cachedEpgSpan(playlistId: String): Pair<Long, Long>? =
+        withContext(layeringDispatcher) {
+            val from = epgProgrammeDao.earliestStart(playlistId) ?: return@withContext null
+            val to = epgProgrammeDao.latestEnd(playlistId) ?: return@withContext null
+            from to to
+        }
+
+    /**
+     * Per-playlist EPG cache purge (iOS GuideStore audit P2 #11). Called by
+     * the user-initiated "Refresh EPG Data" action on the playlist detail
+     * so the next fetch starts from a clean slate instead of reusing
+     * possibly-corrupt cached rows. Idempotent; safe to call when no rows
+     * exist.
+     */
+    /**
+     * Drop ONLY the grid coverage map, keeping the cached programmes.
+     *
+     * This is what a forced full reload needs (the "Refresh" button on Edit
+     * Playlist, or any forceRefresh EPG load): every one-day chunk must be
+     * fetched again, because the user is asking for fresh guide data, but the
+     * accumulated catch-up history must NOT be thrown away to get it. The
+     * merge is idempotent, so refetched chunks replace their rows in place.
+     */
+    suspend fun purgeEpgCoverage(playlistId: String) {
+        epgChunkCoverageDao.deleteForPlaylist(playlistId)
+    }
+
+    suspend fun purgeEpgCache(playlistId: String) {
+        epgProgrammeDao.deleteForPlaylist(playlistId)
+        // The grid coverage map dies WITH the rows it vouches for (the
+        // cache-identity rule): a surviving coverage row would tell the next
+        // incremental walk a chunk is already cached while the programmes it
+        // stood for are gone, and the guide would stay permanently holed.
+        // Covers the user's "Refresh" from Edit Playlist, Refresh EPG Data,
+        // Refresh Everything, and the identity-change purge in the ViewModel.
+        runCatching { epgChunkCoverageDao.deleteForPlaylist(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "purgeEpgCache: coverage purge failed", it) }
+    }
+
+    suspend fun saveEpgToCache(
+        playlistId: String,
+        programmes: List<EPGProgramme>,
+        /** False when [programmes] is a FRAGMENT of its feed (a budget-
+         *  truncated XMLTV parse). The merge then only inserts, and never
+         *  deletes a region this list cannot vouch for. */
+        authoritative: Boolean = true,
+    ) {
+        val now = System.currentTimeMillis()
+        val entities = withContext(layeringDispatcher) {
+            programmes.map { it.toCacheEntity(playlistId, now) }
+        }
+        DeletedPlaylists.ensureAlive(playlistId, "EPG cache")
+        // Catch-up (task #135): MERGE the feed instead of replacing the whole
+        // cache, so already-aired rows survive refreshes and accumulate into a
+        // browsable history, then prune to the playlist's retention window
+        // (default 7 days). The old behaviour (full replace + drop everything
+        // ended over an hour ago) erased exactly the programmes the catch-up
+        // "Watch" action needs.
+        epgProgrammeDao.mergeForPlaylist(
+            playlistId,
+            entities,
+            now,
+            replaceCoveredWindow = authoritative,
+        )
+        // E-6: prune at most once per cycle. Upstream layering calls this once
+        // PER SOURCE on purpose (so a kill mid-phase loses at most one feed),
+        // and every one of those calls used to run a full-table retention
+        // DELETE -- three sources, three sweeps, for a horizon measured in
+        // DAYS. Nothing about a 7-day cutoff needs re-applying seconds later,
+        // so the first save in a cycle sweeps and the rest skip.
+        val lastSweep = lastRetentionSweepAtMs[playlistId] ?: 0L
+        if (now - lastSweep >= RETENTION_SWEEP_COOLDOWN_MS) {
+            lastRetentionSweepAtMs[playlistId] = now
+            // All Available prunes at the hard 30-day bound.
+            val retentionDays = resolveGuideDays(dao.byId(playlistId)?.epgRetentionDays ?: 7)
+                ?: GUIDE_DAYS_ALL_MAX_BACK
+            epgProgrammeDao.deleteEndedBeforeForPlaylist(
+                playlistId,
+                now - retentionDays * 24L * 60L * 60L * 1000L,
+            )
+        }
+    }
+
+    /** Last retention prune per playlist; see the cooldown in [saveEpgToCache]. */
+    private val lastRetentionSweepAtMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Write back JUST these programmes, leaving every other cached row alone.
+     *
+     * E-6 (perf campaign 2026-08-20): category enrichment changes a category
+     * string on the few hundred programmes that happen to be airing, and used
+     * to persist that by handing the ENTIRE feed back to [saveEpgToCache] -- a
+     * second full rewrite of a ~139k-row table, four indexes per row, plus
+     * another retention sweep, minutes after the first one finished. That is
+     * the disk churn behind the io-wait storm that turned a 1.4s guide stall
+     * into an ANR.
+     *
+     * These rows already exist: they carry the same (playlistId, channelId,
+     * startMillis) as their cached copies, so the REPLACE conflict strategy on
+     * that unique index updates them in place. Deliberately NOT
+     * [EpgProgrammeDao.mergeForPlaylist] -- that deletes the present-and-future
+     * region for every channel it touches before inserting, which for a partial
+     * list would erase the programmes that were not enriched.
+     */
+    suspend fun updateEpgRowsInCache(playlistId: String, programmes: List<EPGProgramme>) {
+        if (programmes.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val entities = withContext(layeringDispatcher) {
+            programmes.mapNotNull { p ->
+                // Same drawability floor mergeForPlaylist applies; an enriched
+                // row must not sneak past the one filter every write shares.
+                if (p.endMillis - p.startMillis < 30_000L) null
+                else p.toCacheEntity(playlistId, now)
+            }
+        }
+        if (entities.isEmpty()) return
+        DeletedPlaylists.ensureAlive(playlistId, "EPG enrichment")
+        epgProgrammeDao.insertAll(entities)
+    }
+
+    /**
+     * Disk-cached channel snapshot (iOS ChannelStore parity, sister to the EPG
+     * cache above). [loadCachedChannels] returns the last persisted channel
+     * list for a source so a cold launch can paint the Live TV rail INSTANTLY
+     * while a background refresh runs; [newestChannelFetch] drives the
+     * freshness check; and [saveChannelsToCache] replaces the source's rows
+     * after a successful network fetch (the [List.mapIndexed] preserves the
+     * exact order [fetchChannelsFor] produced, which is what the rail / list
+     * sort by).
+     */
+    suspend fun loadCachedChannels(playlistId: String): List<M3UChannel> =
+        stripCatchupIfDenied(playlistId, loadCachedChannelsRaw(playlistId))
+
+    /** Profiles: a Dispatcharr user with catchup_enabled=false sees every
+     *  channel as having no archive, even from a cache written by another
+     *  user. Non-Dispatcharr playlists are untouched. */
+    private suspend fun stripCatchupIfDenied(playlistId: String, channels: List<M3UChannel>): List<M3UChannel> {
+        val row = dao.byId(playlistId) ?: return channels
+        if (!row.isDispatcharrDirectConnect() || row.dispatcharrCanUseCatchup()) return channels
+        return channels.map { if (it.catchupDays > 0 || it.catchupStreamId != null) it.copy(catchupDays = 0, catchupStreamId = null) else it }
+    }
+
+    private suspend fun loadCachedChannelsRaw(playlistId: String): List<M3UChannel> =
+        // distinctBy url: an exact-duplicate stream (identical URL) is dropped so
+        // the Live TV lists (keyed by url) can never see a duplicate key. Channels
+        // that merely SHARE a tvg-id but have different URLs are kept (they are
+        // distinct streams) -- the list key is url precisely so those don't collide.
+        channelSnapshotDao.forPlaylist(playlistId).map { it.toChannel() }.distinctBy { it.url }
+
+    /** GH #81: distinct provider group names in the cached snapshot. */
+    suspend fun cachedGroupTitles(playlistId: String): List<String> =
+        channelSnapshotDao.distinctGroupTitles(playlistId)
+
+    suspend fun newestChannelFetch(playlistId: String): Long? =
+        channelSnapshotDao.newestFetchedAt(playlistId)
+
+    suspend fun saveChannelsToCache(playlistId: String, rawChannels: List<M3UChannel>) {
+        val now = System.currentTimeMillis()
+        // Drop exact-duplicate streams (same URL) before persisting so the cache
+        // stays clean and reloads never feed a duplicate key to the url-keyed
+        // Live TV lists. Distinct streams that share a tvg-id are kept.
+        val channels = rawChannels.distinctBy { it.url }
+        DeletedPlaylists.ensureAlive(playlistId, "channel snapshot")
+        // GH #31: persist in CHUNKS inside ONE transaction instead of mapping the
+        // whole ~100k-row entity list + one giant insertAll. That overlap (the
+        // channel list + the full entity list + the transaction bind) was the
+        // bulk of the 505MB heap peak that wedged a large XC import. delete-then-
+        // insert stays atomic (a reader never sees a half-written playlist, and a
+        // crash rolls back to the previous snapshot), while SQLite buffers pending
+        // rows on disk (WAL), so only ONE chunk of entities is ever resident.
+        // The delete-first is MANDATORY: ChannelSnapshotEntity's PK is
+        // autoGenerate with only a NON-unique index on playlistId, so REPLACE
+        // never dedups, chunked inserts without it would duplicate every row.
+        database.withTransaction {
+            channelSnapshotDao.deleteForPlaylist(playlistId)
+            var position = 0
+            for (chunk in channels.asSequence().chunked(CHANNEL_CACHE_CHUNK)) {
+                channelSnapshotDao.insertAll(
+                    chunk.map { ch -> ch.toCacheEntity(com.aeriotv.android.core.profiles.ProfileScope.cacheKey(playlistId), position++, now) },
+                )
+            }
+            // Stamp the displayed count from the list ACTUALLY PERSISTED, in the
+            // same transaction that persists it.
+            //
+            // Callers used to set channelCount = channels.size from their own
+            // pre-dedup list while this function stored `distinctBy { url }`, so
+            // the number on the Playlists / playlist-detail screens was computed
+            // from a different list than the one the user then scrolls. Any
+            // provider that repeats a stream URL made the two disagree
+            // permanently, and every caller had to remember to stamp it at all.
+            // Doing it here means the count cannot drift from the snapshot by
+            // construction, for every write path (add, refresh, switch-active,
+            // background refresh worker).
+            dao.updateChannelCount(playlistId, channels.size)
+        }
+        stampSnapshot(playlistId)
+    }
+
+    /**
+     * Profiles phase 2b: record the Dispatcharr user id and channel_profiles
+     * assignment this snapshot was fetched with, so a fast profile switch can
+     * tell a stale snapshot (other user, changed assignment) from a fresh one.
+     */
+    private suspend fun stampSnapshot(playlistId: String) {
+        runCatching {
+            val row = dao.byId(playlistId) ?: return
+            if (!row.isDispatcharrDirectConnect()) return
+            val uid = com.aeriotv.android.core.profiles.ProfileScope.activeUserIdLookup?.invoke(playlistId) ?: 0
+            snapshotStamps.put(
+                com.aeriotv.android.core.profiles.ProfileScope.cacheKey(playlistId),
+                com.aeriotv.android.core.profiles.SnapshotStamp(uid, row.dispatcharrAccountProfileIds),
+            )
+        }
+    }
+
+    /** The stamp of the CURRENT scope's snapshot for [playlistId], or null. */
+    fun snapshotStamp(playlistId: String): com.aeriotv.android.core.profiles.SnapshotStamp? =
+        snapshotStamps.get(com.aeriotv.android.core.profiles.ProfileScope.cacheKey(playlistId))
+
+    /**
+     * Fetch the Dispatcharr channel profiles available for [playlist] so the
+     * Edit Playlist screen can offer them as scoping options. Returns an empty
+     * list for non-Dispatcharr sources. Routed through the AuthBroker so a
+     * rotated api_key silently rebootstraps instead of surfacing a 401.
+     */
+    suspend fun listChannelProfiles(playlist: PlaylistEntity): List<ChannelProfileOption> {
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return emptyList()
+        val base = effectiveBaseUrl(playlist)
+        return dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.listProfiles(base, key)
+        }.map { ChannelProfileOption(id = it.id, name = it.name, channelCount = it.channels.size) }
+    }
+
+    /**
+     * The ordered member streams of a Dispatcharr channel (highest-priority
+     * first) with their probed quality stats, for the player's "Switch Stream"
+     * sheet. [channelIntPk] is M3UChannel.dispatcharrChannelId. Empty for
+     * non-Dispatcharr sources or when there is no active playlist. AuthBroker-
+     * wrapped so a rotated api_key silently rebootstraps instead of surfacing 401.
+     */
+    suspend fun listDispatcharrChannelStreams(
+        channelIntPk: Int,
+    ): List<com.aeriotv.android.core.network.DispatcharrChannelStream> {
+        val playlist = activePlaylist() ?: return emptyList()
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return emptyList()
+        val base = effectiveBaseUrl(playlist)
+        return dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.listChannelStreams(base, key, channelIntPk)
+        }
+    }
+
+    /** Switch Stream reorder (admin): persist [streamIds] as the channel's
+     *  stream order. Throws on failure (StreamOrderSaveException carries the
+     *  HTTP status). */
+    suspend fun saveDispatcharrChannelStreamOrder(channelIntPk: Int, streamIds: List<Int>) {
+        val playlist = activePlaylist() ?: error("No active playlist")
+        val base = effectiveBaseUrl(playlist)
+        dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.updateChannelStreamOrder(base, key, channelIntPk, streamIds)
+        }
+    }
+
+    /**
+     * Mark as Radio Channel / Unmark Radio Channel (admin, Direct Connect):
+     * PATCH is_radio on the channel, then flip the cached snapshot row so a
+     * cache-restored launch agrees. Returns the HTTP status; throws on
+     * failure (StreamOrderSaveException carries the status).
+     */
+    suspend fun setDispatcharrChannelRadio(channel: M3UChannel, isRadio: Boolean): Int {
+        val playlist = activePlaylist() ?: error("No active playlist")
+        val pk = channel.dispatcharrChannelId ?: error("Not a Dispatcharr channel")
+        val base = effectiveBaseUrl(playlist)
+        val status = try {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.updateChannelIsRadio(base, key, pk, isRadio)
+            }
+        } catch (e: Exception) {
+            val code = (e as? com.aeriotv.android.core.network.DispatcharrHttpFailure)?.status
+            android.util.Log.w("PlaylistRepository", "[DISPATCHARR] is_radio -> $isRadio channel=${channel.name} status=${code ?: "error"} (${e.message})")
+            throw e
+        }
+        android.util.Log.i("PlaylistRepository", "[DISPATCHARR] is_radio -> $isRadio channel=${channel.name} status=$status")
+        runCatching { channelSnapshotDao.setRadio(playlist.id, channel.id, isRadio) }
+        return status
+    }
+
+    /**
+     * Map of Dispatcharr M3U account id -> source name, to label each alternate
+     * in the Switch Stream sheet with the M3U it comes from. Empty for
+     * non-Dispatcharr sources, no active playlist, or on any failure (the sheet
+     * then just omits the source label). AuthBroker-wrapped.
+     */
+    suspend fun dispatcharrM3uAccountNames(): Map<Int, String> {
+        val playlist = activePlaylist() ?: return emptyMap()
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return emptyMap()
+        val base = effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.listM3uAccounts(base, key)
+            }.mapNotNull { acct -> acct.name?.takeIf { it.isNotBlank() }?.let { acct.id to it } }
+                .toMap()
+        }.getOrDefault(emptyMap())
+    }
+
+    /**
+     * The provider relations Dispatcharr deduped into one logical movie, for
+     * the VOD Version picker. Empty for non-Dispatcharr sources or when there
+     * is no active playlist. AuthBroker-wrapped like the channel-streams
+     * lookup above. The payload nests provider credentials (the client model
+     * declares only safe fields); never log the raw rows.
+     */
+    suspend fun listVodMovieProviders(
+        movieId: Int,
+    ): List<com.aeriotv.android.core.network.DispatcharrVODProviderRelation> {
+        val playlist = activePlaylist() ?: return emptyList()
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return emptyList()
+        val base = effectiveBaseUrl(playlist)
+        return dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.getMovieProviders(base, key, movieId)
+        }
+    }
+
+    /**
+     * MEASURED stream properties of ONE provider copy (the picker's quality
+     * labels). Null for non-Dispatcharr sources, when there is no active
+     * playlist, or on any failure: this is best-effort enrichment, so a copy
+     * the server cannot describe simply shows account + container.
+     *
+     * Latency: the first call for a copy Dispatcharr has never inspected can
+     * take several seconds (it fetches upstream), then caches 24h server-side.
+     * Callers must render the picker first and fill labels in as these land.
+     */
+    suspend fun vodMovieProviderMedia(
+        movieId: Int,
+        relationId: Int,
+    ): com.aeriotv.android.core.network.DispatcharrVODProviderMedia? {
+        val playlist = activePlaylist() ?: return null
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return null
+        val base = effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.getMovieProviderMedia(base, key, movieId, relationId)
+            }
+        }.getOrNull()
+    }
+
+    /** Series counterpart of [listVodMovieProviders]. */
+    suspend fun listVodSeriesProviders(
+        seriesId: Int,
+    ): List<com.aeriotv.android.core.network.DispatcharrVODProviderRelation> {
+        val playlist = activePlaylist() ?: return emptyList()
+        val sourceType = playlist.resolvedSourceType()
+        val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+            sourceType == SourceType.DispatcharrUserPass
+        if (!isDispatcharr) return emptyList()
+        val base = effectiveBaseUrl(playlist)
+        return dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.getSeriesProviders(base, key, seriesId)
+        }
+    }
+
+    /**
+     * Switch a Dispatcharr channel's active upstream to [streamId] (a Stream pk
+     * from [listDispatcharrChannelStreams]). [channelUuid] is the channel UUID
+     * (M3UChannel.id minus the "disp:" prefix). Dispatcharr swaps the source
+     * server-side behind the unchanged /proxy/ts/stream/<uuid> URL; the caller
+     * re-primes that URL afterwards so playback pulls the new source.
+     */
+    /** Switch the channel's upstream. Returns the resolved upstream URL the server
+     *  swapped to (for the client re-prime gate), or null if the response omitted it. */
+    suspend fun switchDispatcharrStream(channelUuid: String, streamId: Int): String? {
+        val playlist = activePlaylist() ?: error("No active playlist for stream switch")
+        val base = effectiveBaseUrl(playlist)
+        return dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+            dispatcharrClient.changeStream(base, key, channelUuid, streamId)
+        }
+    }
+
+    /** The currently-active stream pk for a Dispatcharr channel (Switch Stream
+     *  sheet radio mark), from /proxy/ts/status. null when unknown / not playing. */
+    suspend fun currentDispatcharrStreamId(channelUuid: String): Int? {
+        val playlist = activePlaylist() ?: return null
+        val base = effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.getCurrentStreamId(base, key, channelUuid)
+            }
+        }.getOrNull()
+    }
+
+    /** The currently-active upstream URL for a Dispatcharr channel, from
+     *  /proxy/ts/status. Used to confirm a stream switch landed (reliable on both
+     *  the owner-direct and event-apply paths, unlike stream_id). */
+    /**
+     * Tri-state for the player's dead-session poller (adversarial review
+     * 2026-07-15): url = session alive; "" = Dispatcharr ANSWERED and reported
+     * no active session (confirmed dead); null = transport/auth failure --
+     * unknown, and must NOT be treated as a dead session (a Wi-Fi blip or a
+     * server restart while ExoPlayer coasts on its buffer is not a wedge).
+     */
+    suspend fun currentDispatcharrStreamUrl(channelUuid: String): String? {
+        val playlist = activePlaylist() ?: return null
+        val base = effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.getCurrentStreamUrl(base, key, channelUuid) ?: ""
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * "Did the server boot us because this account is out of slots?" for the
+     * player's clean-end handling (see StreamEndVerifier). Direct Connect only;
+     * anything else, or any failure, answers "not verified" so the caller keeps
+     * reconnecting on its backoff instead of giving up on a guess.
+     */
+    suspend fun verifyStreamEndedByLimit(
+        channelUuid: String?,
+        ourConnectedAtEpochSec: Double,
+    ): com.aeriotv.android.core.playback.StreamEndVerifier.Verdict {
+        val notVerified = com.aeriotv.android.core.playback.StreamEndVerifier
+            .Verdict(false, "not a Dispatcharr Direct Connect playlist")
+        val playlist = activePlaylist() ?: return notVerified
+        if (playlist.sourceType != SourceType.DispatcharrApiKey.name &&
+            playlist.sourceType != SourceType.DispatcharrUserPass.name
+        ) {
+            return notVerified
+        }
+        val base = effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.verifyStreamEndedByLimit(
+                    base, key, channelUuid, ourConnectedAtEpochSec,
+                )
+            }
+        }.getOrElse {
+            com.aeriotv.android.core.playback.StreamEndVerifier
+                .Verdict(false, "session check failed: ${it.message}")
+        }
+    }
+
+    suspend fun clear() {
+        dispatcharrTokenStore.clearAll()
+        dao.clear()
+    }
+
+    /** All stored playlists, observed for the multi-playlist switcher. */
+    fun observeAll(): kotlinx.coroutines.flow.Flow<List<PlaylistEntity>> = dao.observeAll()
+
+    /**
+     * The active playlist's id, or null when none is active. Emits on
+     * switch / add / delete (the playlists table changes), so observers can
+     * react to the active source changing -- e.g. On Demand clears the previous
+     * source's movies/series so stale, unplayable VOD never lingers after a
+     * playlist is deleted or switched (iOS Issue #25).
+     */
+    /** Emits again on a Dispatcharr profile switch (same id, new user), so
+     *  every "playlist switched" collector (DVR, On Demand) reloads for the
+     *  new profile exactly as it does for a playlist switch. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    fun observeActiveId(): kotlinx.coroutines.flow.Flow<String?> =
+        dao.observeActive()
+            .map { it.firstOrNull()?.id to com.aeriotv.android.core.profiles.ProfileScope.token.value }
+            .distinctUntilChanged()
+            .map { it.first }
+    suspend fun allOnce(): List<PlaylistEntity> = dao.allOnce()
+
+    /**
+     * Make [playlistId] the active row and load its channels + EPG. Returns
+     * the resolved entity + channel list, mirroring loadAndPersist's shape
+     * so callers can drop a switch into the same state-update flow.
+     */
+    suspend fun switchActive(
+        playlistId: String,
+        probe: Boolean = true,
+        /** Profiles fast switch: the ProfileScope token this fetch belongs
+         *  to; a different token at write time drops the result. */
+        expectedScopeToken: String? = null,
+    ): Result<Pair<PlaylistEntity, List<M3UChannel>>> = runCatching {
+        val t0 = System.currentTimeMillis()
+        dao.switchActive(playlistId)
+        // Capability probing is ACTIVE-PLAYLIST ONLY, so the row that just
+        // became active is probed here: it may never have been probed at
+        // all, or its snapshot may be hours old from when it was last
+        // active.
+        //
+        // FORCED, exactly like a cold launch (Logan 2026-09-16). The old
+        // TTL-respecting call kept a snapshot up to 6 h old, so a permission
+        // granted or revoked on the server WHILE THIS PLAYLIST WAS INACTIVE
+        // was not seen until the TTL expired or the app was force closed
+        // (the Movies tab only came back after a relaunch). An inactive
+        // playlist is never probed, so its snapshot's age says nothing about
+        // whether it is still true: a switch is the one moment we must ask.
+        // A profile switch has just probed (ProfileManager.switchTo), so it
+        // passes probe=false: probing again only doubled the round trips.
+        if (probe) {
+            runCatching { probeCapabilities(playlistId, force = true, trigger = "playlist switch") }
+                .onFailure { Log.w(TAG_CAPS, "switch-active capability probe failed", it) }
+        }
+        val tProbe = System.currentTimeMillis()
+        val entity = dao.byId(playlistId)
+            ?: throw IllegalStateException("Playlist $playlistId vanished after switch")
+        val base = effectiveBaseUrl(entity)
+        val sourceType = entity.resolvedSourceType()
+        val channels = when (sourceType) {
+            SourceType.DispatcharrApiKey, SourceType.DispatcharrUserPass ->
+                dispatcharrAuth.withApiKeyRetry(entity.id) { key ->
+                    fetchChannelsFor(
+                        sourceType, base, entity.epgUrl, key,
+                        entity.dispatcharrProfileId, entity.dispatcharrAccountProfileIdList(),
+                        // Profiles: the switch reload must honor the user's
+                        // catchup_enabled like refresh() does, or a catch-up
+                        // denied profile still sees Watch from Start.
+                        catchupEnabled = entity.dispatcharrCanUseCatchup(),
+                    )
+                }
+            else -> fetchChannelsFor(
+                sourceType, base, entity.epgUrl, entity.apiKey,
+                entity.dispatcharrProfileId, emptyList(),
+                entity.username, entity.password,
+            )
+        }
+        if (expectedScopeToken != null && com.aeriotv.android.core.profiles.ProfileScope.token.value != expectedScopeToken) {
+            throw IllegalStateException("profile changed during the background refresh")
+        }
+        val updated = entity.copy(channelCount = channels.size, lastRefreshedAt = System.currentTimeMillis())
+        dao.update(updated)
+        // Cache the post-switch channel list (Phase 130 channel snapshot cache).
+        try {
+            saveChannelsToCache(updated.id, channels)
+        } catch (t: Throwable) {
+            android.util.Log.w("PlaylistRepository", "saveChannelsToCache failed (switchActive)", t)
+        }
+        publishActiveCredentials(updated)
+        val tEnd = System.currentTimeMillis()
+        Log.i(
+            "PlaylistRepo",
+            "[SWITCH] switchActive probe=${tProbe - t0}ms channels+cache=${tEnd - tProbe}ms " +
+                "(${channels.size} channels, probe=$probe)",
+        )
+        updated to channels
+    }
+
+    /**
+     * Delete a playlist AND everything cached under its id.
+     *
+     * This is the ONLY place a playlist's caches are destroyed. A playlist
+     * switch keeps every other playlist's data intact (Logan 2026-09-16), so
+     * the cleanup that used to be implicit has to be explicit here or the
+     * rows would outlive the playlist forever.
+     */
+    suspend fun deletePlaylist(playlistId: String): Result<Unit> = runCatching {
+        // Crash guard (Apple d051505 parity): mark the id deleted and stop
+        // every background task that holds it BEFORE anything is purged, so
+        // none of them writes rows for this playlist after its next
+        // suspension point.
+        DeletedPlaylists.mark(playlistId)
+        cancelPlaylistTasks(playlistId)
+        // Drop any in-memory JWT pair for the row we're removing so the
+        // warmup coordinator stops trying to refresh a dead playlist on
+        // the next foreground.
+        dispatcharrTokenStore.clear(playlistId)
+        // Session capability guesses recorded from this playlist's 403s.
+        CapabilityCorrections.clear(playlistId)
+        // Display-only Dispatcharr account facts for the deleted row.
+        runCatching { appPreferences.clearDispatcharrAccountFacts(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "delete: account facts purge failed", it) }
+        // The VOD snapshot file is keyed by the playlist's IDENTITY, which is
+        // derived from the row, so compute it BEFORE the row is gone.
+        val row = dao.byId(playlistId)
+        // Guide + coverage, channel snapshot, VOD catalog (all identities),
+        // VOD snapshot metadata file. Each is best-effort: a failure to clean
+        // one store must not abort the delete itself.
+        runCatching { purgeEpgCache(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "delete: EPG purge failed", it) }
+        runCatching { channelSnapshotDao.deleteAllProfilesForPlaylist(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "delete: channel snapshot purge failed", it) }
+        runCatching { vodCatalogStore.deleteForPlaylistId(playlistId) }
+            .onFailure { Log.w("PlaylistRepo", "delete: VOD catalog purge failed", it) }
+        if (row != null) {
+            runCatching { vodSnapshotStore.delete(vodSnapshotStore.identity(row)) }
+                .onFailure { Log.w("PlaylistRepo", "delete: VOD snapshot purge failed", it) }
+        }
+        // Reminders, watch progress and local recordings are ON DELETE
+        // CASCADE against this row, so the DAO delete takes them with it.
+        dao.deleteById(playlistId)
+    }
+
+    /**
+     * Playlist delete: cancel the repository-owned background tasks keyed to
+     * [playlistId] (upstream XMLTV layering / grid window walk, background EPG
+     * sweep). Logs one `[PLAYLIST] delete: cancelled <task>` line per task.
+     */
+    fun cancelPlaylistTasks(playlistId: String) {
+        val cancelled = mutableListOf<String>()
+        layeringJobs.remove(playlistId)?.let { job ->
+            if (job.isActive) { job.cancel(); cancelled += "EPG layering/grid walk" }
+        }
+        epgSweepJobs.remove(playlistId)?.let { job ->
+            if (job.isActive) { job.cancel(); cancelled += "EPG background sweep" }
+        }
+        for (task in cancelled) Log.i("PlaylistRepo", "[PLAYLIST] delete: cancelled $task (${playlistId.take(8)})")
+        if (cancelled.isEmpty()) Log.i("PlaylistRepo", "[PLAYLIST] delete: no running repository tasks (${playlistId.take(8)})")
+    }
+
+    /** Persist a user-chosen ordering of playlists. Sequence of ids is taken
+     * top-to-bottom and stamped onto displayOrder = 0..n-1 atomically. */
+    suspend fun applyPlaylistOrder(orderedIds: List<String>): Result<Unit> = runCatching {
+        dao.applyDisplayOrder(orderedIds)
+    }
+
+    /** GH #26: download-to-temp-file + parse + delete. Constant memory for
+     *  arbitrarily large payloads (XC-panel M3Us and provider XMLTVs run
+     *  100-200MB+; buffering them as one ByteArray OOM'd constrained
+     *  heaps). The temp file lives in cacheDir so the OS can reclaim it
+     *  even if a crash skips the finally. */
+    /**
+     * The XC live channel list, shared by the XtreamCodes source type AND by
+     * an M3U playlist whose URL is really an XC `get.php` link (see
+     * [xtreamCredsFromGetPhpUrl]). Both end up wanting exactly the same thing:
+     * the compact JSON list rather than the provider's giant flattened M3U.
+     */
+    private suspend fun xtreamLiveChannels(
+        b: String,
+        user: String,
+        pass: String,
+    ): List<M3UChannel> {
+        // Live channels come from player_api.php get_live_streams, NOT
+        // from get.php?type=m3u_plus. Measured against a real provider on
+        // 2026-08-10 (Logan: panels this size are "very typical of any
+        // user that is NOT using Dispatcharr"):
+        //
+        //     get.php m3u_plus     538 MB
+        //     get_live_streams      23.7 MB   -- the same 53,599 channels
+        //
+        // m3u_plus is one flat dump of live + ALL VOD + ALL series, so
+        // ~95% of that 538MB was movie/episode rows this code parsed and
+        // then deliberately threw away, because On Demand loads them from
+        // the JSON endpoints anyway. We were ALSO already calling
+        // get_live_streams on every refresh just for catch-up flags, and
+        // then downloading the M3U on top of it.
+        //
+        // The M3U additionally CANNOT produce a guide on that panel: every
+        // m3u_plus entry carries tvg-id="" (2000/2000 sampled), so a
+        // perfectly good 32MB xmltv.php matched nothing and the app logged
+        // "EPG loaded: 0 programmes across 53306 channels".
+        // get_live_streams carries epg_channel_id. This is the shape Apple
+        // has always used (StreamingAPIs.getLiveStreams) and what other
+        // mainstream clients do.
+        // Group names are a separate 83KB call. A failure here costs only
+        // the group labels, so it must not fail the whole playlist.
+        val categoryNames = runCatching {
+            xtreamApi.getLiveCategories(b, user, pass).associate { it.id to it.name }
+        }.getOrDefault(emptyMap())
+        val streams = xtreamApi.getLiveStreams(b, user, pass)
+        if (streams.isEmpty()) {
+            // Same contract as PlaylistFetcher's empty-body guard: a
+            // playlist that resolves to zero channels is a failure to
+            // surface, not a legitimately empty source to store silently.
+            // fetchAndMapArray swallows transport/parse failures to an
+            // empty list, so this is also where a broken panel lands.
+            throw IllegalStateException(
+                "The server returned no live channels for these credentials. " +
+                    "Check the username and password, and that this device is " +
+                    "allowed to connect.",
+            )
+        }
+        android.util.Log.i(
+            "PlaylistRepository",
+            "XC live list: ${streams.size} channels from player_api, " +
+                "${categoryNames.size} categories, " +
+                "${streams.count { it.epgChannelId.isNotBlank() }} with EPG ids",
+        )
+        // See XtreamLiveStream.directSource: not played, but a panel where
+        // most channels publish one is the shape where our rebuilt /live/
+        // URLs may 404 across the board. One line here turns that report
+        // into a diagnosis instead of a hunt.
+        val directSourceCount = streams.count { it.directSource.isNotBlank() }
+        if (directSourceCount > streams.size / 2) {
+            android.util.Log.w(
+                "PlaylistRepository",
+                "XC panel publishes direct_source on $directSourceCount/${streams.size} " +
+                    "channels; if channels list but do not play, this panel may be " +
+                    "direct_source-only and the standard /live/ URL form will 404",
+            )
+        }
+        // Same id formula as M3UParser ("m3u:" + tvg-id, else the URL) AND the
+        // same duplicate handling. epg_channel_id is routinely SHARED across
+        // streams (HD/FHD/SD variants of one channel all carry "espn.us"), and
+        // M3UParser has always disambiguated repeats by appending "|url".
+        // Skipping that here shipped duplicate ids straight into id-keyed UI
+        // (LazyColumn keys throw on duplicates - a crash in the player's
+        // channel overlay) and made favoriting one variant flag them all.
+        val seenIds = HashSet<String>()
+        val channels = streams.map { s ->
+            val url = xtreamApi.liveStreamUrl(b, user, pass, s.streamId)
+            var id = "m3u:${s.epgChannelId.ifBlank { url }}"
+            if (!seenIds.add(id)) {
+                id = "$id|$url"
+                seenIds.add(id)
+            }
+            M3UChannel(
+                id = id,
+                name = s.name,
+                url = url,
+                groupTitle = categoryNames[s.categoryId].orEmpty(),
+                tvgID = s.epgChannelId,
+                tvgName = s.name,
+                tvgLogo = s.icon,
+                channelNumber = s.num?.toString(),
+                catchupDays = s.catchupDays,
+                catchupStreamId = if (s.catchupDays > 0) s.streamId.toString() else null,
+                isRadio = s.isRadio,
+            )
+        }
+        migrateUrlKeyedChannelIds(channels)
+        return channels
+    }
+
+    /**
+     * Heal favorites and recents that still point at URL-keyed channel ids.
+     *
+     * The switch to player_api JSON claimed ids were unchanged for existing
+     * installs because "a panel that publishes tvg-id publishes the same value
+     * as epg_channel_id". True - but the panel that MOTIVATED the switch emits
+     * tvg-id="" on every M3U entry while epg_channel_id is populated, so on
+     * that class of panel the old M3U path keyed those channels by URL and
+     * this path keys them by epg id. Without this pass, updating the app
+     * silently emptied those users' Favorites and recents.
+     *
+     * The URL is the stable half of both schemes, so the mapping is exact: a
+     * channel whose new id is epg-keyed may have old rows under "m3u:<url>".
+     * Idempotent - after the first run nothing is left under a URL-keyed id
+     * that has an epg-keyed replacement - and cheap (favorites and recents
+     * are both small), so it simply runs on every XC fetch.
+     */
+    /**
+     * [fetchViaTempFile] as a conditional GET (upstream layering only):
+     * null when the feed is unchanged since [validators] were taken, without
+     * a download or a parse. Local files always parse.
+     */
+    private suspend fun <T> fetchViaTempFileIfChanged(
+        url: String,
+        suffix: String,
+        validators: com.aeriotv.android.core.network.FeedValidators?,
+        parse: (java.io.File) -> T,
+    ): Pair<T, com.aeriotv.android.core.network.FeedValidators?>? = withContext(layeringDispatcher) {
+        if (url.startsWith("file:", ignoreCase = true)) {
+            return@withContext fetchViaTempFile(url, suffix, parse) to null
+        }
+        val tmp = java.io.File.createTempFile("aerio_dl", suffix, context.cacheDir)
+        try {
+            val fresh = fetcher.fetchToFileIfChanged(url, tmp, validators) ?: return@withContext null
+            parse(tmp) to fresh
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    /**
+     * The pre-0.4.11 XC live fetch, kept as the fallback for panels whose
+     * player_api is broken while get.php still works. Same streaming
+     * temp-file parse (GH #31 memory discipline), same VOD/series row drop,
+     * same output=ts-then-bare 404 retry (5a8a605, both directions). No
+     * catch-up enrichment: that data came from get_live_streams, which is
+     * exactly the endpoint that just failed.
+     */
+    private suspend fun xtreamLiveChannelsViaM3uPlus(
+        b: String,
+        user: String,
+        pass: String,
+    ): List<M3UChannel> {
+        val creds = "username=${xtreamEncode(user)}&password=${xtreamEncode(pass)}"
+        val m3uUrl = "$b/get.php?$creds&type=m3u_plus&output=ts"
+        val m3uUrlNoOutput = "$b/get.php?$creds&type=m3u_plus"
+        return fetchViaTempFileWithFallback(m3uUrl, m3uUrlNoOutput, ".m3u") { file ->
+            val out = ArrayList<M3UChannel>()
+            var droppedVodSeries = 0
+            M3UParser.parseFile(file) { ch ->
+                if (isXtreamVodOrSeriesUrl(ch.url)) {
+                    droppedVodSeries++
+                    return@parseFile
+                }
+                out.add(ch)
+            }
+            if (droppedVodSeries > 0) {
+                android.util.Log.i(
+                    "PlaylistRepository",
+                    "XC m3u_plus fallback: dropped $droppedVodSeries VOD/series entries; " +
+                        "kept ${out.size} live channels",
+                )
+            }
+            out
+        }
+    }
+
+    private suspend fun migrateUrlKeyedChannelIds(channels: List<M3UChannel>) {
+        val renames = HashMap<String, String>()
+        for (ch in channels) {
+            val urlKeyed = "m3u:${ch.url}"
+            if (ch.id != urlKeyed) renames[urlKeyed] = ch.id
+        }
+        if (renames.isEmpty()) return
+
+        val favoriteDao = database.favoriteChannelDao()
+        var migratedFavorites = 0
+        for (fav in favoriteDao.allOnce()) {
+            val newId = renames[fav.channelId] ?: continue
+            // Keep displayOrder/addedAt; skip the insert if the new id already
+            // exists (the user re-favorited it by hand after the update).
+            if (favoriteDao.getOnce(newId) == null) {
+                favoriteDao.upsert(fav.copy(channelId = newId))
+            }
+            favoriteDao.delete(fav.channelId)
+            migratedFavorites++
+        }
+
+        val migratedRecents = appPreferences.renameRecentChannelIds(renames)
+        if (migratedFavorites > 0 || migratedRecents > 0) {
+            android.util.Log.i(
+                "PlaylistRepository",
+                "Channel-id migration: rewrote $migratedFavorites favorite(s) and " +
+                    "$migratedRecents recent(s) from URL-keyed to EPG-keyed ids",
+            )
+        }
+    }
+
+    private suspend fun <T> fetchViaTempFile(
+        url: String,
+        suffix: String,
+        parse: (java.io.File) -> T,
+    ): T = withContext(layeringDispatcher) {
+        // Task #45 file import: an imported source is a file:// URI pointing
+        // at the copy the picker flow stored under filesDir/imports/. No
+        // download needed -- parse it in place (refresh re-reads the same
+        // snapshot, matching iOS which parses its imported copy).
+        if (url.startsWith("file:", ignoreCase = true)) {
+            val local = java.io.File(java.net.URI(url))
+            if (!local.isFile) {
+                throw java.io.FileNotFoundException(
+                    "Imported file is missing: ${local.name}. Re-import it from Edit Playlist.",
+                )
+            }
+            return@withContext parse(local)
+        }
+        // Off the main thread: Ktor's execute{} block (the file copy) and the
+        // parse both run on the CALLER'S dispatcher, and the add/refresh flows
+        // call in from viewModelScope (Main). A small Dispatcharr payload froze
+        // the UI imperceptibly, but a full XC-panel m3u_plus (Discord report
+        // 2026-07-30: 385k rows / 31k live on an Onn box) blocked Main for the
+        // ENTIRE download + parse - Choreographer logged 4359 skipped frames /
+        // a 72.8s Davey, which the reporter experienced as "locked up".
+        val tmp = java.io.File.createTempFile("aerio_dl", suffix, context.cacheDir)
+        try {
+            fetcher.fetchToFile(url, tmp)
+            parse(tmp)
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    /**
+     * [fetchViaTempFile] that retries once against [fallbackUrl] when the
+     * primary URL comes back 404. Used for XC `get.php`, where panels disagree
+     * about whether the `output` parameter is required or rejected; trying the
+     * standard form first and the legacy form only on a hard 404 means neither
+     * flavour of panel can break the other. Deliberately narrow: any other
+     * failure (timeout, 403, empty body, parse error) propagates untouched so
+     * a real problem is not masked by a second doomed download.
+     */
+    private suspend fun <T> fetchViaTempFileWithFallback(
+        primaryUrl: String,
+        fallbackUrl: String,
+        suffix: String,
+        parse: (java.io.File) -> T,
+    ): T = try {
+        fetchViaTempFile(primaryUrl, suffix, parse)
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        throw ce
+    } catch (e: Exception) {
+        // Callers with nothing better to try pass the same URL twice; retrying
+        // an identical request would just burn a second doomed download.
+        if (fallbackUrl == primaryUrl) throw e
+        if (e.message?.contains("HTTP 404") != true) throw e
+        android.util.Log.w(
+            "PlaylistRepository",
+            "get.php returned 404; retrying without the output parameter",
+        )
+        fetchViaTempFile(fallbackUrl, suffix, parse)
+    }
+
+    /**
+     * Delete download temp files left behind by a process that died mid
+     * fetch. [fetchViaTempFile] removes its own temp in a `finally`, but that
+     * never runs when the app is force-stopped or killed for memory while a
+     * download is in flight -- and each orphan is the full size of the payload
+     * (a large XMLTV or a 100MB+ M3U). Repeated over a wedged EPG load this is
+     * what grew one reporter's app cache past 4GB.
+     *
+     * Age-gated so a download running RIGHT NOW in another coroutine is never
+     * pulled out from under itself.
+     */
+    fun sweepOrphanedDownloads() {
+        runCatching {
+            val cutoff = System.currentTimeMillis() - ORPHAN_TEMP_MAX_AGE_MS
+            var freed = 0L
+            var count = 0
+            context.cacheDir.listFiles { f -> f.isFile && f.name.startsWith("aerio_dl") }
+                ?.forEach { f ->
+                    if (f.lastModified() < cutoff) {
+                        val size = f.length()
+                        if (f.delete()) {
+                            freed += size
+                            count++
+                        }
+                    }
+                }
+            if (count > 0) {
+                Log.i("PlaylistRepo", "swept $count orphaned download temp file(s), freed ${freed / 1024 / 1024}MB")
+            }
+        }
+    }
+
+    private fun deriveName(url: String): String =
+        url.substringAfterLast('/').substringBeforeLast('.').ifBlank { "Source" }
+
+    private suspend fun fetchChannelsFor(
+        sourceType: SourceType,
+        base: String,
+        userEpgUrl: String?,
+        apiKey: String?,
+        profileId: Int? = null,
+        accountProfileIds: List<Int> = emptyList(),
+        username: String? = null,
+        password: String? = null,
+        /** Dispatcharr 0.30 catchup_enabled for the account; false strips every catch-up affordance. */
+        catchupEnabled: Boolean = true,
+        // Dispatchers.IO for the same main-thread reason as fetchViaTempFile:
+        // the Dispatcharr branch decodes multi-MB JSON bodies and sorts/maps
+        // the full channel list, and callers arrive on Main.
+    ): List<M3UChannel> = withContext(layeringDispatcher) { when (sourceType) {
+        SourceType.M3uUrl -> {
+            // GH #26: stream the download to a temp file + line-parse it.
+            // A full XC-panel M3U runs 100-200MB; fetchBytes materialized
+            // it as one allocation and OOM'd 256MB-heap phones on Add.
+            //
+            // Discord report (Onn 4K box, 2026-07-29): users also paste an XC
+            // panel's get.php?type=m3u_plus URL directly as a plain M3U source.
+            // Those panels dump their whole VOD + series catalog into the
+            // "live" m3u (~80% of a ~1M-row, 100MB+ file), and while the
+            // DOWNLOAD streams in constant memory, the parse-to-List
+            // materialization alone holds ~2.2x the file size in live objects
+            // (emulator-measured) -- fatal on a 256MB largeHeap TV box. The
+            // XtreamCodes source type already guards this (GH #31) by
+            // stream-parsing and dropping VOD/series rows; give the plain-M3U
+            // path the SAME guard when the URL is actually an XC get.php
+            // fetch. A normal M3U playlist (no get.php) keeps its VOD groups.
+            // The streaming parseFile overload also detects charset up front
+            // instead of the parse-then-retry double read.
+            // A pasted XC get.php link is really an Xtream playlist wearing an
+            // M3U hat. Use the panel's JSON endpoints instead: 23.7MB rather
+            // than 538MB on the panel measured 2026-08-10, and it carries the
+            // epg_channel_id the M3U omits entirely.
+            val pastedXtream = xtreamCredsFromGetPhpUrl(base)
+            if (pastedXtream != null) {
+                android.util.Log.i(
+                    "PlaylistRepository",
+                    "M3U URL is an Xtream get.php link; loading via player_api instead",
+                )
+                // The reroute is a URL-shape guess, not a probe. Middleware
+                // that serves get.php with player_api disabled, broken, or
+                // separately IP-locked exists, and for those users the pasted
+                // M3U worked before the reroute did - so a player_api failure
+                // falls through to fetching the M3U they actually pasted
+                // instead of failing a previously-working playlist outright.
+                try {
+                    return@withContext xtreamLiveChannels(
+                        pastedXtream.base,
+                        pastedXtream.username,
+                        pastedXtream.password,
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w(
+                        "PlaylistRepository",
+                        "player_api failed for the get.php link (${e.message}); " +
+                            "falling back to the pasted M3U itself",
+                    )
+                }
+            }
+            val isXtreamGetPhp = base.contains("get.php", ignoreCase = true)
+            // Some panels 404 a get.php URL that omits `output` (measured
+            // 2026-08-10: crx.watch answers `type=m3u_plus` with a bare 404 and
+            // serves `output=ts` fine). Providers hand out links in both forms,
+            // so a pasted one can fail through no fault of the user. Try their
+            // URL exactly as given, and only on a 404 retry it once with
+            // `&output=ts` appended. The XtreamCodes source type no longer
+            // touches get.php at all, so this pasted-link case is the only
+            // place that still needs the retry.
+            val getPhpFallback = if (isXtreamGetPhp && !base.contains("output=", ignoreCase = true)) {
+                base + (if (base.contains("?")) "&" else "?") + "output=ts"
+            } else {
+                null
+            }
+            fetchViaTempFileWithFallback(base, getPhpFallback ?: base, ".m3u") { file ->
+                val out = ArrayList<M3UChannel>()
+                var droppedVodSeries = 0
+                M3UParser.parseFile(file) { ch ->
+                    if (isXtreamGetPhp && isXtreamVodOrSeriesUrl(ch.url)) {
+                        droppedVodSeries++
+                        return@parseFile
+                    }
+                    out.add(ch)
+                }
+                if (droppedVodSeries > 0) {
+                    android.util.Log.i(
+                        "PlaylistRepository",
+                        "M3U (XC get.php): dropped $droppedVodSeries VOD/series entries from " +
+                            "the live list (add the panel as an Xtream Codes source for On " +
+                            "Demand); kept ${out.size} live channels",
+                    )
+                }
+                out
+            }
+        }
+        // Both Dispatcharr modes converge here. UserPass calls in with a key
+        // that was resolved via JWT login + /api/accounts/users/me/ earlier in
+        // loadAndPersist; ApiKey calls in with the user-supplied key. Subsequent
+        // refreshes / switchActive use the persisted key on the row regardless
+        // of which auth mode originally produced it.
+        SourceType.DispatcharrApiKey, SourceType.DispatcharrUserPass -> {
+            val key = apiKey?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("Dispatcharr API key is required")
+            val groups = dispatcharrClient.listGroups(base, key)
+                .associate { it.id to it.name }
+            // Layer A: child-safety account filter (FAIL-CLOSED). When the
+            // connected account is assigned Channel Profile(s), keep only
+            // channels in the UNION of their memberships. A membership fetch
+            // that throws propagates -> the whole load fails -> the caller keeps
+            // the prior channels instead of leaking the full list. An account
+            // profile that resolves to an empty set is respected literally
+            // (enables no channels). Mirrors iOS 3eb4ae3d8.
+            val accountAllowedIds: Set<Int>? =
+                if (accountProfileIds.isNotEmpty()) {
+                    val union = HashSet<Int>()
+                    for (pid in accountProfileIds) {
+                        union += dispatcharrClient.fetchChannelProfileChannelIds(base, key, pid)
+                    }
+                    union
+                } else {
+                    null
+                }
+            // Layer B: user-chosen per-playlist profile (FAIL-OPEN, unchanged).
+            // A selected-but-now-deleted profile (firstOrNull == null) falls
+            // back to no manual filter rather than a blank list. Skipped (no
+            // extra request) when no profile is selected.
+            val manualAllowedIds: Set<Int>? = profileId?.let { pid ->
+                runCatching {
+                    dispatcharrClient.listProfiles(base, key).firstOrNull { it.id == pid }
+                }.getOrNull()?.channels?.toSet()
+            }
+            // Resolve each channel's EPG via its epg_data_id FK. The grid keys
+            // programmes by the EPGData's tvg_id, which routinely differs from a
+            // channel's own tvg_id, so map epg_data_id -> EPGData.tvg_id and use
+            // THAT as the channel's tvgID below. Without this, only channels
+            // whose raw tvg_id happens to equal the EPGData tvg_id get a guide.
+            // A failure here silently re-keys channels to the legacy guide key
+            // (see [dispatcharrGuideKey]), which changes the EPG identity hash
+            // and purges the cached guide on the next load, so log it.
+            val epgDataById: Map<Int, DispatcharrEpgData>? = runCatching {
+                dispatcharrClient.listEpgData(base, key).associateBy { it.id }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                Log.w("PlaylistRepo", "Dispatcharr epgdata lookup failed; guide keys fall back to legacy: $it")
+            }.getOrNull()
+            // GH #53: which SOURCE an EPGData row came from decides whether its
+            // tvg_id is a real broadcast identity at all. See [dispatcharrGuideKey].
+            val epgSourceTypeById: Map<Int, String?>? = runCatching {
+                dispatcharrClient.listEpgSources(base, key).associate { it.id to it.sourceType }
+            }.onFailure {
+                if (it is CancellationException) throw it
+                Log.w("PlaylistRepo", "Dispatcharr EPG sources lookup failed; guide keys fall back to legacy: $it")
+            }.getOrNull()
+            val serverChannels = dispatcharrClient.listChannels(base, key)
+            val afterAccount =
+                if (accountAllowedIds != null) serverChannels.filter { it.id in accountAllowedIds } else serverChannels
+            val channels =
+                if (manualAllowedIds != null) afterAccount.filter { it.id in manualAllowedIds } else afterAccount
+            // 2026-08 "only ~40 channels" report: neither filter layer logged,
+            // so a truncated or filtered list was indistinguishable from a
+            // small server. Always record where the count came from.
+            Log.i(
+                "PlaylistRepo",
+                "Dispatcharr channels: server=${serverChannels.size}, " +
+                    "accountFilter=${accountAllowedIds?.size?.toString() ?: "off"} -> ${afterAccount.size}, " +
+                    "manualFilter=${manualAllowedIds?.size?.toString() ?: "off"} -> ${channels.size}",
+            )
+            channels
+                .filter { !it.uuid.isNullOrBlank() }
+                .sortedWith(compareBy(
+                    { it.channelNumber ?: Double.MAX_VALUE },
+                    { it.name.lowercase() },
+                ))
+                .map { ch ->
+                    // Stable ID derived from Dispatcharr's server UUID so the
+                    // favorites store key survives playlist refreshes. The
+                    // default `UUID.randomUUID()` in M3UChannel re-rolled on
+                    // every fetch and orphaned existing FavoriteChannel rows.
+                    M3UChannel(
+                        id = "disp:${ch.uuid!!}",
+                        name = ch.name,
+                        url = dispatcharrClient.streamUrl(base, ch.uuid!!),
+                        groupTitle = ch.channelGroupId?.let { groups[it] }.orEmpty(),
+                        tvgID = dispatcharrGuideKey(ch, epgDataById, epgSourceTypeById),
+                        // GH #53: when the guide key above had to become the
+                        // channel UUID, the channel's own tvg-id is still a
+                        // legitimate INBOUND key for a tvg-id-keyed feed (a
+                        // custom XMLTV the user configured). Carry it so
+                        // buildChannelEpgKeyBridge can still route those
+                        // programmes onto this channel.
+                        rawAttributes = ch.tvgId?.trim()
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { mapOf("tvg-id" to it) }
+                            .orEmpty(),
+                        tvgName = ch.name,
+                        tvgLogo = ch.logoId?.let { dispatcharrClient.logoUrl(base, it) }.orEmpty(),
+                        channelNumber = ch.channelNumber?.formatChannelNumber(),
+                        dispatcharrChannelId = ch.id,
+                        // Catch-up (task #133): Dispatcharr's /timeshift/
+                        // endpoint identifies the channel by Channel.id (its
+                        // XC layer exposes it as stream_id). Gate on BOTH
+                        // flags so a stale/partial payload can't produce a
+                        // dead Watch affordance.
+                        isRadio = ch.radio,
+                        catchupDays = if (catchupEnabled && ch.isCatchup) ch.catchupDays else 0,
+                        catchupStreamId = if (catchupEnabled && ch.isCatchup && ch.catchupDays > 0) {
+                            ch.id.toString()
+                        } else {
+                            null
+                        },
+                    )
+                }
+        }
+        SourceType.XtreamCodes -> {
+            val user = username?.takeIf { it.isNotBlank() }
+                ?: throw IllegalArgumentException("Xtream Codes username is required")
+            try {
+                xtreamLiveChannels(base.trimEnd('/'), user, password.orEmpty())
+            } catch (e: Exception) {
+                // Until 0.4.10 this source type fetched get.php m3u_plus, so
+                // panels with a broken, disabled, or separately IP-locked
+                // player_api WORKED - restreamers and aggregators that only
+                // emulate get.php exist. A player_api failure must not turn a
+                // previously-working playlist into a permanent "check the
+                // username and password" error; fall back to the m3u_plus
+                // fetch this branch used to be. Catch-up enrichment is
+                // deliberately absent here: it came from get_live_streams,
+                // which is exactly what just failed.
+                android.util.Log.w(
+                    "PlaylistRepository",
+                    "XC player_api failed (${e.message}); falling back to get.php m3u_plus",
+                )
+                xtreamLiveChannelsViaM3uPlus(base.trimEnd('/'), user, password.orEmpty())
+            }
+        }
+    } }
+}
+
+/** Matches the reserved Xtream VOD/series path segment as a DELIMITED segment
+ *  (leading + trailing slash), so a live channel merely NAMED "...movie..." in
+ *  its display text can't trip it -- only the URL path is inspected. */
+private val XC_VOD_SERIES_SEGMENT = Regex("/(?:movie|series)/", RegexOption.IGNORE_CASE)
+
+/**
+ * True when an XC-delivered stream URL points at a VOD movie or a series
+ * episode rather than a live channel. Xtream Codes serves VOD under
+ * "…/movie/<user>/<pass>/<id>.<ext>" and episodes under
+ * "…/series/<user>/<pass>/<id>.<ext>" (see XtreamCodesApi.buildVodUrl /
+ * buildEpisodeUrl), while live channels use "…/live/<user>/<pass>/<id>" (or the
+ * bare "…/<user>/<pass>/<id>" form) and carry no such segment.
+ *
+ * Host-independent on purpose: load-balanced panels rewrite the host in the URLs
+ * they return, so anchoring to the entered base would miss them.
+ *
+ * The explicit "/live/" guard covers the COMMON pathological case -- a panel
+ * whose username or password is literally "movie"/"series" still keeps its
+ * "…/live/…"-form channels. One residual edge is knowingly left UNHANDLED as
+ * negligible: a channel delivered in the BARE "…/<user>/<pass>/<id>" live form
+ * (no "/live/" segment) whose credential is EXACTLY "movie"/"series" would match
+ * and be dropped. That needs a reserved-word credential AND a panel that emits
+ * bare-form live URLs in its m3u_plus -- vanishingly unlikely. Deliberately NOT
+ * tightened to a fixed "<kind>/<user>/<pass>/<id>" segment position: that would
+ * instead risk MISSING real VOD on panels whose paths deviate from that shape,
+ * which defeats the point (the goal is to shed the VOD/series bloat, so a false
+ * negative that keeps the bloat is worse than this impossible-in-practice drop).
+ */
+private fun isXtreamVodOrSeriesUrl(url: String): Boolean =
+    !url.contains("/live/", ignoreCase = true) && XC_VOD_SERIES_SEGMENT.containsMatchIn(url)
+
+/**
+ * Xtream credentials recovered from a pasted `get.php` playlist URL.
+ *
+ * Providers hand users a link like
+ * `http://host:8080/get.php?username=U&password=P&type=m3u_plus&output=ts`
+ * and users paste it as a plain "M3U URL" playlist rather than choosing the
+ * Xtream Codes source type -- it is, after all, an M3U link. That lands them
+ * on the worst path we have: the provider flattens live + ALL VOD + ALL series
+ * into one file (538MB on a real panel measured 2026-08-10) and frequently
+ * emits `tvg-id=""` on every entry, so the guide can never populate. The XC
+ * JSON endpoints behind the SAME credentials are 23.7MB and carry
+ * epg_channel_id.
+ *
+ * So recognise the shape and use the better source. Returns null for anything
+ * that is not unambiguously an XC get.php URL with both credentials.
+ */
+private data class XtreamCredsFromUrl(val base: String, val username: String, val password: String)
+
+private fun xtreamCredsFromGetPhpUrl(rawUrl: String): XtreamCredsFromUrl? {
+    if (!rawUrl.contains("get.php", ignoreCase = true)) return null
+    val uri = runCatching { java.net.URI(rawUrl.trim()) }.getOrNull() ?: return null
+    val scheme = uri.scheme?.lowercase() ?: return null
+    if (scheme != "http" && scheme != "https") return null
+    val host = uri.host ?: return null
+    val query = uri.rawQuery ?: return null
+    val params = query.split("&").mapNotNull { pair ->
+        val i = pair.indexOf('=')
+        if (i <= 0) return@mapNotNull null
+        val k = pair.substring(0, i).lowercase()
+        val v = runCatching {
+            java.net.URLDecoder.decode(pair.substring(i + 1), "UTF-8")
+        }.getOrNull() ?: return@mapNotNull null
+        k to v
+    }.toMap()
+    val user = params["username"]?.takeIf { it.isNotBlank() } ?: return null
+    val pass = params["password"] ?: return null
+    // Everything before the trailing "/get.php" is the panel base, so panels
+    // served from a subdirectory keep working.
+    val path = uri.rawPath.orEmpty()
+    val cut = path.lastIndexOf("/get.php", ignoreCase = true)
+    val basePath = if (cut >= 0) path.substring(0, cut) else ""
+    val port = if (uri.port > 0) ":${uri.port}" else ""
+    return XtreamCredsFromUrl("$scheme://$host$port$basePath", user, pass)
+}
+
+/** URL-encode an Xtream credential for use in a query string. */
+private fun xtreamEncode(value: String): String =
+    java.net.URLEncoder.encode(value, "UTF-8")
+
+private fun PlaylistEntity.resolvedSourceType(): SourceType =
+    SourceType.entries.firstOrNull { it.name == sourceType } ?: SourceType.M3uUrl
+
+/**
+ * UI-facing summary of a Dispatcharr channel profile for the Edit Playlist
+ * picker. [channelCount] lets the row show "Plex (65 channels)" so the user
+ * can tell the profiles apart at a glance.
+ */
+data class ChannelProfileOption(
+    val id: Int,
+    val name: String,
+    val channelCount: Int,
+)
+
+/**
+ * Parse a Dispatcharr grid timestamp to epoch millis, accepting both forms the
+ * server emits.
+ *
+ * Dispatcharr renders regular programme times as `2026-08-08T08:35:00Z` but
+ * GENERATED dummy programmes as an explicit offset, `2026-08-08T08:35:00+00:00`.
+ * `Instant.parse` is ISO_INSTANT, and on the desugared java.time shipped to
+ * older Android runtimes that rejects the offset form, so every generated dummy
+ * row was silently dropped in DTO conversion while regular rows survived. That
+ * is the "guide shows placeholders on channels with dummy EPG" class of report
+ * (GitHub #53: 3,754 of 4,226 rows dropped on a SHIELD).
+ *
+ * Instant first (the common case, no exception on the hot path), then
+ * OffsetDateTime. Strictly additive: anything that parsed before still parses.
+ */
+private fun parseGridInstantMillis(raw: String?): Long? {
+    val text = raw?.takeIf { it.isNotBlank() } ?: return null
+    runCatching { return Instant.parse(text).toEpochMilli() }
+    return runCatching { OffsetDateTime.parse(text).toInstant().toEpochMilli() }.getOrNull()
+}
+
+/**
+ * The key a Dispatcharr channel's guide programmes will arrive under (GH #53).
+ *
+ * Dispatcharr's `/api/epg/grid/` buckets a programme by the tvg_id of the
+ * EPGData row assigned to the channel, EXCEPT for generated dummy / no-EPG
+ * rows, which it keys by `str(channel.uuid)`
+ * (apps/epg/api_views.py::EPGGridAPIView). Resolving every channel to its
+ * EPGData tvg_id therefore collapses siblings: several channels can share one
+ * dummy EPGData, so they all resolved to the same key and rendered the same
+ * schedule. That is the FANSEAT `120 0` / `120 1` / `120 2` screenshot on
+ * GH #53 - three channels, one programme list, plus each other's matches
+ * interleaved with generic dummy blocks.
+ *
+ * So the key follows the SOURCE TYPE behind the assignment:
+ *  - dummy source, or no assignment at all -> the channel's own UUID, which
+ *    is exactly what the grid keys those rows by, and is unique per channel.
+ *  - a real source -> that EPGData's tvg_id, unchanged from before, so
+ *    channels legitimately sharing one broadcast feed still share a bucket.
+ *
+ * Anything unresolved is deliberately AMBIGUOUS rather than wrong: if the
+ * epgdata or sources call failed, or the assigned row is missing (stale FK,
+ * pagination skew, older Dispatcharr), fall back to the pre-#53 key. A
+ * temporarily unreachable endpoint must not re-key an entire playlist.
+ */
+internal fun dispatcharrGuideKey(
+    channel: DispatcharrChannel,
+    epgDataById: Map<Int, DispatcharrEpgData>?,
+    sourceTypeById: Map<Int, String?>?,
+): String {
+    val uuid = channel.uuid.orEmpty()
+    val legacyKey = channel.tvgId?.trim()?.takeIf { it.isNotBlank() } ?: uuid
+    // No metadata at all: keep the previous behaviour rather than guess.
+    if (epgDataById == null) return legacyKey
+    val assignmentId = channel.effectiveEpgDataId ?: channel.epgDataId
+    // A successful epgdata response positively establishes that an unassigned
+    // channel has no EPG identity, so its grid rows are UUID-keyed dummies.
+    if (assignmentId == null) return uuid.takeIf { it.isNotBlank() } ?: legacyKey
+    val data = epgDataById[assignmentId] ?: return legacyKey
+    val sourceType = data.epgSourceId?.let { sourceTypeById?.get(it) }?.trim()?.lowercase()
+    return when {
+        sourceType == "dummy" -> uuid.takeIf { it.isNotBlank() } ?: legacyKey
+        sourceType == null -> legacyKey
+        else -> data.tvgId?.trim()?.takeIf { it.isNotBlank() } ?: legacyKey
+    }
+}
+
+/** One upstream XMLTV feed plus the guide keys it is allowed to supply. */
+internal data class DispatcharrEpgLayer(
+    val url: String,
+    val channelKeys: Set<String>,
+)
+
+/**
+ * Pair each active upstream XMLTV source with ONLY the guide keys Dispatcharr
+ * actually sourced from it (GH #53).
+ *
+ * Upstream feeds used to be parsed against the playlist's whole key set, so
+ * two unrelated feeds that happen to reuse a tvg-id - which is common, the
+ * value is a broadcaster string, not a GUID - both dumped programmes into the
+ * same bucket. That is the other half of the FANSEAT report: named matches
+ * belonging to sibling channels appearing on `120 1` alongside its own dummy
+ * blocks.
+ *
+ * The scoping needs no channel list: every EPGData row already names both its
+ * tvg_id and its source, so source -> keys falls straight out of
+ * `/api/epg/epgdata/`. Intersecting with [knownChannelKeys] keeps the parser
+ * filter as tight as before. Dummy sources are excluded implicitly - they are
+ * not `xmltv` and have no URL to fetch.
+ */
+internal fun dispatcharrEpgLayers(
+    epgData: List<DispatcharrEpgData>,
+    sources: List<DispatcharrEpgSource>,
+    knownChannelKeys: Set<String>?,
+    customXmltvUrl: String?,
+): List<DispatcharrEpgLayer> {
+    val keysBySource = LinkedHashMap<Int, MutableSet<String>>()
+    for (row in epgData) {
+        val sourceId = row.epgSourceId ?: continue
+        val tvgId = row.tvgId?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: continue
+        if (knownChannelKeys != null && tvgId !in knownChannelKeys) continue
+        keysBySource.getOrPut(sourceId) { linkedSetOf() }.add(tvgId)
+    }
+    return sources.asSequence()
+        .filter { it.isActive && it.sourceType == "xmltv" && it.hasChannels != false }
+        .mapNotNull { src ->
+            val url = src.url?.trim()?.takeIf { u ->
+                u.startsWith("http://", ignoreCase = true) ||
+                    u.startsWith("https://", ignoreCase = true)
+            } ?: return@mapNotNull null
+            if (url == customXmltvUrl) return@mapNotNull null
+            val keys = keysBySource[src.id] ?: return@mapNotNull null
+            if (keys.isEmpty()) null else DispatcharrEpgLayer(url, keys)
+        }
+        // Two source rows can point at the same URL (the same feed assigned
+        // twice); fetch it once with the union of both scopes.
+        .groupBy { it.url }
+        .map { (url, same) -> DispatcharrEpgLayer(url, same.flatMapTo(linkedSetOf()) { it.channelKeys }) }
+}
+
+/**
+ * Convert Dispatcharr `/api/epg/grid/` entries into the universal EPGProgramme
+ * shape the rest of the app consumes. Entries without a tvg_id are dropped -
+ * they cannot be matched back to a channel row. Entries with genuinely
+ * malformed times are dropped too (see [parseGridInstantMillis]).
+ *
+ * Dispatcharr bulk grid intentionally omits `category` for perf; we propagate
+ * empty string. Lazy category enrichment via /api/epg/programs/<id>/ lives in
+ * a later phase tied to ProgramInfoView.
+ */
+private fun List<DispatcharrEpgEntry>.toProgrammes(): List<EPGProgramme> =
+    mapNotNull { entry ->
+        val channelId = entry.tvgId?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        val start = parseGridInstantMillis(entry.startTime) ?: return@mapNotNull null
+        val end = parseGridInstantMillis(entry.endTime) ?: return@mapNotNull null
+        val title = entry.title.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        EPGProgramme(
+            channelId = channelId,
+            title = title,
+            description = entry.description,
+            startMillis = start,
+            endMillis = end,
+            // Dispatcharr's bulk grid usually strips <category>; pick up
+            // the array when newer builds emit it as a free upgrade, fall
+            // back to per-program lazy fetch in ProgramInfoSheet otherwise.
+            category = entry.categories?.filter { it.isNotBlank() }?.joinToString(",").orEmpty(),
+            dispatcharrProgramId = entry.programIdInt,
+            // Badge metadata decoded off the grid. is_previously_shown is not
+            // in Dispatcharr's slim grid serializer TODAY, so isRepeat is
+            // false on current servers - but it is decoded and mapped so the
+            // pill lights up as soon as the server starts emitting it.
+            subTitle = entry.subTitle?.takeIf { it.isNotBlank() },
+            season = entry.season,
+            episode = entry.episode,
+            isNew = entry.isNew,
+            isLiveBroadcast = entry.isLive,
+            isPremiere = entry.isPremiere,
+            isFinale = entry.isFinale,
+            isRepeat = entry.isPreviouslyShown,
+            // Newer grids sometimes carry the programme icon; when they do the
+            // banner / Program Info get real art with no detail fetch at all.
+            iconUrl = entry.artworkUrl,
+        )
+    }
+
+/** EPG disk-cache row <-> domain model mapping. */
+private fun EpgProgrammeEntity.toProgramme(): EPGProgramme = EPGProgramme(
+    channelId = channelId,
+    title = title,
+    description = description,
+    startMillis = startMillis,
+    endMillis = endMillis,
+    category = category,
+    dispatcharrProgramId = dispatcharrProgramId,
+    subTitle = subTitle,
+    season = season,
+    episode = episode,
+    isNew = isNew,
+    isLiveBroadcast = isLiveBroadcast,
+    isPremiere = isPremiere,
+    isFinale = isFinale,
+    isRepeat = isRepeat,
+    iconUrl = iconUrl,
+)
+
+private fun EPGProgramme.toCacheEntity(playlistId: String, fetchedAt: Long): EpgProgrammeEntity =
+    EpgProgrammeEntity(
+        playlistId = playlistId,
+        channelId = channelId,
+        title = title,
+        description = description,
+        startMillis = startMillis,
+        endMillis = endMillis,
+        category = category,
+        dispatcharrProgramId = dispatcharrProgramId,
+        fetchedAt = fetchedAt,
+        subTitle = subTitle,
+        season = season,
+        episode = episode,
+        isNew = isNew,
+        isLiveBroadcast = isLiveBroadcast,
+        isPremiere = isPremiere,
+        isFinale = isFinale,
+        isRepeat = isRepeat,
+        iconUrl = iconUrl,
+    )
+
+/** Channel snapshot cache row <-> M3UChannel mapping. We deliberately drop
+ *  `rawAttributes` (write-only at parse time, never read after) so the cache
+ *  stays a single tabular Room row instead of needing a TypeConverter. */
+private fun ChannelSnapshotEntity.toChannel(): M3UChannel = M3UChannel(
+    id = channelId,
+    name = name,
+    url = url,
+    groupTitle = groupTitle,
+    tvgID = tvgID,
+    tvgName = tvgName,
+    tvgLogo = tvgLogo,
+    channelNumber = channelNumber,
+    drmLicenseType = drmLicenseType,
+    drmLicenseKey = drmLicenseKey,
+    dispatcharrChannelId = dispatcharrChannelId,
+    catchupDays = catchupDays,
+    catchupStreamId = catchupStreamId,
+    isRadio = isRadio,
+)
+
+private fun M3UChannel.toCacheEntity(
+    playlistId: String,
+    position: Int,
+    fetchedAt: Long,
+): ChannelSnapshotEntity = ChannelSnapshotEntity(
+    playlistId = playlistId,
+    channelId = id,
+    position = position,
+    name = name,
+    url = url,
+    groupTitle = groupTitle,
+    tvgID = tvgID,
+    tvgName = tvgName,
+    tvgLogo = tvgLogo,
+    channelNumber = channelNumber,
+    dispatcharrChannelId = dispatcharrChannelId,
+    catchupDays = catchupDays,
+    catchupStreamId = catchupStreamId,
+    isRadio = isRadio,
+    drmLicenseType = drmLicenseType,
+    drmLicenseKey = drmLicenseKey,
+    fetchedAt = fetchedAt,
+)
+
+
+/**
+ * Format a Dispatcharr-API channel-number Double back to a display string,
+ * trimming the trailing `.0` when the value is integer-valued. Matches the
+ * iOS commit d1ac87a behaviour: prefer "11444" over "11444.0", but preserve
+ * "2.1" / "1.10" verbatim.
+ */
+private fun Double.formatChannelNumber(): String {
+    return if (this == kotlin.math.floor(this) && !this.isInfinite()) {
+        this.toLong().toString()
+    } else {
+        this.toString()
+    }
+}
+
+/** How often the launch / foreground cast-profile re-resolve may hit the
+ *  server per playlist. */
+
+private const val TAG_CAPS = "AerioCaps"
+private const val TAG_PERMS = "PermsRefresh"
+
+/** "10", "1", "0", or "unknown" (no snapshot to gate on) for the PermsRefresh log. */
+private fun PlaylistEntity.permsLevelLabel(): String {
+    val caps = capabilities()
+    return if (caps.isUnknownSnapshot) "unknown" else caps.effectiveUserLevel.toString()
+}
+
+/** Per-stage timing for playlist saves (Edit Playlist / Add Playlist). */
+private const val TAG_SAVE = "AerioSave"

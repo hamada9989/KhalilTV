@@ -1,0 +1,727 @@
+package com.aeriotv.android.feature.player
+
+import kotlinx.coroutines.launch
+import android.util.Log
+import android.view.ViewGroup
+import androidx.annotation.OptIn
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.PlayerView
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import com.aeriotv.android.core.playback.AerioExoPlayerHolder
+import com.aeriotv.android.core.pip.isTelevision
+import com.aeriotv.android.feature.settings.SettingsViewModel
+
+/**
+ * The single, activity-lifetime Media3 [PlayerView]. Direct counterpart of
+ * [PersistentMpvWindow] for the Media3 migration.
+ *
+ * Mounted ONCE inside MainActivity's root Box (as a sibling above NavHost,
+ * via the same Phase 165 -> 167 z-order rules), it never changes parents.
+ * Only the modifier driving its size + position changes in response to
+ * [ExoWindowState] flips from PlayerScreen / TvMiniPlayerOverlay.
+ *
+ * Visibility modes mirror [PersistentMpvWindow] one-for-one:
+ *   - Hidden: AndroidView mounted inside a zero-size Box.
+ *   - Fullscreen: fillMaxSize within the outer Box. Default z-order, so
+ *     PlayerScreen chrome drawn ON TOP via NavHost (Phase 167's trick).
+ *   - Mini: 205x115 dp at top-right, 20dp end inset and a top inset taken
+ *     from the MEASURED tab bar height plus 4dp ([MiniPlayerChrome]).
+ *     zIndex(1f) so it floats above whatever NavHost route is showing
+ *     underneath (Phase 175's fix).
+ *
+ * Surface mode: PlayerView with surface_type=surface_view. Media3's
+ * MediaCodecVideoRenderer writes directly into the SurfaceView's surface
+ * via MediaCodec.configure(..., surface) -- this is the path that fixes
+ * the QTI HEVC-in-MPEG-TS bug. No GLES blit, no FFmpeg hevc_mediacodec
+ * wrapper.
+ */
+/** tvOS mini frame, halved from the 1080 pt canvas (HomeView.swift:4848). */
+private val MINI_WIDTH = MiniPlayerChrome.miniWidth
+private val MINI_HEIGHT = MiniPlayerChrome.miniHeight
+private val MINI_END_INSET = 20.dp
+private val MINI_CORNER = 6.dp
+
+/** Floor for the fit-to-band shrink; below this the mini is not a picture. */
+private val MINI_MIN_HEIGHT = 56.dp
+
+@OptIn(UnstableApi::class)
+@Composable
+fun BoxScope.PersistentExoWindow(
+    holder: AerioExoPlayerHolder,
+    state: ExoWindowState,
+) {
+    val mode by state.mode.collectAsStateWithLifecycle()
+    // Recomposes the AndroidView update block whenever the holder swaps the
+    // underlying ExoPlayer instance; see the rebind comment below.
+    val boundPlayer by holder.playerInstance.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val settingsVm: SettingsViewModel = hiltViewModel()
+    val videoScaleMode by settingsVm.videoScaleMode.collectAsStateWithLifecycle(
+        initialValue = VIDEO_SCALE_FIT,
+    )
+    val inPip by com.aeriotv.android.core.pip.PipState.inPictureInPicture
+    // Phones and tablets get the floating PiP-style mini (PhoneMiniPlayer.kt);
+    // everything below that reads MiniPlayerChrome is the TV geometry.
+    val isPhone = remember(context) { !context.isTelevision() }
+    val miniSession = hiltViewModel<com.aeriotv.android.feature.miniplayer.MiniPlayerViewModel>().session
+    // Phone on-demand mini (PhoneVodMini.kt): while a movie / episode /
+    // recording / catch-up is minimized, this PlayerView shows THAT screen's
+    // ExoPlayer instead of the live holder's. Never read on TV.
+    val vodMiniPlayer = if (isPhone) PhoneVodMini.session.collectAsStateWithLifecycle().value?.player else null
+    val bindTarget = vodMiniPlayer ?: boundPlayer
+
+    // Minimize / expand is ONE spring on size AND position (tvOS
+    // .spring(response: 0.35), HomeView.swift:4920), not a hard cut. The
+    // PlayerView instance is never recreated and a resize does not recreate
+    // the codec (see the factory notes below), so animating the frame is safe.
+    // Both directions animate: the mini frame keeps drawing while it grows
+    // back out to full screen, and only then does the plain Fullscreen branch
+    // take over.
+    val cfg = androidx.compose.ui.platform.LocalConfiguration.current
+    val screenW = cfg.screenWidthDp.dp
+    val screenH = cfg.screenHeightDp.dp
+    val miniTarget = mode == ExoWindowState.Mode.Mini
+    val miniTopInsetDp by MiniPlayerChrome.topInsetDp.collectAsStateWithLifecycle()
+    val miniSpec = spring<Dp>(
+        dampingRatio = Spring.DampingRatioNoBouncy,
+        stiffness = Spring.StiffnessMediumLow,
+    )
+    // Bottom-align the mini with the Channel Preview banner's art card, the
+    // way tvOS shares one baseline between the logo, the copy and the corner
+    // mini (Logan 2026-09-11). Preferred frame is the tvOS 205x115; the top is
+    // artBottom - 115, clamped so the mini never rises above the tab bar's
+    // drawn bottom + 4 dp. When the art bottom sits too high for a full-size
+    // mini, the frame shrinks at 16:9 to fit that band instead of moving down
+    // over the guide's time bar. With no banner mounted (list view, other
+    // tabs) the mini keeps its full size at bar bottom + 4 dp.
+    val localDensity = androidx.compose.ui.platform.LocalDensity.current
+    val artBottomPx by MiniPlayerChrome.bannerArtBottomPx.collectAsStateWithLifecycle()
+    // With the Channel Preview banner OFF there is no art card, so the guide
+    // publishes its MEASURED timeline top instead and the mini's bottom edge
+    // lands on it (the guide reserves that band, so rows start below the mini).
+    val timelineTopPx by MiniPlayerChrome.timelineTopPx.collectAsStateWithLifecycle()
+    val anchorBottomPx = if (artBottomPx > 0f) artBottomPx else timelineTopPx
+    val barBottomInset = miniTopInsetDp.dp
+    val artBottom = if (anchorBottomPx > 0f) {
+        (with(localDensity) { anchorBottomPx.toDp() } - if (artBottomPx > 0f) 0.dp else MiniPlayerChrome.miniGap)
+            .coerceAtLeast(0.dp)
+    } else 0.dp
+    val band = artBottom - barBottomInset
+    val miniFitHeight = when {
+        artBottom <= 0.dp -> MINI_HEIGHT
+        band >= MINI_HEIGHT -> MINI_HEIGHT
+        else -> band.coerceAtLeast(MINI_MIN_HEIGHT)
+    }
+    val miniFitWidth = MINI_WIDTH * (miniFitHeight / MINI_HEIGHT)
+    val miniFitTop = if (artBottom > 0.dp) {
+        (artBottom - miniFitHeight).coerceAtLeast(barBottomInset)
+    } else {
+        barBottomInset
+    }
+
+    // Leaving Hidden starts a fresh set of springs, keyed on [miniEpoch], so
+    // each spring's first value is its target: a first tune straight into
+    // the mini (Play Channels In = Mini Player, nothing playing) composes the
+    // mini at its final frame instead of springing down from full screen
+    // (Discord report 2026-10-14: a 2 to 3x oversized black frame for
+    // ~350 ms). Mini <-> Fullscreen within one visible stretch keeps the
+    // shared springs, so minimize and expand still animate.
+    val epochHolder = remember { MiniEpochHolder() }
+    val hiddenNow = mode == ExoWindowState.Mode.Hidden
+    if (epochHolder.wasHidden && !hiddenNow) epochHolder.epoch++
+    epochHolder.wasHidden = hiddenNow
+    val miniAnims = key(epochHolder.epoch) {
+        listOf(
+            animateDpAsState(
+                targetValue = if (miniTarget) miniFitWidth else screenW,
+                animationSpec = miniSpec,
+                label = "miniWidth",
+            ),
+            animateDpAsState(
+                targetValue = if (miniTarget) miniFitHeight else screenH,
+                animationSpec = miniSpec,
+                label = "miniHeight",
+            ),
+            animateDpAsState(
+                targetValue = if (miniTarget) miniFitTop else 0.dp,
+                animationSpec = miniSpec,
+                label = "miniTopInset",
+            ),
+            animateDpAsState(
+                targetValue = if (miniTarget) MINI_END_INSET else 0.dp,
+                animationSpec = miniSpec,
+                label = "miniEndInset",
+            ),
+            animateDpAsState(
+                targetValue = if (miniTarget) MINI_CORNER else 0.dp,
+                animationSpec = miniSpec,
+                label = "miniCorner",
+            ),
+        )
+    }
+    val miniWidth by miniAnims[0]
+    val miniHeight by miniAnims[1]
+    val miniTopInset by miniAnims[2]
+    val miniEndInset by miniAnims[3]
+    val miniCorner by miniAnims[4]
+    // Settings tab stash (TV only; the phone mini floats over every tab,
+    // Settings included, like system PiP). The frame keeps its size, so the SurfaceView is only
+    // repositioned, never resized: slide right until just [stashSliver] of
+    // video stays on screen. With animations off (animator duration scale 0)
+    // the move snaps and a short black cover fades out over the new spot.
+    val settingsStashed by MiniPlayerChrome.settingsStashed.collectAsStateWithLifecycle()
+    val stashTarget = miniTarget && settingsStashed
+    val reduceMotion = remember(cfg) {
+        android.provider.Settings.Global.getFloat(
+            context.contentResolver,
+            android.provider.Settings.Global.ANIMATOR_DURATION_SCALE,
+            1f,
+        ) == 0f
+    }
+    val stashOffset by animateDpAsState(
+        targetValue = if (stashTarget) {
+            miniFitWidth + MINI_END_INSET - MiniPlayerChrome.stashSliver
+        } else 0.dp,
+        animationSpec = if (reduceMotion) snap() else miniSpec,
+        label = "miniStashOffset",
+    )
+    var stashFadeCover by remember { mutableFloatStateOf(0f) }
+    var lastStashTarget by remember { mutableStateOf(stashTarget) }
+    LaunchedEffect(stashTarget) {
+        if (lastStashTarget == stashTarget) return@LaunchedEffect
+        lastStashTarget = stashTarget
+        if (!reduceMotion) return@LaunchedEffect
+        // Frame-clock loop rather than an animate* call: the duration scale
+        // of 0 that asks for this fade would also collapse a Compose tween.
+        stashFadeCover = 1f
+        val start = withFrameNanos { it }
+        while (stashFadeCover > 0f) {
+            withFrameNanos { now ->
+                stashFadeCover = (1f - (now - start) / 150_000_000f).coerceAtLeast(0f)
+            }
+        }
+    }
+
+    // Hidden is an instant teardown (no surface to animate); Fullscreen keeps
+    // the mini frame only for as long as the expand spring is still running.
+    val drawMiniFrame = !isPhone && (
+        miniTarget ||
+            (mode == ExoWindowState.Mode.Fullscreen && miniWidth < screenW)
+        )
+    val phoneFrame = if (isPhone) phoneMiniFrameModifier(mode, inPip) else null
+    if (isPhone) PhoneMiniCastGuard(holder = holder, state = state, session = miniSession)
+    if (isPhone) PhoneVodMiniHost(state = state, mode = mode)
+
+    // See PersistentMpvWindow for the long form of the z-index rationale.
+    // tl;dr: NavHost paints over PersistentExoWindow by declaration order;
+    // fullscreen wants that (chrome over video), mini doesn't (mini needs
+    // to float above the Guide's opaque background).
+    val tileRect by state.tileRectPx.collectAsStateWithLifecycle()
+    val containerModifier = when {
+        mode == ExoWindowState.Mode.Hidden -> Modifier.size(0.dp)
+        // Held Multiview tile: the tile's rect, under the NavHost (no zIndex)
+        // so the grid's ring, name strip and glyphs draw over the video. The
+        // fixed-size surface buffer means this move never resets the codec.
+        mode == ExoWindowState.Mode.Tile -> with(localDensity) {
+            Modifier
+                .offset { androidx.compose.ui.unit.IntOffset(tileRect.left.toInt(), tileRect.top.toInt()) }
+                .size(width = tileRect.width.toDp(), height = tileRect.height.toDp())
+                .background(Color.Black)
+        }
+        phoneFrame != null -> phoneFrame
+        // tvOS geometry, halved from the 1080 pt canvas (mini report D2-D4):
+        // 410x231 pt -> 205x115 dp, 40 pt -> 20 dp end inset, corner radius
+        // 12 pt -> 6 dp, shadow blur 20 pt -> 10 dp. The top inset is the
+        // MEASURED tab bar height plus 4 dp rather than tvOS's fixed 87 pt,
+        // because Android's bar is not a fixed-height system bar: that is what
+        // stops the mini clipping the centered Settings pill, which the old
+        // 12 dp inset did.
+        drawMiniFrame -> Modifier
+            .zIndex(1f)
+            .align(Alignment.TopEnd)
+            .offset(x = stashOffset)
+            .padding(end = miniEndInset, top = miniTopInset)
+            .size(width = miniWidth, height = miniHeight)
+            .shadow(elevation = 10.dp, shape = RoundedCornerShape(miniCorner))
+            .clip(RoundedCornerShape(miniCorner))
+            .background(Color.Black)
+        else -> Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+    }
+
+    // Re-anchor the SurfaceView after the activity window is recreated while
+    // this window is Hidden. Repro (user log + emulator, the recurring
+    // "audio plays, screen stays black" report): minimize playback to the
+    // audio chip (Hidden -> the SurfaceView is 0-size and has NO surface),
+    // background the app (Android destroys the activity window), return, and
+    // start a channel. requestFullscreen resizes the old SurfaceView, which
+    // then creates its surface against the DEAD window's layer tree:
+    // SurfaceFlinger shows the layer in the Offscreen Hierarchy, consuming
+    // 1920x1080 buffers nobody composites. onRenderedFirstFrame fires (so the
+    // no-video-frame watchdog rightly stays quiet) but the screen is black
+    // until a force-stop. A view that holds a LIVE surface across the window
+    // teardown re-anchors correctly through the normal surfaceDestroyed /
+    // surfaceCreated cycle, so only the Hidden case needs this; recreating the
+    // PlayerView there is free (no surface, no codec attachment to disturb).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var surfaceEpoch by remember { mutableIntStateOf(0) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START &&
+                state.mode.value == ExoWindowState.Mode.Hidden
+            ) {
+                surfaceEpoch++
+                Log.i(TAG, "window restarted while Hidden; recreating PlayerView (epoch=$surfaceEpoch)")
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // GH #107 (Fire TV AFTKM / MediaTek): the holder asks for a NEW SurfaceView
+    // when the video decoder died (MediaCodec flush threw and the platform
+    // force-released the codec) or when a tune renders no frame while audio
+    // advances - the "Could not find corresponding native window for surface"
+    // state, where the old surface is unusable for the rest of the session.
+    // Rebuilding the player alone is not enough; the view has to go too.
+    val surfaceRebuild by holder.surfaceRebuildRequest.collectAsStateWithLifecycle()
+    LaunchedEffect(surfaceRebuild) {
+        if (surfaceRebuild > 0) {
+            surfaceEpoch++
+            Log.i(TAG, "holder requested a fresh surface; recreating PlayerView (epoch=$surfaceEpoch)")
+        }
+    }
+
+    // Shield freeze after a display mode change (Frankie B., 2026-09-02):
+    // "the first channel after a UHD <-> HD change freezes; the next channel
+    // is fine". His logs show every resolution switch rendering frames (the
+    // wedge watchdog never fires) yet the picture stays on the last frame:
+    // the HDMI re-handshake reallocates the SurfaceView's buffers under the
+    // running decoder ("freeAllBuffers: 1 buffers were freed while being
+    // dequeued!") and the decoder keeps rendering into a queue nobody
+    // composites any more. A channel change fixes it only because it
+    // re-attaches the surface, so do that directly: recreate the PlayerView
+    // after the display's RESOLUTION changes.
+    //
+    // Timing matters (Streamer, 2026-09-02): a surface created while the
+    // HDMI transition is still in progress lands on a layer the compositor
+    // cannot present, and the decoder renders nothing into it (black screen
+    // with audio until the next surface change). So the recreate waits
+    // until 1.5s after the LAST display event, and the player's own
+    // onRenderedFirstFrame verifies it: no frame within 4s means the surface
+    // was still too early, and it is recreated once more.
+    //
+    // Refresh-rate-only mode changes (the seamless frame-rate matcher's own
+    // switches, which can also arrive with an unchanged mode id) are logged
+    // and ignored; only a size change acts.
+    val displayContext = LocalContext.current
+    val recreateGate = remember { SurfaceRecreateGate() }
+    // Streamer (MediaTek) at 2160p: a recreated SurfaceView was never
+    // presented by the compositor (no frames reached the screen) until the
+    // layer's GEOMETRY changed - Back to the mini player did that by
+    // accident. So each recreate is followed by a one-frame 1px nudge of
+    // the container, which makes SurfaceFlinger re-validate the layer.
+    var geometryNudge by remember { mutableStateOf(false) }
+    DisposableEffect(boundPlayer) {
+        val p = boundPlayer
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onRenderedFirstFrame() { recreateGate.frameSinceRecreate = true }
+        }
+        p?.addListener(listener)
+        onDispose { p?.removeListener(listener) }
+    }
+    val reprimeScope = androidx.compose.runtime.rememberCoroutineScope()
+    DisposableEffect(displayContext) {
+        val dmgr = displayContext.getSystemService(android.content.Context.DISPLAY_SERVICE)
+            as android.hardware.display.DisplayManager
+        val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        val startMode = dmgr.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.mode
+        var lastW = startMode?.physicalWidth ?: 0
+        var lastH = startMode?.physicalHeight ?: 0
+        var pending: Runnable? = null
+        var audioReinit: Runnable? = null
+        val isNvidia = android.os.Build.MANUFACTURER.equals("NVIDIA", ignoreCase = true)
+        var verify: Runnable? = null
+        fun playing(): Boolean {
+            if (state.mode.value == ExoWindowState.Mode.Hidden) return false
+            val p = boundPlayer ?: return false
+            return p.playbackState != androidx.media3.common.Player.STATE_IDLE &&
+                p.playbackState != androidx.media3.common.Player.STATE_ENDED
+        }
+        fun recreate(reason: String, retriesLeft: Int) {
+            if (!playing()) return
+            Log.i(TAG, "recreating PlayerView surface ($reason)")
+            recreateGate.frameSinceRecreate = false
+            surfaceEpoch++
+            mainHandler.postDelayed({
+                geometryNudge = true
+                mainHandler.postDelayed({ geometryNudge = false }, 120L)
+            }, 400L)
+            // NVIDIA Shield (Frankie B., 2026-09-03, still frozen on 0.4.26):
+            // a recreated SurfaceView is not enough there; the decoder keeps
+            // reporting rendered frames while the panel shows the last one.
+            // Re-prime the stream in place ~700 ms after the recreate so the
+            // decoder is rebuilt against the new surface (the same reload the
+            // stall watchdog uses). Shield only: everywhere else the recreate
+            // alone is verified (Streamer 4K/50 Hz).
+            if (isNvidia) {
+                mainHandler.postDelayed({
+                    val url = holder.player?.currentMediaItem?.localConfiguration?.uri?.toString()
+                    if (url != null && playing()) {
+                        Log.i(TAG, "Shield: re-priming stream after display mode change")
+                        reprimeScope.launch {
+                            runCatching { holder.reprime(url = url, bypassCooldown = true, reason = "Shield display mode change") }
+                                .onFailure { Log.w(TAG, "Shield re-prime failed", it) }
+                        }
+                    }
+                }, 700L)
+            }
+            verify?.let { mainHandler.removeCallbacks(it) }
+            verify = Runnable {
+                if (!recreateGate.frameSinceRecreate && playing() && retriesLeft > 0) {
+                    recreate("no frame rendered 4s after the previous recreate", retriesLeft - 1)
+                } else if (!recreateGate.frameSinceRecreate && playing()) {
+                    Log.w(TAG, "surface recreate: still no rendered frame after retry; leaving it to the watchdog")
+                }
+            }.also { mainHandler.postDelayed(it, 4000L) }
+        }
+        val listener = object : android.hardware.display.DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != android.view.Display.DEFAULT_DISPLAY) return
+                val mode = dmgr.getDisplay(displayId)?.mode ?: return
+                val sizeChanged = mode.physicalWidth != lastW || mode.physicalHeight != lastH
+                val desc = "${mode.physicalWidth}x${mode.physicalHeight}@${mode.refreshRate} (mode ${mode.modeId})"
+                lastW = mode.physicalWidth; lastH = mode.physicalHeight
+                val appSwitch = DisplayModeSwitchSignal.pending
+                if (!sizeChanged && !appSwitch) {
+                    Log.i(TAG, "display changed, same size: $desc; no surface action")
+                    return
+                }
+                if (!playing()) return
+                Log.i(TAG, "display mode changed during playback: $desc (sizeChanged=$sizeChanged appSwitch=$appSwitch); surface recreate armed")
+                pending?.let { mainHandler.removeCallbacks(it) }
+                pending = Runnable { recreate("display settled at $desc", retriesLeft = 1) }
+                    .also { mainHandler.postDelayed(it, 1500L) }
+                // NVIDIA Shield (Frankie B. log, 2026-09-03): the HDMI mode
+                // switch kills the AudioTrack; about a second later the audio
+                // renderer hits "AudioTrack write failed: -6" and Media3 tears
+                // the sink down and re-buffers, which the user sees as a hang.
+                // Hand the player a fresh audio session id shortly after the
+                // switch: Media3 flushes the sink and opens a new track on
+                // the re-negotiated output before the dead one is written to.
+                audioReinit?.let { mainHandler.removeCallbacks(it) }
+                audioReinit = Runnable {
+                    val p = holder.player ?: return@Runnable
+                    val am = context.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+                    val id = am?.generateAudioSessionId() ?: return@Runnable
+                    runCatching { p.audioSessionId = id }
+                        .onSuccess { Log.i(TAG, "audio sink re-init after display mode change (session $id)") }
+                        .onFailure { Log.w(TAG, "audio sink re-init failed", it) }
+                }.also { mainHandler.postDelayed(it, 400L) }
+            }
+        }
+        dmgr.registerDisplayListener(listener, mainHandler)
+        onDispose {
+            dmgr.unregisterDisplayListener(listener)
+            mainHandler.removeCallbacksAndMessages(null)
+        }
+    }
+
+    Box(modifier = containerModifier.padding(end = if (geometryNudge) 1.dp else 0.dp)) {
+        key(surfaceEpoch) {
+        // Survives recompositions within this epoch; disposed (and detached via
+        // onRelease) when surfaceEpoch flips and the SurfaceView is recreated.
+        val fpsMatch = remember { FrameRateMatchAttachment() }
+        AndroidView(
+            factory = { ctx ->
+                Log.i(TAG, "PersistentExoWindow factory: building PlayerView + binding player")
+                val player = holder.acquireOrCreate(ctx)
+                PlayerView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                    )
+                    // We render our own chrome via Compose (PlayerChromeOverlay).
+                    // The built-in PlayerView controls would compete with it.
+                    useController = false
+                    setShowBuffering(PlayerView.SHOW_BUFFERING_NEVER)
+                    // Letterbox (FIT) matches the iOS canon and our libmpv
+                    // setup -- broadcast streams have intrinsic aspect ratios
+                    // we don't want to crop. ZOOM is a Settings-level toggle
+                    // we'll port from MPV later.
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    // Critical on Android TV: PlayerView is focusable by
+                    // default. With our Compose chrome layered above it via
+                    // NavHost, a focused PlayerView swallows BACK before
+                    // PlayerScreen's BackHandler ever sees the event -- the
+                    // user ends up at the launcher on first BACK rather than
+                    // surfacing chrome (the tvOS-style 3-press flow). Lock
+                    // focus traversal out of this View; the chrome controls
+                    // are the only focusable surface in the activity.
+                    isFocusable = false
+                    isFocusableInTouchMode = false
+                    descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+                    // Surface mode is set via the bundled layout
+                    // exo_player_view.xml's surface_type=surface_view default.
+                    setPlayer(player)
+                    // Seamless content frame-rate matching (UHD judder fix).
+                    // Requests a refresh-rate match on THIS SurfaceView's Surface
+                    // via Surface.setFrameRate(CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS)
+                    // -- it never pins the display mode, so it cannot black out
+                    // the video like the old preferredDisplayModeId path
+                    // (GOTCHA 23). TV-only + self-gating (acts only while frames
+                    // flow); API 31+ inside the matcher.
+                    val tvUiMode = ctx.resources.configuration.uiMode and
+                        android.content.res.Configuration.UI_MODE_TYPE_MASK
+                    if (tvUiMode == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION) {
+                        (videoSurfaceView as? android.view.SurfaceView)?.let { sv ->
+                            // Pin the surface BUFFER to the display size so the
+                            // Fullscreen <-> Mini layout RESIZE does not recreate
+                            // the underlying Surface. A SurfaceView whose bounds
+                            // change otherwise destroys + recreates its Surface
+                            // (new "surface generation"), which forces the video
+                            // MediaCodec to be torn down and re-initialised against
+                            // the new surface -> a multi-second freeze + re-buffer
+                            // when entering the mini-player (NOT a network re-fetch;
+                            // the stream keeps playing, only the decoder resets).
+                            // With a fixed buffer size, SurfaceFlinger's hardware
+                            // scaler maps the constant-size buffer into whatever
+                            // display rect the view occupies (fullscreen or the
+                            // 210x118 mini), so the Surface -- and the codec bound
+                            // to it -- survive the transition untouched.
+                            val dm = ctx.resources.displayMetrics
+                            sv.holder.setFixedSize(dm.widthPixels, dm.heightPixels)
+                            // Retain the handle + player + SurfaceView so the
+                            // matcher can be re-attached after a holder rebuild
+                            // (update block) and detached on teardown (onRelease).
+                            fpsMatch.handle = DisplayFrameRateMatcher.attach(player, sv)
+                            fpsMatch.player = player
+                            fpsMatch.surfaceView = sv
+                            chainFramePacing(holder, player, fpsMatch.handle)
+                        }
+                    } else {
+                        // Phones / tablets: same buffer pin, so the fullscreen
+                        // <-> floating mini animation (a per-frame resize) never
+                        // recreates the Surface under the codec. Landscape dims
+                        // whatever the current orientation, since the content is
+                        // landscape video; the hardware scaler maps the buffer
+                        // into the view rect at every size.
+                        (videoSurfaceView as? android.view.SurfaceView)?.let { sv ->
+                            val dm = ctx.resources.displayMetrics
+                            sv.holder.setFixedSize(
+                                maxOf(dm.widthPixels, dm.heightPixels),
+                                minOf(dm.widthPixels, dm.heightPixels),
+                            )
+                            // Measure-only (no refresh-rate request): live
+                            // MPEG-TS carries no container frameRate, so the
+                            // format badge's "59.94 fps" half and Stream Info
+                            // need the measured rate here too (Logan
+                            // 2026-10-04: phone and tablet showed "720p" only).
+                            fpsMatch.handle = DisplayFrameRateMatcher.attach(player, sv, matchRate = false)
+                            fpsMatch.player = player
+                            fpsMatch.surfaceView = sv
+                            chainFramePacing(holder, player, fpsMatch.handle)
+                        }
+                    }
+                }
+            },
+            update = { view ->
+                // Video Scale (Fit / Fill / Stretch); PiP always stays Fit.
+                // See VideoScale.kt.
+                view.resizeMode = videoScaleResizeMode(videoScaleMode, inPip)
+                // Rebind when the holder recreated the player (post-X-close
+                // re-create, media-service acquire, passthrough rebuild).
+                // The factory's one-time setPlayer covered only the original
+                // instance; without this, a recreated player renders into a
+                // placeholder surface: audio with a black screen until the
+                // app process restarts (GitHub report).
+                val current = bindTarget
+                if (current != null && view.player !== current) {
+                    Log.i(TAG, "PersistentExoWindow: rebinding PlayerView to recreated player")
+                    view.player = current
+                }
+                // Re-attach the seamless frame-rate matcher to the rebuilt
+                // player. The factory attached only the original instance; a
+                // holder rebuild (black-screen recreate / passthrough rebuild)
+                // otherwise leaves the matcher bound to a destroyed player and
+                // UHD judder returns for the rest of the session. TV-only:
+                // surfaceView is null off-TV, so this is a no-op there. The
+                // player-identity guard keeps it from firing on every recompose.
+                val matchSv = fpsMatch.surfaceView
+                if (matchSv != null && current != null && current !== fpsMatch.player) {
+                    DisplayFrameRateMatcher.detach(fpsMatch.player, fpsMatch.handle, matchSv)
+                    fpsMatch.handle = DisplayFrameRateMatcher.attach(
+                        current, matchSv, matchRate = isTvUiMode(view.context),
+                    )
+                    fpsMatch.player = current
+                    chainFramePacing(holder, current, fpsMatch.handle)
+                }
+            },
+            modifier = Modifier.fillMaxSize(),
+            // onRelease only runs on a surfaceEpoch swap (the view otherwise
+            // outlives every composition). Detach the player from the dying
+            // view; Media3 ignores the clear when the player's active surface
+            // already belongs to the replacement view, so ordering is safe.
+            onRelease = { view ->
+                // Detach the frame-rate matcher (clear the listener + reset the
+                // Surface's frame-rate preference to the panel default) before
+                // the SurfaceView is destroyed on this epoch swap.
+                // Skip when a newer view (the next surfaceEpoch's factory, which
+                // runs BEFORE this release) has already attached: detaching
+                // here would zero contentFps and the re-chain below would
+                // overwrite the newer listener on the same player.
+                val superseded = fpsMatch.handle == null ||
+                    fpsMatch.handle !== DisplayFrameRateMatcher.latestHandle
+                fpsMatch.surfaceView?.takeIf { !superseded }?.let { sv ->
+                    DisplayFrameRateMatcher.detach(fpsMatch.player, fpsMatch.handle, sv)
+                    // detach() only clears the matcher's own listener, and our
+                    // chain wraps it, so re-register the tracer alone: frame
+                    // pacing keeps being measured and the dead matcher closure
+                    // stops being called.
+                    chainFramePacing(holder, fpsMatch.player, null)
+                }
+                fpsMatch.player = null
+                fpsMatch.handle = null
+                fpsMatch.surfaceView = null
+                view.player = null
+            },
+        )
+        }
+        // Audio-only (radio) stream, GH AerioTV#90: channel logo centered on
+        // the surface instead of black. Drawn under every overlay below, so
+        // the mini controls and PlayerScreen's chrome stay on top.
+        val audioOnly by holder.audioOnly.collectAsStateWithLifecycle()
+        if (audioOnly) {
+            AudioOnlyArtwork(
+                logoUrl = holder.currentArtworkUri?.toString().orEmpty(),
+                name = holder.currentTitle.orEmpty(),
+                compact = mode == ExoWindowState.Mode.Mini || inPip,
+            )
+        }
+        if (stashFadeCover > 0f) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = stashFadeCover }
+                    .background(Color.Black),
+            )
+        }
+        if (isPhone && mode == ExoWindowState.Mode.Mini && !inPip) {
+            PhoneMiniControls(holder = holder, state = state, session = miniSession)
+        }
+        if (isPhone && mode == ExoWindowState.Mode.Mini && !inPip) {
+            // Limit refusal / Stream ended: PlayerScreen's overlay is gone
+            // while minimized, so the mini shows the compact card itself.
+            // Drawn after the controls so its Retry button takes the tap.
+            val miniNotice by holder.connectionLimit.collectAsStateWithLifecycle()
+            miniNotice?.let { notice ->
+                ConnectionLimitCard(
+                    notice = notice,
+                    isTv = false,
+                    compact = true,
+                    onRetry = { holder.retryConnectionLimit() },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Put the always-on frame-pacing tracer in the player's single
+ * video-frame-metadata slot, chained in front of the frame-rate matcher's
+ * listener ([handle]) so both keep running. Observational only.
+ */
+@OptIn(UnstableApi::class)
+private fun chainFramePacing(
+    holder: AerioExoPlayerHolder,
+    player: androidx.media3.exoplayer.ExoPlayer?,
+    handle: Any?,
+) {
+    val p = player ?: return
+    holder.tracer.contentFpsProvider = { DisplayFrameRateMatcher.contentFps.value }
+    runCatching {
+        p.setVideoFrameMetadataListener(
+            holder.tracer.frameMetadataListener(
+                handle as? androidx.media3.exoplayer.video.VideoFrameMetadataListener,
+            ),
+        )
+    }
+}
+
+private const val TAG = "PersistentExoWindow"
+
+private fun isTvUiMode(ctx: android.content.Context): Boolean =
+    (ctx.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_TYPE_MASK) ==
+        android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+
+/** Whether the player has rendered a frame since the last surface recreate. */
+private class SurfaceRecreateGate {
+    @Volatile var frameSinceRecreate = true
+}
+
+/**
+ * Retains the [DisplayFrameRateMatcher] attachment so it can be re-attached
+ * after a holder player rebuild and detached when the SurfaceView is torn down.
+ * The factory previously discarded the attach() handle and detach() was never
+ * called, so seamless frame-rate matching was lost for the rest of the session
+ * after any black-screen / passthrough rebuild, and the Surface's frame-rate
+ * preference was never reset on an epoch swap. TV-only: [surfaceView] is set
+ * only inside the TV gate, so the re-attach / detach paths are no-ops elsewhere.
+ */
+private class FrameRateMatchAttachment {
+    var player: androidx.media3.exoplayer.ExoPlayer? = null
+    var handle: Any? = null
+    var surfaceView: android.view.SurfaceView? = null
+}
+
+/**
+ * Plain (non-snapshot) holder for the Hidden -> visible counter that keys the
+ * mini springs in [PersistentExoWindow]. Written during composition on
+ * purpose: it only changes in the same pass that observes the mode change.
+ */
+private class MiniEpochHolder {
+    var wasHidden = true
+    var epoch = 0
+}

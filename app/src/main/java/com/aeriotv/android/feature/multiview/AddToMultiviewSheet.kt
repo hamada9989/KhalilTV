@@ -1,0 +1,1305 @@
+package com.aeriotv.android.feature.multiview
+
+import com.aeriotv.android.ui.scale.subtext
+import com.aeriotv.android.ui.theme.textAccent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.Search
+import com.aeriotv.android.ui.scale.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import android.content.res.Configuration
+import androidx.activity.compose.BackHandler
+import androidx.compose.material3.BottomSheetDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import com.aeriotv.android.ui.scale.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
+import com.aeriotv.android.ui.scale.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil3.compose.AsyncImage
+import com.aeriotv.android.core.data.M3UChannel
+import com.aeriotv.android.core.data.SourceType
+import com.aeriotv.android.core.data.guideMatchKey
+import com.aeriotv.android.feature.dvr.DvrViewModel
+import com.aeriotv.android.feature.ondemand.OnDemandViewModel
+import com.aeriotv.android.feature.playlist.PlaylistViewModel
+import com.aeriotv.android.feature.playlist.nowPlaying
+import com.aeriotv.android.feature.settings.SettingsViewModel
+import com.aeriotv.android.feature.watchprogress.WatchProgressViewModel
+import kotlinx.coroutines.launch
+
+/**
+ * Bottom sheet to pick channels for the multiview tile grid. Mirrors iOS
+ * AddToMultiviewSheet (project_aeriotv_ios_canon.md "+ Add to Multiview"):
+ * header with "Done" + title, group filter chips, a "Recent" section, a search
+ * field, and the full "All Channels" list. Each row shows logo / number / name
+ * / now-playing metadata, with a cyan + when not selected and a green check
+ * when already in the multiview set. Footer counter ("N / 9 max") lives in the
+ * header.
+ *
+ * Phase 11a delivered the basic picker; this revision adds the group chips +
+ * Recent + search + section headers for full iOS parity. Recents are fed by
+ * RecentChannelsStore (AppPreferences.recentChannelIds), written from
+ * PlayerScreen on each channel flip.
+ *
+ * "Add a tile while watching" flow (player path): [currentChannel] is the
+ * stream the user is watching. It is implicitly Tile 1 (seeded into the store
+ * + audio-focused by the host), so it is EXCLUDED from the selectable list and
+ * shown as a pinned, non-interactive "Now playing" row at the top. The user
+ * picks ADDITIONAL channels; [onLaunch] (the "Play" button, enabled only once
+ * there are >= 2 tiles) transitions to the multiview grid, while [onCancel]
+ * (Back / swipe / "Cancel") closes the sheet and keeps single-stream playback.
+ * Search is a toggle button left of the "All" pill (no resting text field, so
+ * the IME never auto-opens on a scroll).
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AddToMultiviewSheet(
+    currentChannel: M3UChannel?,
+    onLaunch: () -> Unit,
+    onCancel: () -> Unit,
+    // BACK / swipe / tap-scrim: close the picker but KEEP whatever is in the
+    // store (the tiles the user just toggled/added stay). Distinct from
+    // [onCancel], which the explicit "Cancel" text button uses to REVERT to the
+    // pre-open snapshot (player flow only). Hosts that have no snapshot to
+    // revert to (the multiview grid's "Add streams") pass the same close lambda
+    // for both. Defaults to onCancel so existing call sites keep compiling.
+    onDismiss: () -> Unit = onCancel,
+    // Swap Stream: when non-null this same picker RE-POINTS the tile with this
+    // id instead of appending a new one, and closes on the first pick. Null
+    // keeps the original add behaviour, so existing call sites are unchanged.
+    swapTargetTileId: String? = null,
+    // Deselect (2026-10-12, Apple parity): a checked row picked again leaves
+    // the set. Over a running Multiview the host removes the tile in place
+    // (MultiviewScreen.removeTileAt, fixed slots) and decides what removing
+    // the sole tile means; null = plain store removal (staging, player flow).
+    onRemoveTile: ((String) -> Unit)? = null,
+    multiviewStore: MultiviewStoreHandle = rememberMultiviewStoreHandle(),
+    playlistVm: PlaylistViewModel = hiltViewModel(),
+    settingsVm: SettingsViewModel = hiltViewModel(),
+    onDemandVm: OnDemandViewModel = hiltViewModel(),
+    dvrVm: DvrViewModel = hiltViewModel(),
+    watchVm: WatchProgressViewModel = hiltViewModel(),
+) {
+    // Phone/tablet container: the native ModalBottomSheet with its natural
+    // swipe-to-dismiss. (TV uses a Dialog panel instead -- see the form-factor
+    // split below -- so a bottom sheet's gesture model never reaches a D-pad.)
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val state by playlistVm.state.collectAsStateWithLifecycle()
+    // GH #96 (Apple parity): what is airing now is read against a clock the
+    // sheet owns, sampled when it opens and re-sampled each minute while it
+    // stays up, so a row never shows a program that already ended. Opening
+    // also runs the existing stale-guide refresh (the foreground hook);
+    // isEpgLoading drives the indicator above the list while it runs.
+    var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
+    androidx.compose.runtime.LaunchedEffect(Unit) {
+        playlistVm.refreshEpgIfStale()
+        while (true) {
+            nowMs = System.currentTimeMillis()
+            kotlinx.coroutines.delay(60_000L - (nowMs % 60_000L))
+        }
+    }
+    val onDemandState by onDemandVm.state.collectAsStateWithLifecycle()
+    // Browse lists are windows over the stored catalog (GH #109), the same
+    // filtered + sorted libraries the Movies and TV Shows tabs show.
+    val movieLibrary by onDemandVm.library(true).collectAsStateWithLifecycle()
+    val seriesLibrary by onDemandVm.library(false).collectAsStateWithLifecycle()
+    val dvrState by dvrVm.state.collectAsStateWithLifecycle()
+    val selected by multiviewStore.selected.collectAsState()
+    val recentIds by settingsVm.recentChannelIds.collectAsStateWithLifecycle(initialValue = emptyList())
+    val selectedIds = selected.map { it.id }.toSet()
+    val scope = rememberCoroutineScope()
+    // Settings > Player > Multiview "Show Subtitles" / "Show Descriptions"
+    // (2026-10-12): extra lines on every channel row, read live.
+    val showSubtitles by settingsVm.multiviewPickerShowSubtitles.collectAsStateWithLifecycle(initialValue = false)
+    val showDescriptions by settingsVm.multiviewPickerShowDescriptions.collectAsStateWithLifecycle(initialValue = false)
+    val removeSelected: (String) -> Unit = { id ->
+        onRemoveTile?.invoke(id) ?: multiviewStore.removeTile(id)
+    }
+
+    // Source switcher (Phase 2). Channels keeps the existing channel picker;
+    // Movies / Series / Recordings draw from the On Demand + DVR view models so
+    // a multiview grid can mix live channels with VOD/episode/recording tiles
+    // (iOS PickerSource). drillSeriesId is the series whose episodes are listed
+    // (null = the series grid); resolving tracks per-row URL-resolve spinners.
+    var pickerSource by remember { mutableStateOf(PickerSource.Channels) }
+    var drillSeriesId by remember { mutableStateOf<Int?>(null) }
+    var resolving by remember { mutableStateOf(setOf<String>()) }
+
+    // Dispatcharr auth headers for VOD / recording tiles (Navigation.kt parity):
+    // X-API-Key + Authorization ApiKey, only for Dispatcharr-backed sources.
+    val vodHeaders = remember(
+        state.playlist?.apiKey,
+        state.playlist?.sourceType,
+        state.playlist?.customUserAgent,
+    ) { com.aeriotv.android.core.network.PlaybackHeaders.forPlaylist(state.playlist) }
+
+    var selectedGroup by remember { mutableStateOf(PlaylistViewModel.ALL_GROUPS) }
+    var query by remember { mutableStateOf("") }
+    // Search is a toggle (button left of the "All" pill) so the IME never
+    // auto-opens: there is no resting text field for the ModalBottomSheet to
+    // land focus on. The field only exists while searchActive (no autofocus;
+    // the user taps/clicks the field to bring up the keyboard).
+    var searchActive by remember { mutableStateOf(false) }
+
+    // TV: when the keyboard closes over the search field, the field kept focus
+    // and swallowed D-pad Up/Down, so nothing visible held focus and Play was
+    // unreachable (observed 2026-10-04). These requesters let the sheet hand
+    // focus to the first result (or Play, or the search toggle) instead.
+    val searchToggleFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val searchFieldFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val firstResultFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val playFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    var searchFieldFocused by remember { mutableStateOf(false) }
+
+    // Playable channels only, indexed for the recents join. The
+    // now-playing channel (currentChannel) is EXCLUDED here so it never
+    // appears as an "add" option -- it is implicitly Tile 1, shown pinned
+    // at the top. Excluding from `playable` also drops it from
+    // `recentChannels` (which resolves against byId), since it is otherwise
+    // the #1 recent on every flip.
+    val excludeId = currentChannel?.id
+    val playable = remember(state.channels, excludeId) {
+        state.channels.filter { it.url.isNotBlank() && it.id != excludeId }
+    }
+    val byId = remember(playable) { playable.associateBy { it.id } }
+
+    // Group filter chips: "All" + the groups the guide/list shows, in the
+    // SAME order. GH #71 (kmac... reported by a Z Fold user): these chips were
+    // raw first-occurrence order and ignored both the user's Manage Groups
+    // sort (Default / A-Z / Manual) and the hidden-groups filter, so the
+    // picker disagreed with every other channel surface. Same pattern as
+    // PlayerScreen's overlayGroups and iOS AddToMultiviewSheet (orderedGroups
+    // minus hidden). Hidden groups drop from the chips only - their channels
+    // still play from "All", exactly like the guide.
+    val hiddenGroups by settingsVm.hiddenGroups.collectAsStateWithLifecycle(initialValue = emptySet())
+    val groupSortModeRaw by settingsVm.groupSortMode.collectAsStateWithLifecycle(initialValue = "Default")
+    val groupOrderPref by settingsVm.groupOrder.collectAsStateWithLifecycle(initialValue = emptyList())
+    val groups = remember(playable, hiddenGroups, groupSortModeRaw, groupOrderPref) {
+        val source = playable.asSequence()
+            .map { it.groupTitle }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toList()
+        val ordered = com.aeriotv.android.feature.livetv.orderGroups(
+            source,
+            com.aeriotv.android.feature.livetv.GroupSortMode.from(groupSortModeRaw),
+            groupOrderPref,
+        )
+        // All Channels always offered here, at its ordered position.
+        val kept = ordered.filter { it == PlaylistViewModel.ALL_GROUPS || it !in hiddenGroups }
+        if (PlaylistViewModel.ALL_GROUPS in kept) kept else listOf(PlaylistViewModel.ALL_GROUPS) + kept
+    }
+
+    // Recent rows: resolve LRU ids against the current playlist, capped to a
+    // short list. Hidden while searching or when a specific group is selected
+    // (matches iOS, where Recent is a top-of-list convenience for the "All"
+    // view only).
+    val recentChannels = remember(recentIds, byId) {
+        recentIds.mapNotNull { byId[it] }.take(8)
+    }
+    val showRecent = query.isBlank() && selectedGroup == PlaylistViewModel.ALL_GROUPS && recentChannels.isNotEmpty()
+
+    val filtered = remember(playable, selectedGroup, query) {
+        val q = query.trim()
+        playable.filter { ch ->
+            (selectedGroup == PlaylistViewModel.ALL_GROUPS || ch.groupTitle.equals(selectedGroup, ignoreCase = true)) &&
+                (q.isEmpty() || ch.name.contains(q, ignoreCase = true))
+        }
+    }
+
+    // User report (v0.1.6, Amlogic S905X4): the channel-picker "seems to
+    // instruct me to drag down, but I am not on a touchscreen." The default
+    // ModalBottomSheet renders a drag handle (a grab bar that reads as
+    // "drag") which is meaningless on a remote. On TV drop the handle and
+    // rely on the "Done" button + BACK to dismiss; BackHandler guarantees the
+    // remote BACK button closes the picker.
+    val isTvDevice = (
+        androidx.compose.ui.platform.LocalConfiguration.current.uiMode and
+            Configuration.UI_MODE_TYPE_MASK
+        ) == Configuration.UI_MODE_TYPE_TELEVISION
+    // Tile count gates the Play action: need the seeded current channel PLUS
+    // at least one picked channel (>= 2 tiles) for a real multiview grid.
+    // Over a running Multiview (onRemoveTile set) Play only closes the picker
+    // back to the grid, which is valid at any tile count, as on Apple; a new
+    // Multiview from the player still needs two.
+    val canLaunch = if (onRemoveTile != null) selected.isNotEmpty() else selected.size >= 2
+
+    // TV: first result when the search has any, else Play when it can launch,
+    // else the search toggle (Play is disabled below two tiles and cannot hold
+    // focus). Never leaves focus on the text field.
+    fun focusFirstResultOrPlay() {
+        val target = when {
+            filtered.isNotEmpty() && runCatching { firstResultFocus.requestFocus() }.isSuccess -> "result0"
+            canLaunch && runCatching { playFocus.requestFocus() }.isSuccess -> "Play"
+            runCatching { searchToggleFocus.requestFocus() }.isSuccess -> "searchToggle"
+            else -> "none"
+        }
+        com.aeriotv.android.ui.tv.TvFocusTrace.player("mvsheet focus handoff -> $target")
+    }
+
+    // #46: soft-limit performance warning. Gates every ADD path in this sheet
+    // once the grid already holds softLimit (4) tiles -- i.e. adding the
+    // 5th+ -- unless the user picked Don't Show Again (persisted) or a
+    // warning already fired within the last 2h (in-memory throttle on the
+    // store, iOS warningRecentlyShown). Removals never warn. The commit
+    // closure is stashed; Continue / Don't Show Again run it, Cancel drops
+    // it. Unlike iOS (whose addVOD path forgot the suppression key), ONE
+    // gate covers channel, movie, episode and recording adds uniformly.
+    val perfWarnSuppressed by settingsVm.multiviewPerfWarningSuppressed
+        .collectAsStateWithLifecycle(initialValue = false)
+    var pendingWarnedAdd by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val gateAdd: (Boolean, () -> Unit) -> Unit = { isAdding, commit ->
+        if (isAdding && selected.size >= multiviewStore.softLimit &&
+            !perfWarnSuppressed && !multiviewStore.warningRecentlyShown()
+        ) {
+            multiviewStore.noteWarningShown()
+            pendingWarnedAdd = commit
+        } else {
+            commit()
+        }
+    }
+    // Swap Stream: one picker, two verbs. With [swapTargetTileId] set every
+    // pick RE-POINTS that tile and closes the sheet; without one the original
+    // add paths run untouched. Routing both through this file keeps the rows,
+    // search, sources and gating identical between them, which is the whole
+    // reason Swap reuses this sheet rather than growing its own.
+    //
+    // Swap deliberately skips [gateAdd]: the soft-limit performance warning is
+    // about ADDING a stream, and a swap leaves the tile count alone.
+    fun commitTile(tile: MultiviewTile): Boolean {
+        val target = swapTargetTileId ?: return multiviewStore.addTile(tile)
+        val ok = multiviewStore.replaceTile(target, tile)
+        // A false here means the pick already occupies another tile; leave the
+        // sheet open so the user can choose something else.
+        if (ok) onLaunch()
+        return ok
+    }
+    val commitChannel: (M3UChannel, Boolean) -> Unit = { channel, isSel ->
+        when {
+            swapTargetTileId != null -> commitTile(MultiviewTile.live(channel))
+            // Picking a checked row again deselects it (fixed-slot removal).
+            isSel -> removeSelected(channel.id)
+            else -> gateAdd(true) { multiviewStore.toggle(channel) }
+        }
+    }
+    // FORM-FACTOR SPLIT: phones/tablets get the native ModalBottomSheet (with
+    // its natural swipe-to-dismiss); Android TV gets a centered Dialog panel. A
+    // bottom sheet's drag / nested-scroll dismiss is a touch idiom that misfires
+    // on a D-pad (scrolling the list up past the top "fades it downward and
+    // closes"). The header + search + list BODY is shared; only the wrapper and
+    // the list's height strategy differ. Only the "Play" button launches
+    // multiview; every other dismissal path keeps single-stream playback.
+    val body: @Composable ColumnScope.() -> Unit = {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onCancel) {
+                    Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "Add to Multiview",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(
+                    onClick = onLaunch,
+                    enabled = canLaunch,
+                    modifier = Modifier
+                        .focusRequester(playFocus)
+                        .onFocusChanged {
+                            if (isTvDevice) {
+                                if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("mvsheet:Play")
+                                else com.aeriotv.android.ui.tv.TvFocusTrace.blurred("mvsheet:Play")
+                            }
+                        },
+                ) {
+                    Text(
+                        text = "Play (${selected.size})",
+                        color = if (canLaunch) MaterialTheme.colorScheme.textAccent
+                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+
+            // Source switcher (Phase 2): Channels / Movies / Series / Recordings.
+            // Styled like the group-filter chips. Movies / Series / Recordings
+            // are only offered when the active source actually has them so the
+            // sheet never lands on an always-empty tab. Switching sources also
+            // resets the series drill so re-entering Series starts at the grid.
+            val hasVod = onDemandState.totalCount > 0 || onDemandState.seriesTotalCount > 0
+            val hasSeries = onDemandState.seriesTotalCount > 0
+            val hasRecordings = dvrState.recordings.any {
+                val s = it.effectiveStatus()
+                (s == DvrViewModel.Recording.Status.Completed ||
+                    s == DvrViewModel.Recording.Status.Stopped) && it.playbackUrl != null
+            }
+            val availableSources = buildList {
+                add(PickerSource.Channels)
+                if (hasVod) add(PickerSource.Movies)
+                if (hasSeries) add(PickerSource.Series)
+                if (hasRecordings) add(PickerSource.Recordings)
+            }
+            // Pill rows keep start and vertical room inside the LazyRow's
+            // clip, so a selected or focused first pill is never cut at its
+            // left edge (Apple TV showed "Channels" clipped by the inset).
+            val pillRowPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)
+            if (availableSources.size > 1) {
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    contentPadding = pillRowPadding,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    items(items = availableSources, key = { it.name }) { src ->
+                        FilterChip(
+                            selected = src == pickerSource,
+                            onClick = {
+                                pickerSource = src
+                                drillSeriesId = null
+                            },
+                            label = { Text(src.label, maxLines = 1) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                selectedLabelColor = MaterialTheme.colorScheme.primary,
+                            ),
+                        )
+                    }
+                }
+            }
+
+            // Control row (Channels only): a search TOGGLE button to the LEFT of
+            // the "All" pill (Guide-chrome parity). Tapping it swaps the
+            // group-pill row for the search field IN PLACE; tapping it again (or
+            // its close) restores the pills and clears the query. No resting text
+            // field = the IME never auto-opens while the user scrolls the list.
+            if (pickerSource == PickerSource.Channels) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilledTonalIconButton(
+                        onClick = {
+                            searchActive = !searchActive
+                            if (!searchActive) query = ""
+                        },
+                        modifier = Modifier
+                            .focusRequester(searchToggleFocus)
+                            .onFocusChanged {
+                                if (isTvDevice) {
+                                    if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("mvsheet:searchToggle")
+                                    else com.aeriotv.android.ui.tv.TvFocusTrace.blurred("mvsheet:searchToggle")
+                                }
+                            },
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Search,
+                            contentDescription = if (searchActive) "Close search" else "Search channels",
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    if (searchActive) {
+                        // No FocusRequester / autofocus on purpose: the keyboard
+                        // opens only when the user taps (or D-pad-selects) the field.
+                        OutlinedTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            placeholder = { Text("Search channels") },
+                            singleLine = true,
+                            trailingIcon = {
+                                if (query.isNotEmpty()) {
+                                    IconButton(onClick = { query = "" }) {
+                                        Icon(Icons.Filled.Close, contentDescription = "Clear search")
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .focusRequester(searchFieldFocus)
+                                .onFocusChanged {
+                                    searchFieldFocused = it.isFocused
+                                    if (isTvDevice) {
+                                        if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("mvsheet:searchField")
+                                        else com.aeriotv.android.ui.tv.TvFocusTrace.blurred("mvsheet:searchField")
+                                    }
+                                }
+                                .onPreviewKeyEvent { ev ->
+                                    // TV: the text field consumes vertical D-pad
+                                    // moves once the keyboard is down; route them
+                                    // out explicitly so the list and header stay
+                                    // reachable.
+                                    if (!isTvDevice || ev.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                                    when (ev.key) {
+                                        Key.DirectionDown -> {
+                                            com.aeriotv.android.ui.tv.TvFocusTrace.player("mvsheet search field Down")
+                                            focusFirstResultOrPlay()
+                                            true
+                                        }
+                                        Key.DirectionUp -> {
+                                            com.aeriotv.android.ui.tv.TvFocusTrace.player("mvsheet search field Up")
+                                            if (canLaunch) runCatching { playFocus.requestFocus() }
+                                            else runCatching { searchToggleFocus.requestFocus() }
+                                            true
+                                        }
+                                        else -> false
+                                    }
+                                },
+                        )
+                    } else if (groups.size > 1) {
+                        // Guide parity (LiveTvTopBar): the selected pill glides to
+                        // about a third in from the left whenever the selection
+                        // changes or focus leaves the row, so the row never rests
+                        // scrolled with the selected pill past its start. Focus
+                        // entering the row starts on the selected pill.
+                        val groupRowState = androidx.compose.foundation.lazy.rememberLazyListState()
+                        val selectedPillFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+                        var groupRowFocused by remember { mutableStateOf(false) }
+                        androidx.compose.runtime.LaunchedEffect(selectedGroup, groups, groupRowFocused) {
+                            if (groupRowFocused) return@LaunchedEffect
+                            val idx = groups.indexOf(selectedGroup)
+                            if (idx >= 0) {
+                                val viewport = groupRowState.layoutInfo.viewportEndOffset
+                                groupRowState.animateScrollToItem(idx, scrollOffset = -(viewport / 3))
+                            }
+                        }
+                        LazyRow(
+                            state = groupRowState,
+                            modifier = Modifier
+                                .weight(1f)
+                                .onFocusChanged { groupRowFocused = it.hasFocus }
+                                .focusProperties {
+                                    @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                                    enter = { selectedPillFocus }
+                                },
+                            // Start and vertical room so a selected or focused
+                            // first pill is not clipped by the row.
+                            contentPadding = PaddingValues(start = 4.dp, end = 12.dp, top = 4.dp, bottom = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {                            items(items = groups, key = { it }) { group ->
+                                FilterChip(
+                                    selected = group == selectedGroup,
+                                    onClick = { selectedGroup = group },
+                                    modifier = if (group == selectedGroup) Modifier.focusRequester(selectedPillFocus) else Modifier,
+                                    label = {
+                                        Text(
+                                            com.aeriotv.android.feature.livetv.groupDisplayName(group),
+                                            maxLines = 1,
+                                        )
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.22f),
+                                        selectedLabelColor = MaterialTheme.colorScheme.primary,
+                                    ),
+                                )
+                            }
+                        }
+                    } else {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+
+            val atCapNow = selected.size >= multiviewStore.maxTiles
+            if (pickerSource == PickerSource.Channels && state.isEpgLoading) {
+                androidx.compose.material3.LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                )
+            }
+            LazyColumn(
+                // TV: fill the remaining Dialog-panel height (weight, inside the
+                // bounded-height panel Column). Phone: a fixed max height inside
+                // the wrap-height bottom sheet.
+                modifier = if (isTvDevice) Modifier.fillMaxWidth().weight(1f)
+                else Modifier.fillMaxWidth().height(520.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                when (pickerSource) {
+                    PickerSource.Channels -> {
+                        // The now-playing channel, pinned + non-interactive: it is
+                        // Tile 1 (already seeded into the store + audio-focused).
+                        // Shown so the user sees it WILL be included, and not
+                        // offered as an "add" toggle (a stray tap must not
+                        // deselect it). Only under the Channels source.
+                        if (currentChannel != null) {
+                            item(key = "tile1_now") {
+                                NowPlayingPinnedRow(
+                                    channel = currentChannel,
+                                    nowTitle = state.epgByChannel[currentChannel.guideMatchKey]
+                                        ?.nowPlaying(nowMs)?.title.orEmpty(),
+                                )
+                            }
+                        }
+                        if (showRecent) {
+                            item(key = "hdr_recent") { SectionHeader("Recent") }
+                            items(items = recentChannels, key = { "recent_${it.url}" }) { channel ->
+                                val isSel = channel.id in selectedIds
+                                val now = state.epgByChannel[channel.guideMatchKey]?.nowPlaying(nowMs)
+                                ChannelPickerRow(
+                                    channel = channel,
+                                    nowTitle = now?.title.orEmpty(),
+                                    subtitle = if (showSubtitles) now?.subTitle.orEmpty() else "",
+                                    description = if (showDescriptions) now?.description.orEmpty() else "",
+                                    selected = isSel,
+                                    atCap = !isSel && atCapNow,
+                                    onToggle = { commitChannel(channel, isSel) },
+                                )
+                            }
+                            item(key = "hdr_all") { SectionHeader("All Channels") }
+                        }
+                        itemsIndexed(items = filtered, key = { _, it -> "all_${it.url}" }) { index, channel ->
+                            val isSel = channel.id in selectedIds
+                            val now = state.epgByChannel[channel.guideMatchKey]?.nowPlaying(nowMs)
+                            ChannelPickerRow(
+                                channel = channel,
+                                nowTitle = now?.title.orEmpty(),
+                                subtitle = if (showSubtitles) now?.subTitle.orEmpty() else "",
+                                description = if (showDescriptions) now?.description.orEmpty() else "",
+                                selected = isSel,
+                                atCap = !isSel && atCapNow,
+                                onToggle = { commitChannel(channel, isSel) },
+                                modifier = if (index == 0 && searchActive) Modifier
+                                    .focusRequester(firstResultFocus)
+                                    // TV: Up from the first result skips the text
+                                    // field (focusing it reopens the keyboard) and
+                                    // lands on Play, or the search toggle when
+                                    // Play is disabled.
+                                    .focusProperties {
+                                        if (isTvDevice) up = if (canLaunch) playFocus else searchToggleFocus
+                                    }
+                                    .onFocusChanged {
+                                        if (isTvDevice) {
+                                            if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("mvsheet:result0")
+                                            else com.aeriotv.android.ui.tv.TvFocusTrace.blurred("mvsheet:result0")
+                                        }
+                                    }
+                                else Modifier,
+                            )
+                        }
+                    }
+
+                    PickerSource.Movies -> {
+                        items(items = movieLibrary.items, key = { "mv_${it.key}" }) { item ->
+                            val movieUuid = item.movieUuid.orEmpty()
+                            val tileId = "vod-${movieUuid}"
+                            val isSel = tileId in selectedIds
+                            VodPickerRow(
+                                title = item.title,
+                                subtitle = item.year?.let { "Movie · $it" } ?: "Movie",
+                                posterUrl = item.posterUrl,
+                                selected = isSel,
+                                resolving = movieUuid in resolving,
+                                atCap = !isSel && atCapNow,
+                                onPick = {
+                                    if (isSel) {
+                                        if (swapTargetTileId == null) removeSelected(tileId)
+                                        return@VodPickerRow
+                                    }
+                                    gateAdd(true) {
+                                        scope.launch {
+                                            resolving = resolving + movieUuid
+                                            onDemandVm.resolveMovieUrl(movieUuid).onSuccess { r ->
+                                                val resume = watchVm.get(movieUuid)?.positionMs ?: 0L
+                                                commitTile(
+                                                    MultiviewTile(
+                                                        id = tileId,
+                                                        kind = TileKind.Vod,
+                                                        displayName = item.title,
+                                                        resolvedUrl = r.url,
+                                                        // Audit #53/#38: no API key to
+                                                        // an off-origin session URL.
+                                                        httpHeaders = if (r.authSafe) vodHeaders else emptyMap(),
+                                                        vodId = movieUuid,
+                                                        vodType = "movie",
+                                                        posterUrl = item.posterUrl,
+                                                        resumePositionMs = resume,
+                                                    ),
+                                                )
+                                            }
+                                            resolving = resolving - movieUuid
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
+
+                    PickerSource.Series -> {
+                        val drillId = drillSeriesId
+                        if (drillId == null) {
+                            items(items = seriesLibrary.items, key = { "sr_${it.key}" }) { series ->
+                                val seriesId = series.seriesId ?: 0
+                                VodPickerRow(
+                                    title = series.title,
+                                    subtitle = "Series",
+                                    posterUrl = series.posterUrl,
+                                    selected = false,
+                                    resolving = false,
+                                    atCap = false,
+                                    chevron = true,
+                                    onPick = {
+                                        drillSeriesId = seriesId
+                                        onDemandVm.loadEpisodes(seriesId)
+                                    },
+                                )
+                            }
+                        } else {
+                            item(key = "sr_back") {
+                                BackRow(onClick = { drillSeriesId = null })
+                            }
+                            onDemandState.episodesErrorFor[drillId]?.let { err ->
+                                item(key = "sr_err") {
+                                    Text(
+                                        text = "Couldn't load episodes: $err",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    )
+                                }
+                            }
+                            if (drillId in onDemandState.episodesLoadingFor) {
+                                item(key = "sr_loading") {
+                                    Box(
+                                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) { CircularProgressIndicator() }
+                                }
+                            }
+                            val episodes = onDemandState.episodesBySeries[drillId].orEmpty()
+                                .sortedWith(
+                                    compareBy(
+                                        { it.seasonNumber ?: 0 },
+                                        { it.episodeNumber ?: 0 },
+                                    ),
+                                )
+                            items(items = episodes, key = { "ep_${it.uuid}" }) { ep ->
+                                val tileId = "vod-${ep.uuid}"
+                                val isSel = tileId in selectedIds
+                                val s = ep.seasonNumber ?: 0
+                                val e = ep.episodeNumber ?: 0
+                                VodPickerRow(
+                                    title = ep.displayName.ifBlank { "Episode $e" },
+                                    subtitle = "S${s} E${e}",
+                                    posterUrl = ep.stillImageUrl,
+                                    selected = isSel,
+                                    resolving = ep.uuid in resolving,
+                                    atCap = !isSel && atCapNow,
+                                    onPick = {
+                                        if (isSel) {
+                                        if (swapTargetTileId == null) removeSelected(tileId)
+                                        return@VodPickerRow
+                                    }
+                                        gateAdd(true) {
+                                            scope.launch {
+                                                resolving = resolving + ep.uuid
+                                                onDemandVm.resolveEpisodeUrl(ep.uuid, ep.firstStreamId)
+                                                    .onSuccess { r ->
+                                                        val resume = watchVm.get(ep.uuid)?.positionMs ?: 0L
+                                                        commitTile(
+                                                            MultiviewTile(
+                                                                id = tileId,
+                                                                kind = TileKind.Vod,
+                                                                displayName = ep.displayName.ifBlank { "Episode $e" },
+                                                                resolvedUrl = r.url,
+                                                                // Audit #53/#38: no API key to
+                                                                // an off-origin session URL.
+                                                                httpHeaders = if (r.authSafe) vodHeaders else emptyMap(),
+                                                                vodId = ep.uuid,
+                                                                vodType = "episode",
+                                                                seriesId = drillId.toString(),
+                                                                seasonNumber = s,
+                                                                episodeNumber = e,
+                                                                posterUrl = ep.stillImageUrl,
+                                                                resumePositionMs = resume,
+                                                            ),
+                                                        )
+                                                    }
+                                                resolving = resolving - ep.uuid
+                                            }
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    PickerSource.Recordings -> {
+                        // Completed / Stopped server + local recordings that have a
+                        // finalized playable URL. They play as VOD tiles (no
+                        // continue-watching id). file:// recordings play headerless
+                        // (Navigation.kt parity); http(s) ones carry the auth
+                        // headers.
+                        val playableRecordings = dvrState.recordings.filter {
+                            val st = it.effectiveStatus()
+                            (st == DvrViewModel.Recording.Status.Completed ||
+                                st == DvrViewModel.Recording.Status.Stopped) &&
+                                it.playbackUrl != null
+                        }
+                        items(items = playableRecordings, key = { "rec_${it.id}" }) { rec ->
+                            val tileId = "dvr-${rec.id}"
+                            val isSel = tileId in selectedIds
+                            val playUrl = rec.playbackUrl.orEmpty()
+                            val remote = playUrl.startsWith("http://", ignoreCase = true) ||
+                                playUrl.startsWith("https://", ignoreCase = true)
+                            VodPickerRow(
+                                title = rec.title,
+                                subtitle = "Recording",
+                                posterUrl = null,
+                                selected = isSel,
+                                resolving = false,
+                                atCap = !isSel && atCapNow,
+                                onPick = {
+                                    if (isSel) {
+                                        if (swapTargetTileId == null) removeSelected(tileId)
+                                        return@VodPickerRow
+                                    }
+                                    gateAdd(true) {
+                                        commitTile(
+                                            MultiviewTile(
+                                                id = tileId,
+                                                kind = TileKind.Vod,
+                                                displayName = rec.title,
+                                                resolvedUrl = playUrl,
+                                                httpHeaders = if (remote) vodHeaders else emptyMap(),
+                                                vodId = null,
+                                            ),
+                                        )
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+    }
+
+    // BACK keeps the user's picks: the now-staged tiles stay in the store and
+    // (for the grid "Add streams" path) keep playing; the player flow then
+    // relies on its Play button, not BACK, to commit. This is the BackHandler
+    // the header comment ("BACK to dismiss") always promised but never wired.
+    // Back, swipe down and the scrim apply the selection exactly like Play
+    // (Apple TV parity, 2026-10-12); only the explicit Cancel control reverts.
+    // With nothing launchable (fewer than two tiles from the player, or the
+    // Swap Stream picker) they just close and keep what was toggled.
+    val applyAndClose: () -> Unit = {
+        if (swapTargetTileId == null && canLaunch) onLaunch() else onDismiss()
+    }
+    BackHandler(onBack = applyAndClose)
+    if (isTvDevice) {
+        androidx.compose.runtime.DisposableEffect(Unit) {
+            com.aeriotv.android.ui.tv.TvFocusTrace.player("sheet open AddToMultiview")
+            onDispose { com.aeriotv.android.ui.tv.TvFocusTrace.player("sheet close AddToMultiview") }
+        }
+        // Android TV: a centered Dialog panel. No drag/swipe semantics, so the
+        // D-pad can scroll the list freely; Back / Cancel / Play dismiss it.
+        // onDismissRequest KEEPS selections (onDismiss); the "Cancel" text
+        // button is the only revert path (onCancel).
+        Dialog(
+            onDismissRequest = applyAndClose,
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            // TV: Back that closes the IME never reaches Compose, so watch the IME
+            // inset on the sheet's own window and hand focus off the field when the
+            // keyboard goes away.
+            if (isTvDevice) {
+                val view = androidx.compose.ui.platform.LocalView.current
+                val currentFocusHandoff by androidx.compose.runtime.rememberUpdatedState({ focusFirstResultOrPlay() })
+                val fieldFocusedNow by androidx.compose.runtime.rememberUpdatedState(searchFieldFocused)
+                androidx.compose.runtime.DisposableEffect(view) {
+                    var imeWasVisible = false
+                    val listener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+                        val insets = androidx.core.view.ViewCompat.getRootWindowInsets(view)
+                        val imeVisible = insets?.isVisible(androidx.core.view.WindowInsetsCompat.Type.ime()) == true
+                        if (imeVisible != imeWasVisible) {
+                            com.aeriotv.android.ui.tv.TvFocusTrace.player("mvsheet ime visible=$imeVisible fieldFocused=$fieldFocusedNow")
+                            if (imeWasVisible && !imeVisible && fieldFocusedNow) {
+                                view.post { currentFocusHandoff() }
+                            }
+                            imeWasVisible = imeVisible
+                        }
+                    }
+                    view.viewTreeObserver.addOnGlobalLayoutListener(listener)
+                    onDispose { view.viewTreeObserver.removeOnGlobalLayoutListener(listener) }
+                }
+            }
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth(0.6f)
+                    .fillMaxHeight(0.92f),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.background,
+            ) {
+                Column(modifier = Modifier.fillMaxSize().padding(top = 8.dp), content = body)
+            }
+        }
+    } else {
+        // Phone / tablet: native bottom sheet. Swipe-to-dismiss KEEPS selections
+        // (onDismiss); the "Cancel" text button reverts (onCancel).
+        ModalBottomSheet(
+            onDismissRequest = applyAndClose,
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.background,
+            content = body,
+        )
+    }
+
+    // #46: the soft-limit warning itself. iOS-verbatim copy and outcomes:
+    // Continue commits the stashed add; Don't Show Again persists the
+    // suppression AND commits (matching iOS, which treats it as consent);
+    // Cancel drops the add. Composes its own window, so it overlays both the
+    // TV Dialog panel and the phone bottom sheet.
+    pendingWarnedAdd?.let { commit ->
+        AlertDialog(
+            onDismissRequest = { pendingWarnedAdd = null },
+            title = { Text("Performance may degrade") },
+            text = {
+                Text(
+                    "Adding more than ${multiviewStore.softLimit} streams may cause " +
+                        "audio drops, buffering, or overheating on some devices.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingWarnedAdd = null
+                        commit()
+                    },
+                ) { Text("Continue", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        settingsVm.setMultiviewPerfWarningSuppressed(true)
+                        pendingWarnedAdd = null
+                        commit()
+                    },
+                ) { Text("Don't Show Again") }
+                TextButton(onClick = { pendingWarnedAdd = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SectionHeader(title: String) {
+    Text(
+        text = title,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+    )
+}
+
+/**
+ * Pinned, NON-interactive row for the now-playing channel (Tile 1). Mirrors
+ * [ChannelPickerRow] visually but carries no clickable / onToggle: it is
+ * already seeded into the multiview store + audio-focused, and a stray tap
+ * must not be able to deselect it (which would silently drop below the
+ * 2-tile launch threshold). Always shows the green check + a "Tile 1" badge.
+ */
+@Composable
+private fun NowPlayingPinnedRow(
+    channel: M3UChannel,
+    nowTitle: String,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = channel.channelNumber ?: "",
+            style = MaterialTheme.typography.labelMedium.subtext(),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(28.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(com.aeriotv.android.core.ui.artworkTileShape(LOGO_TILE_CORNER, model = channel.tvgLogo))
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (channel.tvgLogo.isNotBlank()) {
+                AsyncImage(
+                    model = channel.tvgLogo,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                )
+            } else {
+                Text(
+                    text = channel.name.take(2).uppercase(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.textAccent,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = channel.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = if (nowTitle.isNotBlank()) "Tile 1 · Now playing · $nowTitle"
+                else "Tile 1 · Now playing",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.textAccent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(
+            modifier = Modifier.size(28.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Check,
+                contentDescription = "Included as Tile 1",
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChannelPickerRow(
+    channel: M3UChannel,
+    nowTitle: String,
+    selected: Boolean,
+    subtitle: String = "",
+    description: String = "",
+    atCap: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val baseColor = if (selected)
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+    else
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.45f)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(baseColor)
+            .clickable(enabled = !atCap, onClick = onToggle)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = channel.channelNumber ?: "",
+            style = MaterialTheme.typography.labelMedium.subtext(),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(28.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(com.aeriotv.android.core.ui.artworkTileShape(LOGO_TILE_CORNER, model = channel.tvgLogo))
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (channel.tvgLogo.isNotBlank()) {
+                AsyncImage(
+                    model = channel.tvgLogo,
+                    contentDescription = null,
+                    modifier = Modifier.size(32.dp),
+                )
+            } else {
+                Text(
+                    text = channel.name.take(2).uppercase(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.textAccent,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = channel.name,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (nowTitle.isNotBlank()) {
+                Text(
+                    text = nowTitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.textAccent,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            // Show Subtitles: the program's subtitle line (Teamarr puts
+            // "Team 1 vs Team 2" here). Show Descriptions: two lines max.
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (description.isNotBlank()) {
+                Text(
+                    text = description,
+                    style = MaterialTheme.typography.bodySmall.subtext(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(
+            modifier = Modifier.size(28.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) {
+                Icon(
+                    imageVector = Icons.Filled.Check,
+                    contentDescription = "Selected",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.Add,
+                    contentDescription = "Add",
+                    tint = if (atCap)
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                    else
+                        MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+/** Multiview picker content source. Mirrors iOS PickerSource. */
+private enum class PickerSource(val label: String) {
+    Channels("Channels"),
+    Movies("Movies"),
+    Series("Series"),
+    Recordings("Recordings"),
+}
+
+/**
+ * Picker row for a Movie / Episode / Series / Recording. Mirrors
+ * [ChannelPickerRow] visually (logo box, title, subtitle, trailing add/check)
+ * but works off arbitrary VOD metadata. [resolving] swaps the trailing icon for
+ * a spinner while the play URL resolves; [chevron] is used for the Series grid
+ * (drill into episodes) instead of an add toggle.
+ */
+@Composable
+private fun VodPickerRow(
+    title: String,
+    subtitle: String,
+    posterUrl: String?,
+    selected: Boolean,
+    resolving: Boolean,
+    atCap: Boolean,
+    onPick: () -> Unit,
+    chevron: Boolean = false,
+) {
+    val baseColor = if (selected)
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+    else
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.45f)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(baseColor)
+            .clickable(enabled = !atCap && !resolving, onClick = onPick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(com.aeriotv.android.core.ui.artworkTileShape(LOGO_TILE_CORNER, model = posterUrl))
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (!posterUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = posterUrl,
+                    contentDescription = null,
+                    modifier = Modifier.size(36.dp).clip(com.aeriotv.android.core.ui.artworkTileShape(LOGO_TILE_CORNER)),
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.Movie,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall.subtext(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Box(
+            modifier = Modifier.size(28.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            when {
+                resolving -> CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                )
+                chevron -> Icon(
+                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = "Open",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                selected -> Icon(
+                    imageVector = Icons.Filled.Check,
+                    contentDescription = "Selected",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                else -> Icon(
+                    imageVector = Icons.Filled.Add,
+                    contentDescription = "Add",
+                    tint = if (atCap)
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                    else
+                        MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+}
+
+/** "Back to series" row shown above the episode list when drilled into a series. */
+@Composable
+private fun BackRow(onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+            contentDescription = "Back",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            text = "All Series",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.textAccent,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+/** The logo tile's own corner radius. The tile and the art inside it read this
+ *  one value, so they cannot drift. */
+private val LOGO_TILE_CORNER = 6.dp

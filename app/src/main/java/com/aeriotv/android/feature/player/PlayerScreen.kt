@@ -1,0 +1,3432 @@
+package com.aeriotv.android.feature.player
+
+import kotlinx.coroutines.sync.withLock
+import android.util.Log
+import android.view.ViewGroup
+import android.widget.Toast
+import com.aeriotv.android.BuildConfig
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.Text
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.graphics.Color
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableIntState
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import com.aeriotv.android.core.data.EPGProgramme
+import com.aeriotv.android.core.data.M3UChannel
+import com.aeriotv.android.core.data.ProgramInfoTarget
+import com.aeriotv.android.core.data.guideMatchKey
+import com.aeriotv.android.core.pip.PipState
+import com.aeriotv.android.core.pip.findActivity
+import com.aeriotv.android.feature.livetv.RecordProgramSheet
+import com.aeriotv.android.feature.miniplayer.MiniPlayerViewModel
+import com.aeriotv.android.feature.multiview.AddToMultiviewSheet
+import com.aeriotv.android.feature.playlist.nowPlaying
+import com.aeriotv.android.feature.settings.SettingsViewModel
+import dagger.hilt.android.EntryPointAccessors
+import dagger.hilt.EntryPoint
+import dagger.hilt.InstallIn
+import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import com.aeriotv.android.core.ui.SkipIntervals
+
+private const val TAG = "PlayerScreen"
+/**
+ * The ONE chrome auto-hide countdown (Logan 2026-09-11: "exactly 3 seconds
+ * after the LAST user action"). Shared by the live player, the VOD player and
+ * multiview so they cannot drift apart again; it was 4 s in all three.
+ */
+const val PLAYER_CHROME_HIDE_MS = 3_000L
+
+/** The launch info pill's own dwell. NOT the chrome timer: it is the brief
+ *  "what am I watching" card, and shortening it with the chrome would change
+ *  unrelated behavior. */
+private const val LAUNCH_HINT_MS = 4_000L
+private const val SWIPE_THRESHOLD_PX = 120f
+// Min gap between two hardware D-pad channel flips. Auto-repeat on a held UP/DOWN
+// fires rapidly; this paces it so a hold surfs one channel at a time instead of
+// skipping several, while a normal press cadence still flips immediately.
+private const val FLIP_DEBOUNCE_MS = 120L
+
+/**
+ * Live-stream player screen. Hosts the MPV view + chrome overlay. Tap toggles
+ * chrome. While chrome is visible, vertical swipe flips to the next/previous
+ * channel without leaving the screen, mirroring iOS PlayerView.swift line 686
+ * (`appleTVChannelFlip`).
+ */
+@Composable
+fun PlayerScreen(
+    channels: List<M3UChannel>,
+    initialChannelId: String,
+    isLive: Boolean = true,
+    httpHeaders: Map<String, String> = emptyMap(),
+    epgByChannel: Map<String, List<EPGProgramme>> = emptyMap(),
+    // Task #148 milestone B (tvOS unified-player parity): non-blank
+    // catchupUrl + csEnd > csStart puts this screen in CATCH-UP mode - the
+    // live prime is skipped, the archive replay plays through
+    // exoHolder.playCatchup, and the shared d-pad scrub commits re-tunes in
+    // the programme domain [0, duration]. Phone never enters this mode (it
+    // keeps VODPlayerScreen for catch-up, mirroring iPhone).
+    catchupUrl: String = "",
+    catchupTitle: String = "",
+    catchupStartMillis: Long = 0L,
+    catchupEndMillis: Long = 0L,
+    catchupTz: String = "",
+    catchupChannelUuid: String = "",
+    /** Task #149: mint a fresh native session for a seek re-tune. */
+    onRemintCatchup: suspend (channelUuid: String, currentUrl: String, absStartMillis: Long) -> String? =
+        { _, _, _ -> null },
+    /** Task #149: best-effort revoke of a native session (exit + re-tune). */
+    onRevokeCatchup: (playbackUrl: String) -> Unit = {},
+    /** Task #183: report local playhead/pause for a native catch-up
+     *  session (keeps server stats honest + refreshes the idle TTL
+     *  through long pauses). Returns false when the server lacks the
+     *  endpoint - the screen then stops reporting for this playback. */
+    onReportCatchupPosition: suspend (playbackUrl: String, positionSecs: Double, paused: Boolean) -> Boolean =
+        { _, _, _ -> true },
+    onClose: () -> Unit = {},
+    onLaunchMultiview: () -> Unit = {},
+    /** Remote Control: hold-Down (openSearch action) hands off to the global
+     *  search screen; the caller navigates AFTER this screen minimizes. */
+    onOpenSearch: () -> Unit = {},
+    /** Remote Control: the guide's active group pill token, seeding the
+     *  Left-press Channels overlay ("channels of the previously selected
+     *  group"). Overlay-local after that - browsing here never re-filters
+     *  the guide. */
+    initialGroup: String = com.aeriotv.android.feature.playlist.PlaylistViewModel.ALL_GROUPS,
+    /** Remote Control (Logan spec 2026-07-20): true = prime playback as
+     *  usual, then immediately drop to the corner mini and pop back to the
+     *  tabs - the optional "start channels in the mini player" tune mode.
+     *  TV live tunes only; catch-up and remote sessions ignore it. */
+    startInMini: Boolean = false,
+    onLoadChannelStreams: suspend (Int) -> List<StreamOption> = { emptyList() },
+    onSwitchChannelStream: suspend (String, Int) -> String? = { _, _ -> null },
+    /** Switch Stream reorder (Dispatcharr admin): persist the channel's stream
+     *  order (channel int pk, full ordered stream ids). Throws on failure. */
+    onSaveChannelStreamOrder: suspend (Int, List<Int>) -> Unit = { _, _ -> },
+    /** Re-read the Dispatcharr user level now and return the fresh Switch
+     *  Stream gate (trigger names the reason for the PermsRefresh log).
+     *  Defaults to false: fail closed when no host wires it. */
+    onRecheckSwitchStreamAllowed: suspend (String) -> Boolean = { false },
+    onLoadCurrentStreamId: suspend (String) -> Int? = { null },
+    onLoadCurrentStreamUrl: suspend (String) -> String? = { null },
+    /** LAN/WAN verdict-flip signal (LAN URL key) for mid-stream re-tune. */
+    onVerdictFlips: kotlinx.coroutines.flow.SharedFlow<String> =
+        kotlinx.coroutines.flow.MutableSharedFlow(),
+    /** Rebuild this channel's live proxy URL from the current LAN/WAN base. */
+    onRebuildLiveUrl: suspend (String) -> String? = { null },
+) {
+    // Hold the screen awake while the fullscreen player is mounted. Without
+    // this the system screen-timeout fires mid-stream after its idle window
+    // (Samsung defaults to 30s in dim mode) and the user has to wake the
+    // phone to keep watching. Mirrors iOS IdleTimerRefCount.increment() on
+    // playback start (MPVPlayerView.swift line 4422). The DisposableEffect
+    // inside KeepScreenOnWhilePlaying cleans the flag up automatically when
+    // PlayerScreen leaves composition -- mini-player promotion + back-out
+    // both trigger the dispose path naturally.
+    KeepScreenOnWhilePlaying()
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val settingsVm: SettingsViewModel = hiltViewModel()
+    val miniPlayerVm: MiniPlayerViewModel = hiltViewModel()
+    val appleTVChannelFlip by settingsVm.appleTVChannelFlip.collectAsStateWithLifecycle(initialValue = true)
+    // In-Player Gestures (touch only, all off by default).
+    val playerBrightnessGesture by settingsVm.playerBrightnessGesture.collectAsStateWithLifecycle(initialValue = false)
+    val playerVolumeGesture by settingsVm.playerVolumeGesture.collectAsStateWithLifecycle(initialValue = false)
+    val playerBrightnessEdge by settingsVm.playerBrightnessEdge.collectAsStateWithLifecycle(
+        initialValue = com.aeriotv.android.core.preferences.PLAYER_EDGE_LEFT,
+    )
+    // Remote Control initiative: live button map (player context slots).
+    val remoteMap by settingsVm.remoteControlMap.collectAsStateWithLifecycle(
+        initialValue = com.aeriotv.android.core.remote.RemoteControlMap.DEFAULT,
+    )
+    val streamBufferSize by settingsVm.streamBufferSize.collectAsStateWithLifecycle(initialValue = "default")
+    val videoScaleMode by settingsVm.videoScaleMode.collectAsStateWithLifecycle(
+        initialValue = VIDEO_SCALE_FIT,
+    )
+    // Live Rewind pref, to hint (below) that pause/rewind needs it turned on.
+    val liveRewindEnabled by settingsVm.liveRewindEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val playerEntry = remember {
+        EntryPointAccessors.fromApplication(
+            context.applicationContext,
+            PlayerScreenEntryPoint::class.java,
+        )
+    }
+    val exoHolder = remember { playerEntry.exoPlayerHolder() }
+    val exoWindowState = remember { playerEntry.exoWindowState() }
+    val timeshiftController = remember { playerEntry.timeshiftController() }
+    // Cast Connect (GH #33) sender. isCasting drives the local-vs-remote swap:
+    // while a cast session is connected we stop the local codec and mirror the
+    // channel identity to the Android-TV receiver instead of playing here.
+    val castSender = remember { playerEntry.castSender() }
+    val castReceiver = remember { playerEntry.castReceiver() }
+    val castState by castSender.state.collectAsStateWithLifecycle()
+    // Play Here from the cast play-where prompt keeps this player local for
+    // the rest of the session: no mirror to the receiver, no auto-close.
+    val playHereWhileCasting by com.aeriotv.android.feature.main.PlayWhereRouter.localWhileCasting
+        .collectAsStateWithLifecycle()
+    val isCasting = castState is com.aeriotv.android.core.cast.AerioCastSender.State.Connected &&
+        !playHereWhileCasting
+    // GH #33 companion remote (second-screen): while connected to an AerioTV TV
+    // over the LAN, this screen behaves EXACTLY like the cast flow -- local
+    // playback is suspended, the channel is mirrored to the TV and the screen
+    // closes (the cast card owns the controls). Cast wins when both exist.
+    val companionRemote = remember { playerEntry.companionRemote() }
+    val companionDiscovery = remember { playerEntry.companionDiscovery() }
+    val companionConn by companionRemote.connection.collectAsStateWithLifecycle()
+    // GH #88: once this screen is in remote mode it STAYS remote through a
+    // reconnect (Connecting after a drop). Only a settled Idle/Failed/pairing
+    // state ends it; the old Connected-only gate re-primed local playback
+    // the moment the socket blinked while the phone was backgrounded.
+    var companionSticky by remember { mutableStateOf(false) }
+    LaunchedEffect(companionConn) {
+        when (companionConn) {
+            is com.aeriotv.android.core.cast.companion.CompanionRemoteController.Conn.Connected -> companionSticky = true
+            is com.aeriotv.android.core.cast.companion.CompanionRemoteController.Conn.Connecting -> Unit
+            else -> companionSticky = false
+        }
+    }
+    val isCompanion = !isCasting && (
+        companionConn is com.aeriotv.android.core.cast.companion.CompanionRemoteController.Conn.Connected ||
+            (companionSticky && companionConn is com.aeriotv.android.core.cast.companion.CompanionRemoteController.Conn.Connecting)
+        )
+    // "Some remote screen is playing this, not the phone" -- the shared gate for
+    // every local-playback suppression below.
+    val isRemote = isCasting || isCompanion
+    // Own companion mDNS discovery for the player's whole lifetime (phones only;
+    // the TV is the host, never a client). The cast button reads the devices flow
+    // to decide its own visibility; if the BUTTON owned discovery (it lives inside
+    // the auto-hiding chrome) the browse would restart on every chrome show and
+    // the button would be invisible for the first seconds each time (device test
+    // 2026-07-15). Refcounted with the chooser dialog's own start/stop.
+    val uiModeIsTv = (
+        androidx.compose.ui.platform.LocalContext.current.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_TYPE_MASK
+        ) == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+    if (!uiModeIsTv) {
+        DisposableEffect(companionDiscovery) {
+            companionDiscovery.start()
+            onDispose { companionDiscovery.stop() }
+        }
+    }
+    // Set true while the companion "Disconnect" button tears down the remote and
+    // exits the player, so the prime effect (which re-fires when isCompanion flips
+    // false) does NOT resume LOCAL playback on the phone -- that left the channel
+    // playing on BOTH the phone and the TV (device report 2026-07-15).
+    val remoteStoppingState = remember { mutableStateOf(false) }
+    var remoteStopping by remoteStoppingState
+
+    // Channel-flip state. The MPV view stays alive across flips; only the
+    // current channel index changes and we call playFile again with the new URL.
+    // -1 when the id is not in the list yet (hydration race, or an event
+    // channel the playlist refresh re-keyed). NEVER coerce a miss to 0: that
+    // silently played channels[0] (the user report: picking World Cup #5200
+    // played channel #1). getOrNull(-1) renders the loading state instead,
+    // and the remember(channels) below re-resolves when the list lands.
+    val initialIndex = remember(channels, initialChannelId) {
+        channels.indexOfFirst { it.id == initialChannelId }
+    }
+    val currentIndexState = remember(channels) { mutableIntStateOf(initialIndex) }
+    var currentIndex by currentIndexState
+    val currentChannel = channels.getOrNull(currentIndex)
+
+    // Task #148 milestone B: catch-up mode state. scrubTargetWallMs (below)
+    // holds PROGRAMME-relative ms in this mode instead of wall-clock.
+    val isCatchupMode = catchupUrl.isNotBlank() && catchupEndMillis > catchupStartMillis
+    val isNativeCatchup = isCatchupMode &&
+        (catchupChannelUuid.isNotBlank() || catchupUrl.contains("/proxy/catchup/"))
+    val catchupDurationMs = (catchupEndMillis - catchupStartMillis).coerceAtLeast(0L)
+    var catchupCurrentUrl by remember { mutableStateOf(catchupUrl) }
+    var catchupOffsetMs by remember { mutableStateOf(0L) }
+    val catchupPositionMsState = remember { mutableStateOf(0L) }
+    var catchupPositionMs by catchupPositionMsState
+    // GH #116: last position observed while the catch-up stream was READY.
+    // The resume save reads this, never catchupPositionMs: on exit the held
+    // player is stopped/re-primed before this screen disposes, and the 500 ms
+    // ticker then wrote offset + 0 into catchupPositionMs, so the save saw a
+    // sub-60 s position and silently dropped the entry (no "resume saved").
+    var catchupResumeMs by remember { mutableStateOf(-1L) }
+    // Set once the resume lookup has run (and any resume re-tune was issued),
+    // so the opening seconds before the resume seek cannot overwrite the entry.
+    var catchupResumeSettled by remember { mutableStateOf(false) }
+    // Task #149: serialized native re-mints (rapid skips coalesce to the
+    // latest target; see VODPlayerScreen's twin for the rationale).
+    var nativeRemintInFlight by remember { mutableStateOf(false) }
+    var nativeRemintPendingMs by remember { mutableStateOf<Long?>(null) }
+
+    // GH #22: a tapped id that is NOT in the active playlist's channel list
+    // used to render a silent forever-black player -- no prime, no log lines
+    // at all (FractalBoy's 0.3.1 report: repro after switching playlists,
+    // Stream Info idle, Dispatcharr shows no client). An EMPTY list is the
+    // normal hydration race and keeps the loading state (the remembers above
+    // re-resolve when it lands); a NON-empty list that's missing the id is a
+    // real miss -- surface it and offer the way out instead of dying quietly.
+    if (channels.isNotEmpty() && currentChannel == null) {
+        LaunchedEffect(initialChannelId) {
+            Log.w(
+                TAG,
+                "[TUNE] channel id $initialChannelId not in active list " +
+                    "(n=${channels.size}) -- surfacing not-found instead of idling",
+            )
+        }
+        ChannelNotAvailableCard(onClose = onClose)
+        return
+    }
+    // Same treatment for a channel with no stream URL (event channels whose
+    // stream isn't assigned yet). The prime effect already no-ops on a blank
+    // url; without this the user sat on a silent black screen. A later
+    // channels refresh that fills the url recomposes straight into playback.
+    if (currentChannel != null && currentChannel.url.isBlank()) {
+        NoStreamAssignedCard(onClose = onClose)
+        return
+    }
+    // Focus target that holds D-pad focus during fullscreen playback (chrome
+    // hidden) so the remote's up/down reaches the channel-flip handler on TV.
+    val playbackFocus = remember { FocusRequester() }
+    val nowProgramme by remember(epgByChannel, currentChannel) {
+        derivedStateOf {
+            // Catch-up: the info card / footer must describe the REPLAYED
+            // programme, not whatever happens to be airing live on the
+            // channel right now (task #148 milestone B polish).
+            if (isCatchupMode) {
+                EPGProgramme(
+                    channelId = currentChannel?.guideMatchKey.orEmpty(),
+                    title = catchupTitle.ifBlank { currentChannel?.name.orEmpty() },
+                    description = "",
+                    startMillis = catchupStartMillis,
+                    endMillis = catchupEndMillis,
+                    category = "",
+                )
+            } else {
+                currentChannel?.let { epgByChannel[it.guideMatchKey]?.nowPlaying() }
+            }
+        }
+    }
+
+    // Persist last-watched channel for the App Behaviors > Resume Last Channel
+    // toggle. Writes whenever the user flips to a new channel; AerioTVNavHost
+    // reads this once on cold boot to decide whether to auto-launch into the
+    // player. Also seeds the mini-player session so a system back can promote
+    // it without losing channel context.
+    // Quiet EPG sweep (Logan 2026-09-12): release the hold taken at tune press
+    // as soon as this tune is actually playing, so the background guide sweep
+    // never competes with a cold start. Polled, not a Player.Listener: the
+    // sweep only reads the flag every couple of seconds anyway, and the gate
+    // ceilings itself so a failed tune cannot hold it forever.
+    LaunchedEffect(currentChannel?.id) {
+        while (true) {
+            if (exoHolder.player?.playbackState == androidx.media3.common.Player.STATE_READY) {
+                com.aeriotv.android.core.data.repository.EpgSweepGate.onTunePlaying()
+                return@LaunchedEffect
+            }
+            kotlinx.coroutines.delay(500)
+        }
+    }
+
+    LaunchedEffect(currentChannel?.id) {
+        // Catch-up replays never become the resume target / recents entry /
+        // mini-player session (task #148 milestone B).
+        if (isCatchupMode) return@LaunchedEffect
+        currentChannel?.let { ch ->
+            if (ch.id.isNotBlank()) {
+                settingsVm.setLastWatchedChannelId(ch.id)
+                // Feed the LRU recents list (AddToMultiview "Recent" section,
+                // iOS RecentChannelsStore parity).
+                settingsVm.recordRecentChannel(ch.id)
+            }
+            miniPlayerVm.setCurrentChannel(ch)
+        }
+    }
+
+    // Mount-time hook: if we're resuming from the mini-player the background
+    // PlaybackService is still running with the notification surfaced and MPV
+    // in audio-only mode. Stop the service (we're foreground again) and flip
+    // video output back on.
+    //
+    // Phase 165: also request the PersistentMpvWindow into Fullscreen mode
+    // so the SurfaceView (mounted at MainActivity root) fills the screen
+    // beneath our chrome overlays.
+    // Start-in-mini eligibility, resolved once (TV live tunes only; declared
+    // here because isTvForm's canonical val sits further down the file).
+    val startMiniEligible = startInMini && !isCatchupMode && !isRemote &&
+        (
+            context.resources.configuration.uiMode and
+                android.content.res.Configuration.UI_MODE_TYPE_MASK
+            ) == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+    LaunchedEffect(Unit) {
+        // Apply Dispatcharr / Xtream auth headers + custom User-Agent
+        // before the first setMediaSource so the DataSource picks them
+        // up. Replays on every mount so reentering the player after a
+        // settings change (e.g. swapping API key) takes effect on the
+        // next channel tap.
+        exoHolder.httpHeaders = httpHeaders
+        // Start-in-mini tunes go straight to the corner rect: requesting
+        // Fullscreen first would flash a full-size frame before the drop.
+        if (startMiniEligible) {
+            exoWindowState.requestMini()
+        } else {
+            exoWindowState.requestFullscreen()
+        }
+        // LAN/WAN terminal-error failover hook (iOS PlayerSession.failoverRetryCurrent):
+        // on a terminal player error the holder asks this to re-probe LAN/WAN and
+        // hand back a fresh /proxy/ts/stream/<uuid> URL instead of replaying a
+        // possibly dead-host lastPlayUrl. Only Dispatcharr-live channels qualify.
+        // The id arrives as a PARAMETER from the holder (session2.txt 19:56:49:
+        // this lambda used to close over currentChannel, captured on mount, so a
+        // channel flip re-primed the failure onto the PREVIOUS channel's URL).
+        exoHolder.onTerminalErrorRebuildUrl = { id ->
+            id.takeIf { it.startsWith("disp:") }
+                ?.let { onRebuildLiveUrl(it.removePrefix("disp:")) }
+        }
+        // Bring up the MediaSessionService so the session is alive before the
+        // first frame. Idempotent -- if it's already running this is a no-op.
+        // NOT while casting: the phone isn't playing locally, so a media FGS would
+        // post a second "Casting to <TV>" notification competing with the
+        // standalone cast chip (GH #33 - re-entering the player from the
+        // Now-Casting mini controller is the path that hit this).
+        if (!isRemote) {
+            com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                .startBackground(context)
+        }
+    }
+
+    // Clear the LAN/WAN failover hook when leaving the player so a backgrounded /
+    // Auto session never re-tunes through this screen's closed-over state.
+    DisposableEffect(Unit) {
+        onDispose { exoHolder.onTerminalErrorRebuildUrl = null }
+    }
+
+    // Start-in-mini: once the tune effect has seeded the channel + issued
+    // play (the app-scoped holder keeps decoding after this screen pops),
+    // promote the mini session and hand the user back to the tabs. The
+    // short delay lets the channel-switch LaunchedEffect above run first;
+    // keying on currentChannel?.id ensures the session has a channel to
+    // show before we promote it.
+    LaunchedEffect(startMiniEligible, currentChannel?.id) {
+        if (startMiniEligible && currentChannel != null) {
+            delay(400)
+            exoWindowState.requestMini()
+            miniPlayerVm.showMiniPlayer()
+            onClose()
+        }
+    }
+
+    // Cast Connect (GH #33): free/restore the LOCAL codec + surface as the cast
+    // session comes and goes. Stopping (not just pausing) the holder releases the
+    // MediaCodec and stops phone-side audio while the TV plays; on disconnect we
+    // restore the fullscreen surface and the prime effect above re-tunes locally.
+    LaunchedEffect(isRemote) {
+        if (isRemote) {
+            runCatching { exoHolder.stop() }
+            runCatching { exoWindowState.hide() }
+            // Also stop the media FGS the LOCAL mount started: the phone isn't
+            // playing anything now, and the leftover session (stuck PLAYING with
+            // a stale position) kept an "AerioTV" media notification in the shade
+            // through the whole remote session AND after Disconnect (device test
+            // 2026-07-15). The in-app Controlling/Now-Casting card is the
+            // re-entry point; the notification is purely local playback's.
+            runCatching {
+                com.aeriotv.android.core.playback.AerioMediaPlaybackService.stop(context)
+            }
+        } else {
+            runCatching { exoWindowState.requestFullscreen() }
+        }
+    }
+
+    // Cast card UX (Logan 2026-09-12): the player is NEVER the remote screen any
+    // more. A session that starts while this player is open (the chrome's cast
+    // button) mirrors the current channel to the other screen -- the tune effect
+    // below does that -- and then hands the user back to the page they came from,
+    // where THE cast card is the one control surface (tap it for the remote
+    // sheet). The short delay lets that tune land before this screen pops; no
+    // local playback is resumed on the way out.
+    LaunchedEffect(isRemote) {
+        if (isRemote) {
+            delay(600)
+            onClose()
+        }
+    }
+
+    // GH #33 (receiver side): when THIS TV is playing a cast and the phone flips
+    // the channel, the receiver's Navigation routes the request here instead of
+    // re-navigating. Move currentIndex so the persistent ExoPlayer re-primes to
+    // the new channel in place -- no nav, no PiP-pop. No-op on the sending phone
+    // (the request flow stays null there).
+    val castFlipChannels by rememberUpdatedState(channels)
+    LaunchedEffect(Unit) {
+        castReceiver.castChannelRequest.collect { requestedId ->
+            if (requestedId == null) return@collect
+            val idx = castFlipChannels.indexOfFirst { it.id == requestedId }
+            if (idx >= 0) currentIndex = idx
+            castReceiver.consumeCastChannelRequest()
+        }
+    }
+
+    // Channel-switch / first-mount setMediaItem: when the held Exo
+    // player is on a different channel than the user just selected,
+    // swap streams via setMediaSource. The PlayerView at MainActivity
+    // root holds the surface across this so no reattach is required.
+    LaunchedEffect(currentChannel?.id, isCasting, isCompanion) {
+        // Task #148 milestone B: catch-up mode never primes the LIVE stream
+        // (and never starts a rewind buffer session below).
+        if (isCatchupMode) return@LaunchedEffect
+        // Companion Disconnect is tearing this player down -- do not resume local
+        // playback as isCompanion flips false (GH #33 double-play fix).
+        if (remoteStopping) return@LaunchedEffect
+        val channelId = currentChannel?.id ?: return@LaunchedEffect
+        val ch = currentChannel ?: return@LaunchedEffect
+        val url = ch.url
+        if (url.isBlank()) return@LaunchedEffect
+        // Keep Recent Channels Live: snapshot the OUTGOING channel's actual
+        // play URL (post LAN/WAN failover) before the holder re-primes, so
+        // a demotion can freeze the URL its retained filler should dial.
+        timeshiftController.noteChannelLeaving()
+        // GH #33 companion remote: mirror the channel to the paired TV over the
+        // LAN socket instead of priming locally. Dedup against the last channel
+        // this phone sent so re-entering the player for the SAME channel (mini
+        // card tap) doesn't needlessly re-tune the TV.
+        if (isCompanion) {
+            if (companionRemote.currentChannelId.value != ch.id) {
+                companionRemote.setRemoteChannel(ch.id, ch.name)
+            }
+            return@LaunchedEffect
+        }
+        // Cast Connect (GH #33): while casting, don't prime the LOCAL codec.
+        // Mirror the channel IDENTITY to the Android-TV receiver, which rebuilds
+        // its own /proxy/ts/ URL and plays with its own ExoPlayer. A channel flip
+        // re-fires this and re-casts. The suspend effect below frees the local
+        // codec so the phone isn't decoding in parallel.
+        if (isCasting) {
+            // Re-tune the receiver ONLY on a genuine channel change. Re-entering
+            // the player from the Now-Casting mini controller re-fires this effect
+            // for the SAME channel; without this guard we'd re-issue setContent()
+            // (an autoplay load) + setRemoteChannel and make the TV needlessly
+            // reload/flicker the feed it is already playing. The sender's current
+            // content mediaId is the source of truth for "what the TV is on".
+            // A cast resumed after an app restart only recovers the channel TITLE
+            // as mediaId (the receiver's bridged MediaSession drops our id), so
+            // also treat a title match as "already on this channel" -- otherwise
+            // re-entering it would needlessly re-tune the TV (GH #33).
+            // On resume mediaId IS the channel name, so a name match on mediaId
+            // covers that case. (Do NOT also match cc.title==ch.name: on a normal
+            // cast that would wrongly suppress a real switch between two channels
+            // sharing a name.)
+            // GH #47: shared in-place cast tune (same dedup guard as before -
+            // see AerioCastSender.tuneLiveChannel). The channel list's tap
+            // handler uses the same path to flip the TV without opening this
+            // screen.
+            castSender.tuneLiveChannel(
+                channelId = ch.id,
+                title = ch.name,
+                subtitle = nowProgramme?.title,
+                artUri = ch.tvgLogo.takeIf { it.isNotBlank() },
+                // Casting rework P1: this URL feeds the phone-local HLS
+                // proxy's ingest. Prefer the holder's post-failover URL when
+                // it is still this channel's (same discipline as the
+                // timeshift filler: the stored channel URL can embed a dead
+                // base after a LAN/WAN failover or server move).
+                localUrl = exoHolder.currentPlayUrl
+                    ?.takeIf { exoHolder.currentChannelId == ch.id } ?: url,
+                headers = httpHeaders,
+            )
+            return@LaunchedEffect
+        }
+        // GH #22: also re-prime when the holder claims this channel but is
+        // actually IDLE (a stop path that missed clearing currentChannelId).
+        // Skipping the prime against a dead player was the silent-black-
+        // screen failure: no logs, Stream Info idle, no server client.
+        var adoptLive = false
+        // Read before the tune resets it: a failed outgoing channel is
+        // released, never kept live.
+        val previousFailed = exoHolder.streamUnavailable.value ||
+            exoHolder.failedChannelId != null
+        if (exoHolder.currentChannelId != channelId || exoHolder.isIdle()) {
+            Log.i(TAG, "Channel switch on Exo persistent player -> $url")
+            // Trace: this is a real tune entry (channel-list / recents / deep
+            // link / mini-player hand-off), so start press->firstFrame here.
+            // session2.txt had no [TUNE] press line for either tune because
+            // this path never called it.
+            // Quiet EPG sweep holds off until this tune reaches its first frame.
+            com.aeriotv.android.core.data.repository.EpgSweepGate.onTuneStart()
+            exoHolder.markTunePress(ch.name)
+            // Refresh headers each switch -- some Dispatcharr deployments
+            // rotate the API key per stream.
+            exoHolder.httpHeaders = httpHeaders
+            // Pass title / subtitle / logo to the MediaItem so
+            // MediaSessionService renders the right notification +
+            // lock-screen art (task #64). The mediaMetadata fields
+            // flow through Player.currentMediaItem.mediaMetadata to
+            // the session.
+            val artworkUri = ch.tvgLogo.takeIf { it.isNotBlank() }
+                ?.let { runCatching { android.net.Uri.parse(it) }.getOrNull() }
+            // Keep Recent Channels Live re-tune: play the kept channel's
+            // buffer at its live edge, fed by the kept connection itself. No
+            // new request to the server (Apple parity). Falls through to a
+            // normal tune when there is no usable kept buffer.
+            val keptWriter = if (exoHolder.canBufferLiveRewind(url)) {
+                timeshiftController.retainedWriterFor(channelId)
+            } else null
+            adoptLive = keptWriter != null && exoHolder.playRetainedLive(
+                writer = keptWriter,
+                url = url,
+                title = ch.name,
+                subtitle = nowProgramme?.title.orEmpty(),
+                artworkUri = artworkUri,
+                channelId = channelId,
+            )
+            if (!adoptLive) exoHolder.playUrl(
+                url = url,
+                title = ch.name,
+                subtitle = nowProgramme?.title.orEmpty(),
+                artworkUri = artworkUri,
+                // GH #27: #KODIPROP DRM signalling for encrypted DASH.
+                drmLicenseType = ch.drmLicenseType,
+                drmLicenseKey = ch.drmLicenseKey,
+                channelId = channelId,
+            )
+            exoHolder.currentChannelId = channelId
+        } else {
+            // GH #22 diagnosability: a skipped prime used to be invisible
+            // in logs. The idle case above re-primes; this remaining skip
+            // is the legitimate "already playing this channel" path.
+            Log.i(TAG, "[TUNE] prime skipped: holder already playing $channelId")
+        }
+        // Live Rewind: (re)start the timeshift buffer for this channel.
+        // No-op when the pref is off. Fullscreen single-stream only per
+        // the locked v1 scope; leaving this screen stops the session
+        // (DisposableEffect below), so mini-player, multiview, and PiP
+        // handoffs all drop back to pure live.
+        // Gate on the tee's own URL test: only raw MPEG-TS is mirrored
+        // into the buffer, so an HLS/DASH live channel must not start a
+        // session (it would show a transport over a permanently empty
+        // buffer and error-loop on the first pause/rewind).
+        if (exoHolder.canBufferLiveRewind(url)) {
+            // GH #65 follow-on (VPS migration): the filler must chase the
+            // holder's post-failover URL, not the stored channel row's.
+            timeshiftController.currentPlayUrlProvider = { exoHolder.currentPlayUrl }
+            timeshiftController.onFullscreenLiveStarted(
+                channelId, ch.name, url, httpHeaders, logoUrl = ch.tvgLogo, adoptLive = adoptLive,
+                keepPrevious = !previousFailed,
+            )
+        } else {
+            timeshiftController.onFullscreenLiveStopped()
+        }
+    }
+
+    // Live Rewind: end the buffer session when fullscreen live ends.
+    // Buffered segments stay on disk until the retention reaper runs.
+    DisposableEffect(Unit) {
+        onDispose {
+            // Radio Mode owns the player now: the Live Rewind buffer keeps
+            // rolling (seekable from the Radio sheet) and the playhead stays
+            // where it is. RadioMode.stop ends it with the full-close rules.
+            if (com.aeriotv.android.feature.player.RadioMode.isActive) {
+                Log.i("AerioTV", "[RADIO] buffer kept on player close")
+                return@onDispose
+            }
+            // Adopted kept channel: the buffer's own connection is still
+            // live and goes straight back to the kept list; a Go Live here
+            // would open a direct connection only to close it.
+            if (exoHolder.isTimeshifting && !exoHolder.isAdoptedLive) exoHolder.goLive()
+            // Keep Recent Channels Live: a close (X, Back without a mini,
+            // hold-Back stop, PiP X) keeps the channel live like a flip.
+            // Minimize to the mini keeps PLAYING it, and multiview launch
+            // hands off to tiles, so neither is retained.
+            // Radio Mode keeps the holder playing exactly like a minimize.
+            val toMini = exoWindowState.mode.value == ExoWindowState.Mode.Mini ||
+                com.aeriotv.android.feature.player.RadioMode.isActive
+            val toMultiview = PlayerCloseIntent.consumeMultiviewLaunch()
+            val hlsSession = exoHolder.lastTuneWasForcedHls
+            if (hlsSession) Log.i("AerioTV", "[FORCE-HLS] keep live skipped on HLS session")
+            val keepOnClose = !toMini && !toMultiview && !hlsSession
+            if (toMini || toMultiview) {
+                Log.i(
+                    "AerioTV",
+                    "[RETAIN] not kept on close: " + if (toMini) "minimized to the mini player" else "multiview launch",
+                )
+            }
+            timeshiftController.onFullscreenLiveStopped(
+                keepIfEnabled = keepOnClose,
+                toMini = toMini && !hlsSession,
+                streamFailed = exoHolder.streamUnavailable.value || exoHolder.failedChannelId != null,
+            )
+        }
+    }
+
+    // Live Rewind keeps buffering THROUGH PiP (user directive 2026-07-11,
+    // Z Fold field test: "I'd rather keep the buffer going in PiP" -
+    // reversing the earlier stop-on-PiP-enter). PiP itself has no rewind
+    // transport, but the buffer keeps growing so returning to fullscreen
+    // can rewind across the PiP stretch like a cable box. The session
+    // still ends when this screen unmounts (DisposableEffect above);
+    // rewind PLAYBACK from PiP stays out of scope (v1: fullscreen only).
+
+    // System back intercept. Two flavours:
+    //   - Phone: promote to the bottom MiniPlayerRow above the nav, kill
+    //     video output (vid=no -> mpv folds vo=null) to free the GPU, and
+    //     start the foreground PlaybackService so audio survives the
+    //     activity going to background. The held MPV stays running.
+    //   - TV: keep video enabled (the TvMiniPlayerOverlay shows the live
+    //     stream in a top-right window, tvOS PlayerSession parity). Toggling
+    //     vid off here would force vo=null and the mini would be black even
+    //     after re-attaching the surface. PlaybackService isn't needed
+    //     either because the app stays foregrounded behind the mini.
+    val isTvForm = (
+        context.resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_TYPE_MASK
+        ) == android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+
+    // GH #7 (True Android Fullscreen): on phone/tablet, hide the status + nav
+    // bars in LANDSCAPE so playback is genuinely edge-to-edge instead of
+    // letterboxed under the system chrome the rest of the app draws (we run
+    // enableEdgeToEdge app-wide). In PORTRAIT we keep the status bar so the top
+    // control banner never slides under a camera cutout: in portrait the OS
+    // always reserves the cutout area with the status bar, which is reliable on
+    // every device, whereas the DisplayCutout inset is not always exposed to
+    // apps (e.g. the Samsung Z Fold cover screen reports none). The banners also
+    // pad by statusBars union displayCutout. Keyed on orientation so a rotation
+    // re-applies the right mode; bars restored on dispose. TV has no system bars.
+    if (!isTvForm) {
+        val activity = context.findActivity()
+        val isLandscape = LocalConfiguration.current.orientation ==
+            android.content.res.Configuration.ORIENTATION_LANDSCAPE
+        DisposableEffect(activity, isLandscape) {
+            val window = activity?.window
+            val controller = window?.let {
+                androidx.core.view.WindowCompat.getInsetsController(it, it.decorView)
+            }
+            controller?.apply {
+                systemBarsBehavior = androidx.core.view.WindowInsetsControllerCompat
+                    .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                if (isLandscape) {
+                    hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                } else {
+                    show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                }
+            }
+            onDispose {
+                controller?.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
+
+    // UHD judder fix (seamless content frame-rate matching) now lives in
+    // PersistentExoWindow, which owns the SurfaceView whose Surface the
+    // refresh-rate match is requested on. The old window-level
+    // preferredDisplayModeId pin lived HERE but was a NON-seamless HDMI
+    // re-handshake that destroyed the SurfaceView mid-stream and blacked out
+    // the video on TV boxes (GOTCHA 23) -- replaced with the seamless
+    // Surface.setFrameRate path.
+
+    // Chrome auto-starts visible on phone (user can immediately reach
+    // controls + close) but hidden on TV (the user just pressed a
+    // channel and wants to watch -- 1st Back press surfaces chrome,
+    // tvOS-style). See BackHandler below for the three-press TV flow.
+    // Declared HERE (above BackHandler) so the BackHandler closure
+    // can read + mutate it.
+    var chromeVisible by remember { mutableStateOf(!isTvForm) }
+    // (chromeFromFlip removed in task #148: flips no longer raise the
+    // bottom chrome at all - only the top program card via the
+    // launch-hint window - so the latch had nothing left to track.)
+    // Last user interaction timestamp. Bumped on D-pad presses while
+    // chrome is visible so the auto-hide timer re-arms instead of firing
+    // mid-traversal. Phase 172.
+    var lastInteractionAt by remember { mutableStateOf(0L) }
+    // Why chromeVisible last flipped (the info card rides on it on phones);
+    // read once per toggle by the PlayerChrome log below.
+    var chromeReason by remember { mutableStateOf("tap") }
+    LaunchedEffect(chromeVisible) {
+        android.util.Log.d("PlayerChrome", "PlayerChrome: visible=$chromeVisible reason=$chromeReason")
+        chromeReason = "tap"
+    }
+    // THE single "the user just did something" entry point. Advancing this
+    // restarts the auto-hide LaunchedEffect (it is one of its keys), which
+    // cancels the running countdown and starts a fresh one, so there is only
+    // ever one hide job in flight. Every action routes through here: key
+    // events at this screen, activity-level mapped actions and media keys,
+    // channel flips, scrub steps, and focus / click inside the chrome.
+    val reportInteraction: () -> Unit = {
+        lastInteractionAt = android.os.SystemClock.uptimeMillis()
+    }
+    // Remote Control A2: OK short/long split latch (engaged only when an
+    // okLong action is mapped; the default map keeps the plain clickable).
+    var okLongFired by remember { mutableStateOf(false) }
+    // Left/Right short-vs-long split latch (chrome hidden): same deferral
+    // shape as the OK split. One latch serves both keys - the D-pad can
+    // only repeat one direction at a time.
+    var horizLongFired by remember { mutableStateOf(false) }
+    // Logan 2026-09-02: a Right whose DOWN closed the channel list overlay
+    // (the overlay consumes it) must not zap on its UP. Only a release whose
+    // press this block saw may fire the short action.
+    var horizDownSeen by remember { mutableStateOf(false) }
+    // Remote Control (Logan spec 2026-07-20): hold-Up "Recently Watched"
+    // overlay. While open, Back dismisses it (guard below) and channel-flip
+    // keys are blocked so Up/Down walk the overlay list instead.
+    val recentsOverlayVisibleState = remember { mutableStateOf(false) }
+    var recentsOverlayVisible by recentsOverlayVisibleState
+    val recentChannelIds by settingsVm.recentChannelIds.collectAsStateWithLifecycle(
+        initialValue = emptyList(),
+    )
+    // Remote Control (Logan spec 2026-07-20 / GH #54): Left-press Channels
+    // overlay + its group sidebar stage. Group choice is overlay-local,
+    // seeded from the guide's active group (initialGroup) on first open.
+    val channelListVisibleState = remember { mutableStateOf(false) }
+    var channelListVisible by channelListVisibleState
+    val channelListSidebarOpenState = remember { mutableStateOf(false) }
+    var channelListSidebarOpen by channelListSidebarOpenState
+    val channelListGroupState = remember { mutableStateOf<String?>(null) }
+    // GH #71: digit keys on a TV remote tune by channel number. Resolves
+    // against the same list the flip / channel-list paths use and tunes
+    // through the same currentIndex write a channel-list pick makes.
+    val channelNumberEntry = com.aeriotv.android.feature.livetv.rememberChannelNumberEntry { entry ->
+        val target = com.aeriotv.android.feature.livetv.resolveChannelNumber(entry, channels)
+        val idx = target?.let { t -> channels.indexOfFirst { it.id == t.id } } ?: -1
+        if (idx >= 0) {
+            channelListVisible = false
+            channelListSidebarOpen = false
+            recentsOverlayVisible = false
+            if (idx != currentIndex) {
+                // Trace: the digit-entry commit IS the press that starts this tune.
+                // Quiet EPG sweep holds off until this tune reaches its first frame.
+                com.aeriotv.android.core.data.repository.EpgSweepGate.onTuneStart()
+                exoHolder.markTunePress(channels[idx].name)
+                currentIndex = idx
+            }
+            true
+        } else false
+    }
+    // Same visible-group derivation as the guide pills (source order ->
+    // Manage Groups sort -> hidden filter), so both surfaces always agree.
+    val hiddenGroups by settingsVm.hiddenGroups.collectAsStateWithLifecycle(initialValue = emptySet())
+    val defaultGroupToken by settingsVm.defaultGroupToken.collectAsStateWithLifecycle(initialValue = "")
+    val groupSortModeRaw by settingsVm.groupSortMode.collectAsStateWithLifecycle(initialValue = "Default")
+    val groupOrderPref by settingsVm.groupOrder.collectAsStateWithLifecycle(initialValue = emptyList())
+    val overlayGroups = remember(channels, hiddenGroups, groupSortModeRaw, groupOrderPref) {
+        val source = channels.asSequence()
+            .map { it.groupTitle }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .toList()
+        val ordered = com.aeriotv.android.feature.livetv.orderGroups(
+            source,
+            com.aeriotv.android.feature.livetv.GroupSortMode.from(groupSortModeRaw),
+            groupOrderPref,
+        )
+        com.aeriotv.android.feature.livetv.groupTokens(
+            ordered.filter { it !in hiddenGroups },
+            hiddenGroups,
+        )
+    }
+    androidx.activity.compose.BackHandler {
+        if (channelListSidebarOpen || channelListVisible) {
+            // Logan 2026-08-06: Back closes the WHOLE channel-list overlay
+            // from any stage (Right is the layer-by-layer step-out: rail ->
+            // list -> player). Previously Back unwound one layer at a time.
+            channelListSidebarOpen = false
+            channelListVisible = false
+        } else if (recentsOverlayVisible) {
+            recentsOverlayVisible = false
+        } else if (isCatchupMode) {
+            // Task #148 milestone B: Back on a catch-up replay exits to where
+            // the user came from (tvOS parity: Menu on the catch-up player
+            // returns to the guide). No mini for a replay - the mini is a
+            // LIVE affordance. The native session revoke runs in onDispose.
+            PlayerDoubleBack.clear()
+            closeCatchupReplay(exoHolder, exoWindowState, miniPlayerVm, context, onClose)
+        } else if (isTvForm) {
+            // #10 back model (Archie 2026-07-02): a SINGLE Back minimizes the
+            // fullscreen player straight to the corner mini. OK/Select is now
+            // what raises the media controls (the tap-target toggles
+            // chromeVisible), so Back no longer needs the old reveal-chrome
+            // first step -- it matches tvOS, where Menu with chrome visible
+            // minimizes, just without the extra press when chrome is hidden.
+            //
+            // Persistent-SurfaceView mini path: flip the root-level
+            // PersistentExoWindow into Mini mode (top-right), promote
+            // MiniPlayerSession to Active. The SurfaceView never reparents --
+            // only its size + position. No reload, no ANR, no fresh-handle
+            // race. The stream just keeps playing. From the mini, Back =
+            // expand / double-Back = top channel (see TvMiniPlayerOverlay);
+            // playback only ever ends by playing something else (tvOS parity:
+            // there is no explicit Stop in fullscreen or the mini).
+            //
+            // Logan 2026-09-14: "Back twice = Close". The first Back does not
+            // minimize immediately any more - it schedules the minimize
+            // PlayerDoubleBack.WINDOW_MS later while the fullscreen player
+            // stays up. A second Back inside that window cancels the timer and
+            // runs the full stop the chrome's X runs (dismiss the mini
+            // session, hide the window, holder.stop(), drop the background
+            // service), so the mini player is never shown at all. If no second
+            // press arrives, the timer fires and minimizes exactly as before.
+            if (PlayerDoubleBack.consumePending()) {
+                miniPlayerVm.dismiss()
+                exoWindowState.hide()
+                exoHolder.stop()
+                com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                    .stop(context)
+                onClose()
+            } else {
+                PlayerDoubleBack.schedule {
+                    exoWindowState.requestMini()
+                    miniPlayerVm.showMiniPlayer()
+                    onClose()
+                }
+            }
+        } else if (isRemote) {
+            // GH #33: while casting / companion-controlling there is NO local
+            // playback to keep alive (LaunchedEffect(isRemote) stopped the local
+            // codec). Back just returns to the scaffold, where the persistent
+            // mini controller (Now Casting / Controlling <TV>) is the re-entry
+            // point. Arming the local audio-only mini here would both start
+            // phone-side background audio AND stack a second card.
+            onClose()
+        } else {
+            // Phone Back (Logan 2026-09-14, TV parity): minimize to the
+            // floating in-app mini window (PhoneMiniPlayer.kt) instead of the
+            // old audio-only chip. The persistent PlayerView only moves into
+            // the corner, so the stream keeps playing with its video, and the
+            // AerioMediaPlaybackService keeps the notification alive. The
+            // top-strip swipe-down dispatches this same Back.
+            miniPlayerVm.showMiniPlayer()
+            currentChannel?.let { _ ->
+                exoWindowState.requestMini()
+                com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                    .startBackground(context)
+            }
+            onClose()
+        }
+    }
+
+    // Chrome + ad-hoc sub-modal state.
+    // chromeVisible declared above (before the BackHandler).
+
+    // Launch-hint: the info pill appears briefly when the user just opened
+    // a channel, then auto-hides. Independent of chromeVisible so the
+    // initial "what am I watching" hint doesn't drag the rest of the
+    // chrome (close button, control bar, dim scrim) with it. After the
+    // first auto-hide the pill follows chromeVisible (i.e. the Back-press
+    // path surfaces it alongside the full chrome).
+    var launchHintActive by remember { mutableStateOf(true) }
+    // Remote Control A2: showProgramInfo action re-arms the same card
+    // without a channel change (OK = info panel in the standard scheme).
+    var programInfoPulse by remember { mutableStateOf(0) }
+    // GH #127: Settings > Player > Pop Up Info Card on Channel Change.
+    val popUpInfoCardOnChange by settingsVm.playerShowChannelInfoCard
+        .collectAsStateWithLifecycle(initialValue = true)
+    var lastInfoPulseSeen by remember { mutableStateOf(0) }
+    LaunchedEffect(currentChannel?.id, programInfoPulse, popUpInfoCardOnChange) {
+        val pulsed = programInfoPulse != lastInfoPulseSeen
+        lastInfoPulseSeen = programInfoPulse
+        // Re-arm whenever the user channel-flips to a new id (or the
+        // showProgramInfo remote action pulses).
+        // Remote Control A2: every successful tune also feeds the
+        // session-scoped last-channel zap memory.
+        currentChannel?.id?.let { exoWindowState.recordTune(it) }
+        // Phones/tablets (2026-10-07): the info card and the controls are one
+        // visibility state, so a channel change wakes the chrome itself
+        // (restarting its timer) instead of a card-only hint window.
+        // GH #127: with Pop Up Info Card on Channel Change off, a channel
+        // change shows nothing by itself; the card still appears with the
+        // controls. The showProgramInfo remote pulse is an explicit request.
+        if (!popUpInfoCardOnChange && !pulsed) {
+            launchHintActive = false
+            return@LaunchedEffect
+        }
+        if (!isTvForm && currentChannel != null) {
+            if (!chromeVisible) chromeReason = "channel change"
+            chromeVisible = true
+            lastInteractionAt = android.os.SystemClock.uptimeMillis()
+        }
+        launchHintActive = true
+        kotlinx.coroutines.delay(LAUNCH_HINT_MS)
+        launchHintActive = false
+    }
+    // TV keeps the card-only tune-in hint (D-pad flips need the chrome hidden);
+    // phones/tablets show the card only with the chrome.
+    val pillVisible = if (isTvForm) chromeVisible || launchHintActive else chromeVisible
+    // The user-facing Audio Only toggle was removed (Radio Mode replaces
+    // it, 2026-10-13); the in-player picture is always on.
+    val audioOnly = false
+    val recordTargetState = remember { mutableStateOf<ProgramInfoTarget?>(null) }
+    var recordTarget by recordTargetState
+    val streamInfoState = remember { mutableStateOf<StreamInfoSnapshot?>(null) }
+    var streamInfo by streamInfoState
+    val subtitlesState = remember { mutableStateOf<SubtitlesState?>(null) }
+    var subtitles by subtitlesState
+    val audioTracksState = remember { mutableStateOf<AudioTracksState?>(null) }
+    var audioTracks by audioTracksState
+    val switchStreamState = remember { mutableStateOf<SwitchStreamState?>(null) }
+    var switchStream by switchStreamState
+    // Marked-current stream id for the Switch Stream sheet. We don't cheaply
+    // know the proxy's active stream, so track the last one the user switched
+    // to (reset on channel change) to radio-mark it on re-open.
+    val switchedStreamIdState = remember(currentChannel?.id) { mutableStateOf<Int?>(null) }
+
+    // Follow EXTERNAL upstream switches we didn't initiate: a stream changed from
+    // the Dispatcharr WebUI Stats page, OR Dispatcharr's automatic server-side
+    // failover when the playing stream dies. Both keep our /proxy/ts/stream
+    // connection open and only mutate the channel's metadata.url (surfaced by
+    // /proxy/ts/status), so the deep live buffer absorbs the splice and ExoPlayer
+    // never self-flushes. Poll status.url while steadily playing a Dispatcharr
+    // channel in the foreground; on a confirmed divergence follow it on the SAME
+    // connection (AerioExoPlayerHolder.followStreamSwitch), which never reopens it.
+    // Gated on an ever-reached-steady LATCH (GH #63): blind
+    // through a true cold start so it can never overlap the cold-start no-data
+    // watchdog, but once the tune has played it keeps watching THROUGH an outage,
+    // because a wedging failover drops the live steady flag at exactly the moment
+    // the switch/dead-session detection is needed. Parked during a manual switch,
+    // any in-flight re-prime, and while the unavailable overlay's own retry loop
+    // owns recovery. repeatOnLifecycle(RESUMED) pauses it when backgrounded/PiP.
+    val followLifecycleOwner = LocalLifecycleOwner.current
+    val isDispatcharrLive = !isCatchupMode && currentChannel?.dispatcharrChannelId != null &&
+        currentChannel?.id?.startsWith("disp:") == true
+    LaunchedEffect(currentChannel?.id, isDispatcharrLive) {
+        if (!isDispatcharrLive) return@LaunchedEffect
+        val ch = currentChannel ?: return@LaunchedEffect
+        val uuid = ch.id.removePrefix("disp:")
+        val proxyUrl = ch.url
+        followLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            var baseline: String? = null     // last-known status.url for this channel/foreground session
+            var backoffMs = 4_000L
+            var deadStatusCount = 0           // consecutive 404/dead-session polls (GH #33 freeze recovery)
+            // GH #63: latch, not a live gate. The poller must stay blind through
+            // a TRUE cold start (the no-data watchdog owns that), but once this
+            // tune has played it must keep watching THROUGH an outage: a
+            // failover that wedges the stream drops the steady flag, and gating
+            // on the live value parked the poller at the exact moment its
+            // switch/dead-session detection was needed. That was the reporter's
+            // "never recovers until I close and reopen".
+            var everSteady = false
+            // GH #117: a follow deferred while a 503 quick retry owned the
+            // player. Holds the prime generation seen at deferral; when the
+            // retry has since reopened the source, that reopen is already on
+            // the new upstream and is adopted without a kept-connection skip.
+            var deferredFollowGen: Long? = null
+            // The Switch Stream radio follows the server: once an external
+            // switch is adopted, re-read status stream_id and replace the
+            // app's last pick so the sheet marks the stream actually playing.
+            suspend fun adoptServerStreamId() {
+                val sid = withContext(Dispatchers.IO) { runCatching { onLoadCurrentStreamId(uuid) }.getOrNull() }
+                    ?: return
+                if (currentChannel?.id != ch.id) return
+                if (switchedStreamIdState.value != sid) {
+                    switchedStreamIdState.value = sid
+                    android.util.Log.i("DispatcharrSwitch", "[SwitchStream] radio follows server stream_id=$sid ch=${ch.id}")
+                }
+            }
+            while (isActive) {
+                delay(backoffMs)
+                if (currentChannel?.id != ch.id) break
+                // a manual switch, any re-prime, an active rewind, or the
+                // unavailable overlay (whose own 5s retry loop owns recovery)
+                // owns the player -> park, re-seed after (a re-prime
+                // mid-rewind would silently yank playback to live)
+                if (switchStream != null || exoHolder.isReprimeInFlight ||
+                    exoHolder.isTimeshifting ||
+                    exoHolder.streamUnavailable.value ||
+                    exoHolder.connectionLimit.value != null) { baseline = null; continue }
+                if (exoHolder.reachedSteadyPlayback.value) everSteady = true
+                // cold-start mutual exclusion with the no-data watchdog: park
+                // only until the stream has been steady ONCE this tune
+                if (!everSteady) { baseline = null; continue }
+                // OFF the main thread: the GET + JSON parse + auth-retry must never run on
+                // Main or it drops frames every tick (a periodic judder with no rebuffer).
+                // Tri-state (review 2026-07-15): null = transport/auth failure
+                // (UNKNOWN -- don't count it as a dead session; a Wi-Fi blip or a
+                // server restart while we coast on the live buffer is not a wedge),
+                // "" = Dispatcharr answered "no active session" (CONFIRMED dead),
+                // url = alive.
+                val statusUrl = withContext(Dispatchers.IO) { runCatching { onLoadCurrentStreamUrl(uuid) }.getOrNull() }
+                if (statusUrl == null) {
+                    // Unknown: transport error. Back off and RE-READ, but never
+                    // reprime on this alone -- reset the dead counter so a real
+                    // outage doesn't accumulate across transient failures.
+                    backoffMs = (backoffMs + 4_000L).coerceAtMost(12_000L)
+                    deadStatusCount = 0
+                    continue
+                }
+                if (statusUrl.isBlank()) {
+                    // Confirmed dead session: Dispatcharr has no active connection
+                    // for this channel. One blank is transient (mid-switch blip) ->
+                    // back off. A SUSTAINED dead session while we still intend to
+                    // PLAY means our read wedged and the proxy dropped us (Shield
+                    // field freeze 2026-07-15: status 404 for >1min, no recovery).
+                    // Hand Dispatcharr a fresh connection via a single close-then-open re-prime.
+                    // Gated on playWhenReady: a user pause legitimately stops our
+                    // read and drops the session -- do NOT force it back to life.
+                    backoffMs = (backoffMs + 4_000L).coerceAtMost(12_000L)
+                    val stillPlaying = withContext(Dispatchers.Main.immediate) {
+                        exoHolder.player?.playWhenReady == true
+                    }
+                    // GH #82 (Streamer, HDHomeRun OTA through Dispatcharr): the
+                    // status endpoint answers 404 for some stream kinds even
+                    // while the proxy is feeding us fine. Three of those made
+                    // the follower reconnect every ~25s (a 3s freeze on every
+                    // channel). A 404 only counts as a dead session when the
+                    // live buffer has also stopped growing.
+                    // 2026-09-14 (Streamer): "stalled" here means the PLAYER is
+                    // starving, not that the socket went quiet -- this proxy
+                    // bursts every 8 to 9.5 s with 10 s buffered, so the old
+                    // silence-only test was true most of the time and made a
+                    // single 404 re-prime into a server teardown, producing a
+                    // 52 s 503 storm. Same predicate as the holder's stall
+                    // status (isLiveIngestStalled), and even a stalled 404 now
+                    // needs TWO consecutive polls, because this server's status
+                    // endpoint lagged real state by ~30 s in the same session.
+                    // Three polls stay for the GH #82 case the rule was written
+                    // for: 404 while bytes are still flowing.
+                    val (ingestAgeMs, ingestStalled) = withContext(Dispatchers.Main.immediate) {
+                        exoHolder.ingestAgeMs() to exoHolder.isLiveIngestStalled()
+                    }
+                    if (ingestAgeMs < 8_000L && !ingestStalled) {
+                        if (deadStatusCount == 0) android.util.Log.i(
+                            "DispatcharrSwitch",
+                            "[FOLLOW] status 404 but ingest healthy (${ingestAgeMs}ms) ch=${ch.id}; not a dead session",
+                        )
+                        deadStatusCount = 0
+                        continue
+                    }
+                    val deadThreshold = if (ingestStalled) 2 else 3
+                    if (stillPlaying) android.util.Log.w(
+                        "DispatcharrSwitch",
+                        "[FOLLOW] 404 poll ${deadStatusCount + 1}/$deadThreshold ch=${ch.id} " +
+                            "(stalled=$ingestStalled, ingest ${ingestAgeMs}ms)",
+                    )
+                    if (stillPlaying && ++deadStatusCount >= deadThreshold && currentChannel?.id == ch.id &&
+                        switchStream == null && !exoHolder.isReprimeInFlight &&
+                        !exoHolder.isTimeshifting
+                    ) {
+                        android.util.Log.w(
+                            "DispatcharrSwitch",
+                            "[FOLLOW] dead session (status 404 x$deadStatusCount) ch=${ch.id}; reconnecting",
+                        )
+                        val ran = exoHolder.reprime(
+                            url = proxyUrl,
+                            title = ch.name,
+                            subtitle = nowProgramme?.title.orEmpty(),
+                            artworkUri = ch.tvgLogo.takeIf { it.isNotBlank() }
+                                ?.let { runCatching { android.net.Uri.parse(it) }.getOrNull() },
+                            reason = "dead session (status 404)",
+                        )
+                        if (ran) { deadStatusCount = 0; baseline = null }
+                    }
+                    continue
+                }
+                backoffMs = 4_000L
+                deadStatusCount = 0
+                if (baseline == null) { baseline = statusUrl; continue }   // seed
+                if (statusUrl != baseline && exoHolder.isFollowingTarget(proxyUrl, statusUrl)) {
+                    // Our own manual switch (or a follow already running for this
+                    // stream): adopt it silently, never follow it a second time.
+                    baseline = statusUrl
+                    continue
+                }
+                if (statusUrl != baseline) {
+                    // confirm with one re-read so a momentary mid-switch blip can't trip us
+                    val confirm = withContext(Dispatchers.IO) { runCatching { onLoadCurrentStreamUrl(uuid) }.getOrNull() }
+                    if (confirm != statusUrl) continue
+                    // GH #63: no live-steady recheck here. everSteady already
+                    // gates the loop, and a wedged (buffering) stream is
+                    // EXACTLY when this reprime is needed.
+                    if (switchStream != null || exoHolder.isReprimeInFlight ||
+                        exoHolder.isTimeshifting || currentChannel?.id != ch.id) continue
+                    // GH #117: skip while the 503 quick retry is pending or the
+                    // player is IDLE / BUFFERING with 0 ms buffered (the retry's
+                    // fresh source). Baseline stays put, so the next poll re-arms.
+                    val (unsafe, gen) = withContext(Dispatchers.Main.immediate) {
+                        exoHolder.isFollowUnsafe() to exoHolder.currentPrimeGeneration
+                    }
+                    if (unsafe) {
+                        if (deferredFollowGen == null) {
+                            deferredFollowGen = gen
+                            android.util.Log.i(
+                                "DispatcharrSwitch",
+                                "[FOLLOW] external switch ch=${ch.id} deferred: quick retry or reopen in progress",
+                            )
+                        }
+                        continue
+                    }
+                    val deferredGen = deferredFollowGen
+                    deferredFollowGen = null
+                    if (deferredGen != null && gen != deferredGen) {
+                        android.util.Log.i(
+                            "DispatcharrSwitch",
+                            "[FOLLOW] external switch ch=${ch.id} adopted: source reopened during the retry",
+                        )
+                        baseline = statusUrl
+                        adoptServerStreamId()
+                        continue
+                    }
+                    android.util.Log.w(
+                        "DispatcharrSwitch",
+                        "[FOLLOW] external switch ch=${ch.id} following onto $statusUrl",
+                    )
+                    // Never a second connection: Dispatcharr already swapped the
+                    // upstream on our socket; a parallel GET trips stream_limit.
+                    val ran = exoHolder.followStreamSwitch(
+                        url = proxyUrl,
+                        title = ch.name,
+                        subtitle = nowProgramme?.title.orEmpty(),
+                        artworkUri = ch.tvgLogo.takeIf { it.isNotBlank() }
+                            ?.let { runCatching { android.net.Uri.parse(it) }.getOrNull() },
+                        targetStreamUrl = statusUrl,
+                    )
+                    if (ran) {
+                        baseline = statusUrl    // adopt new baseline only after the follow ran
+                        adoptServerStreamId()
+                    }
+                }
+            }
+        }
+    }
+
+    // Mid-stream LAN/WAN re-tune failover (iOS PlayerSession.retuneCurrentToActiveURL,
+    // commit e6ca1d207). When the reachability probe flips a verdict while a
+    // Dispatcharr-live channel is playing (the leaving-home-WiFi / WiFi-drop
+    // case), rebuild the /proxy/ts/stream/<uuid> URL from the now-reachable base
+    // and re-prime onto it (single close-then-open; the host changed, so the old
+    // socket is dead weight and must never overlap the new one) instead of freezing on the dead host
+    // and waiting for the watchdog to replay the stale lastPlayUrl. Scoped to the
+    // RESUMED player; parked during a manual switch or any in-flight re-prime.
+    LaunchedEffect(currentChannel?.id, isDispatcharrLive) {
+        if (!isDispatcharrLive) return@LaunchedEffect
+        val ch = currentChannel ?: return@LaunchedEffect
+        val uuid = ch.id.removePrefix("disp:")
+        followLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            onVerdictFlips.collect {
+                if (currentChannel?.id != ch.id) return@collect
+                if (switchStream != null || exoHolder.isReprimeInFlight ||
+                    exoHolder.isTimeshifting) return@collect
+                val newUrl = withContext(Dispatchers.IO) {
+                    runCatching { onRebuildLiveUrl(uuid) }.getOrNull()
+                } ?: return@collect
+                // Only re-prime when the base actually changed; a no-op flip
+                // (same host) costs nothing (mirrors iOS "primary != current" guard).
+                if (newUrl == exoHolder.currentPlayUrl) return@collect
+                if (currentChannel?.id != ch.id || switchStream != null ||
+                    exoHolder.isReprimeInFlight || exoHolder.isTimeshifting) return@collect
+                Log.w(TAG, "[RETUNE] LAN/WAN flip -> re-priming ch=${ch.id} onto $newUrl")
+                exoHolder.reprime(
+                    reason = "LAN/WAN flip",
+                    url = newUrl,
+                    title = ch.name,
+                    subtitle = nowProgramme?.title.orEmpty(),
+                    artworkUri = ch.tvgLogo.takeIf { it.isNotBlank() }
+                        ?.let { runCatching { android.net.Uri.parse(it) }.getOrNull() },
+                    bypassCooldown = true,
+                )
+            }
+        }
+    }
+    val playbackSpeedSheetState = remember { mutableStateOf<Float?>(null) }
+    var playbackSpeedSheet by playbackSpeedSheetState
+    val multiviewPickerOpenState = remember { mutableStateOf(false) }
+    var multiviewPickerOpen by multiviewPickerOpenState
+    // True while the chrome's Options menu or Sleep sheet is open; pauses the
+    // auto-hide timer so the chrome does not fade mid-interaction.
+    val chromeMenuOpenState = remember { mutableStateOf(false) }
+    var chromeMenuOpen by chromeMenuOpenState
+    // GH #33: the cast/companion device chooser (rendered inside the auto-hiding
+    // chrome's castSlot) pins the chrome open via interactionLocked below.
+    val castChooserOpenState = remember { mutableStateOf(false) }
+    var castChooserOpen by castChooserOpenState
+
+    // Sleep timer: stores the wall-clock millis at which the player should close.
+    val sleepEndsAtState = remember { mutableStateOf<Long?>(null) }
+    var sleepEndsAt by sleepEndsAtState
+    val sleepRemainingMillisState = remember { mutableStateOf<Long?>(null) }
+    var sleepRemainingMillis by sleepRemainingMillisState
+
+    // Phase 165: mpvView is now derived from mpvHolder.view (single
+    // persistent View at root). Kept as a local val inside the chrome
+    // Box below for parity with the old factory-captured reference.
+
+    // Publish playback state for the activity's leave-the-app handling: video
+    // (not audio-only) auto-enters PiP; audio-only instead keeps a background
+    // media notification (no PiP). Cleared when the player leaves composition.
+    DisposableEffect(audioOnly, isRemote, currentChannel?.id, nowProgramme?.title) {
+        PipState.nowPlayingTitle = currentChannel?.name ?: "AerioTV"
+        PipState.nowPlayingSubtitle = nowProgramme?.title.orEmpty()
+        PipState.nowPlayingLogo = currentChannel?.tvgLogo?.takeIf { it.isNotBlank() }
+        // GH #33: while casting, the local player is stopped and the TV is
+        // playing, so leaving the phone app must NOT auto-enter PiP (nor arm a
+        // local audio notification) -- the Now-Casting mini controller is the
+        // re-entry path instead.
+        PipState.videoPlaybackActive.value = !audioOnly && !isRemote
+        PipState.audioPlaybackActive.value = audioOnly && !isRemote
+        onDispose {
+            PipState.videoPlaybackActive.value = false
+            PipState.audioPlaybackActive.value = false
+        }
+    }
+
+    val streamUrl = currentChannel?.url.orEmpty()
+
+    // Dead-upstream net: the holder flips this true when a freshly-tuned live
+    // stream produced no data even after a reconnect (AerioExoPlayerHolder
+    // no-data watchdog). Drives the "Channel unavailable" overlay below instead
+    // of an endless black screen. A channel flip / re-tap clears it.
+    val streamUnavailable by exoHolder.streamUnavailable.collectAsStateWithLifecycle()
+    // Task #150: escalation counter for the unavailable overlay's auto-retry
+    // (5s doubling to a 30s cap). Bumped per retry; reset on channel change.
+    val unavailableRetrySerialState = remember(currentChannel?.id) { mutableIntStateOf(0) }
+    var unavailableRetrySerial by unavailableRetrySerialState
+
+    // Returning to the foreground player must always restore video unless
+    // Radio Mode owns the player. A media-session controller (or the old
+    // car-audio path) could have disabled the video track while we were
+    // backgrounded; without this the user came back to a black screen with
+    // sound and the Audio Only toggle's state did not match the real track
+    // (user report). audioOnly stays the single source of truth.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, audioOnly) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // Radio Mode is the only owner of a video-off state now.
+                exoHolder.setVideoTrackEnabled(!exoHolder.radioVideoOff)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Blank-screen guard after a Picture-in-Picture close. MainActivity's
+    // onPictureInPictureModeChanged tears playback down on an X-dismiss
+    // (exoHolder.stop() + exoWindowState.hide()) but has no NavController to
+    // pop THIS route, so the app is left sitting on a live PlayerScreen whose
+    // video window is now Hidden (0dp) and whose chrome has auto-hidden -- a
+    // blank screen that only a force-stop cleared (Z Fold 5 tester repro:
+    // play -> HOME/auto-PiP -> close PiP with its X -> reopen app = blank).
+    // Every IN-APP teardown (explicit chrome X, phone Back-to-mini, multiview
+    // launch) already pairs hide() with onClose(); this catches the one path
+    // that can't reach the NavController. Guarded by windowWasShown so the
+    // initial mount -- Hidden until LaunchedEffect(Unit) requestFullscreen()s
+    // -- never self-pops, and scoped to ON_RESUME so it only fires when we
+    // return to a screen whose window was pulled out from under it while away.
+    var windowWasShown by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        exoWindowState.mode.collect { if (it != ExoWindowState.Mode.Hidden) windowWasShown = true }
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME &&
+                windowWasShown &&
+                exoWindowState.mode.value == ExoWindowState.Mode.Hidden &&
+                // GH #33: while this TV is a live Cast Connect receiver, a channel
+                // change arrives as a cast LOAD that relaunches MainActivity; the
+                // transient Hidden window during that relaunch is NOT a PiP-X
+                // dismiss, so don't pop to the guide -- the incoming deep link
+                // re-tunes the persistent player in place.
+                !castReceiver.isReceivingCast()
+            ) {
+                Log.i(TAG, "resumed onto a hidden player window (PiP X-dismiss) -> popping player")
+                // GH #15: this pop lands on a fresh guide composition with the
+                // mini already dismissed, so no effect restores D-pad focus and
+                // Google TV devices drop Compose focus across the stop/restart,
+                // deadening the remote. Hand the guide a one-shot restore
+                // request before popping.
+                miniPlayerVm.session.requestGuideFocusRestore()
+                onClose()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Live Rewind transport state (declared before the chrome canvas so
+    // the root key handler below can reach it).
+    val tsState by timeshiftController.state.collectAsStateWithLifecycle()
+    val tsPositionWallMsState = remember { mutableStateOf(0L) }
+    var tsPositionWallMs by tsPositionWallMsState
+    val tsPausedState = remember { mutableStateOf(false) }
+    var tsPaused by tsPausedState
+    val livePauseWallMsState = remember { mutableStateOf(0L) }
+
+    // Shared D-pad LEFT/RIGHT scrub for the live rewind buffer (task
+    // #148, tvOS parity; catch-up joins when it unifies into this
+    // player). Each press/repeat steps a PREVIEW position - no seek per
+    // press, because a seek is a whole buffer re-open - and the single
+    // seek commits 650ms after the presses stop. A single press moves by
+    // the Skip Intervals setting; holding accelerates 1x..12x on native
+    // key repeats (10s base step). Active with the
+    // chrome hidden (band-only HUD renders) or with the timeline band
+    // focused (UP from the pill row).
+    val scrubTargetWallMsState = remember { mutableStateOf<Long?>(null) }
+    var scrubTargetWallMs by scrubTargetWallMsState
+    val scrubHudVisibleState = remember { mutableStateOf(false) }
+    var scrubHudVisible by scrubHudVisibleState
+    var scrubAccelCount by remember { mutableStateOf(0) }
+    var scrubLastDirection by remember { mutableStateOf(0) }
+    var scrubLastStepAt by remember { mutableStateOf(0L) }
+    // Bumped on EVERY step so the commit debounce restarts even when the
+    // preview VALUE stops changing (held key clamped at the buffer tail
+    // or head). Without it the value-keyed effect committed once per
+    // ~750ms for the whole hold - 8 identical buffer re-opens in the
+    // 2026-07-11 Streamer field log.
+    var scrubStepSerial by remember { mutableStateOf(0) }
+    // Commit through the SAME fresh-window logic the transport pills
+    // use (the composed state snapshot can lag; Streamer field lesson).
+    val commitScrubWall: (Long) -> Unit = { target ->
+        val w = timeshiftController.activeWriter
+        val head = w?.headWallMs ?: tsState.headWallMs
+        val tail = w?.tailWallMs ?: tsState.tailWallMs
+        if (target >= head - 5_000) {
+            exoHolder.goLive()
+        } else {
+            exoHolder.playTimeshift(target.coerceAtLeast(tail))
+        }
+    }
+
+    // Task #148 milestone B: tune the archive replay + drive the position
+    // ticker. The live prime effect above is fully gated off in this mode.
+    LaunchedEffect(Unit) {
+        if (!isCatchupMode) return@LaunchedEffect
+        exoHolder.httpHeaders = httpHeaders
+        exoHolder.playCatchup(
+            url = catchupUrl,
+            title = catchupTitle.ifBlank { currentChannel?.name },
+            subtitle = currentChannel?.name,
+        )
+        exoHolder.currentChannelId = null
+        // Task #183: throttled position/pause reports for native sessions
+        // ride this ticker (which keeps running while paused - each
+        // accepted report refreshes the session idle TTL, so a long pause
+        // can't expire the session). 20s cadence, immediate on a pause
+        // state flip; one 404 latches reporting off (stable-tag server).
+        var reportUnsupported = false
+        var lastReportAtMs = 0L
+        var lastReportedPaused: Boolean? = null
+        var lastResumeSaveAtMs = android.os.SystemClock.elapsedRealtime()
+        while (true) {
+            catchupPositionMs = (catchupOffsetMs + (exoHolder.player?.contentPosition ?: 0L))
+                .coerceIn(0L, catchupDurationMs)
+            tsPaused = exoHolder.isPaused()
+            if (catchupResumeSettled && exoHolder.isCatchup &&
+                exoHolder.player?.playbackState == androidx.media3.common.Player.STATE_READY
+            ) {
+                catchupResumeMs = catchupPositionMs
+                // GH #116: checkpoint every 30 s while playing, so a kill or
+                // an exit path that skips disposal still resumes.
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                if (nowMs - lastResumeSaveAtMs >= 30_000L) {
+                    lastResumeSaveAtMs = nowMs
+                    com.aeriotv.android.core.playback.CatchupResumeStore.save(
+                        context, initialChannelId, catchupStartMillis,
+                        catchupResumeMs, catchupDurationMs,
+                    )
+                }
+            }
+            if (isNativeCatchup && !reportUnsupported) {
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                val pausedChanged = lastReportedPaused != tsPaused
+                if (pausedChanged || nowMs - lastReportAtMs >= 20_000L) {
+                    lastReportAtMs = nowMs
+                    lastReportedPaused = tsPaused
+                    val url = catchupCurrentUrl
+                    val posSecs = catchupPositionMs / 1000.0
+                    val pausedNow = tsPaused
+                    // Child launch so a slow report can't stall the ticker.
+                    launch {
+                        if (!onReportCatchupPosition(url, posSecs, pausedNow)) {
+                            reportUnsupported = true
+                        }
+                    }
+                }
+            }
+            delay(500)
+        }
+    }
+    // Task #149: revoke the native session when the replay screen leaves
+    // composition (Back, X, nav-away). Re-tunes revoke their outgoing
+    // session inline in commitScrubCatchup.
+    val catchupUrlForRevoke by rememberUpdatedState(catchupCurrentUrl)
+    DisposableEffect(Unit) {
+        onDispose {
+            if (isNativeCatchup) onRevokeCatchup(catchupUrlForRevoke)
+        }
+    }
+    // Re-tune helper: swap the window URL on the same held player.
+    val retuneCatchup: (String, Long) -> Unit = { newUrl, offsetMs ->
+        catchupOffsetMs = offsetMs
+        catchupPositionMs = offsetMs
+        catchupCurrentUrl = newUrl
+        exoHolder.playCatchup(
+            url = newUrl,
+            title = catchupTitle.ifBlank { currentChannel?.name },
+            subtitle = currentChannel?.name,
+        )
+    }
+    // Commit a catch-up scrub: native sessions mint at the EXACT second
+    // (serialized; rapid skips coalesce to the latest target - see
+    // VODPlayerScreen's twin); XC rebuilds the wall-clock URL at the floored
+    // minute (the URL format has nothing finer).
+    val commitScrubCatchup: (Long) -> Unit = { target ->
+        val clamped = target.coerceIn(0L, (catchupDurationMs - 5_000L).coerceAtLeast(0L))
+        if (isNativeCatchup) {
+            if (nativeRemintInFlight) {
+                nativeRemintPendingMs = clamped
+                catchupPositionMs = clamped
+            } else scope.launch {
+                nativeRemintInFlight = true
+                var t = clamped
+                while (true) {
+                    val outgoing = catchupCurrentUrl
+                    val minted = onRemintCatchup(catchupChannelUuid, outgoing, catchupStartMillis + t)
+                    val pending = nativeRemintPendingMs
+                    if (pending != null) {
+                        nativeRemintPendingMs = null
+                        if (minted != null) onRevokeCatchup(minted)
+                        t = pending
+                        continue
+                    }
+                    if (minted == null) {
+                        Log.w(TAG, "[CATCHUP] native re-mint failed; keeping current window")
+                        break
+                    }
+                    onRevokeCatchup(outgoing)
+                    retuneCatchup(minted, t)
+                    Log.i(TAG, "[CATCHUP] native re-tune to ${t / 1000}s")
+                    break
+                }
+                nativeRemintInFlight = false
+            }
+        } else {
+            val absFlooredStart = ((catchupStartMillis + clamped) / 60_000L) * 60_000L
+            val windowOffset = (absFlooredStart - catchupStartMillis).coerceAtLeast(0L)
+            val newUrl = com.aeriotv.android.core.playback.CatchupUrlBuilder.rebuildForOffset(
+                url = catchupUrl,
+                panelTimeZoneId = catchupTz.ifBlank { "UTC" },
+                programmeStartMillis = catchupStartMillis,
+                programmeEndMillis = catchupEndMillis,
+                offsetMillis = windowOffset,
+            )
+            if (newUrl == null) {
+                Log.w(TAG, "[CATCHUP] re-tune URL rebuild failed; ignoring seek")
+            } else {
+                retuneCatchup(newUrl, windowOffset)
+                Log.i(TAG, "[CATCHUP] re-tune to window ${windowOffset / 1000}s")
+            }
+        }
+    }
+    // GH #116: catch-up resume. Same model as the recording player (GH #75):
+    // no up-front choice, playback silently auto-resumes at the saved position
+    // (Apple parity, 2026-10-05). Keyed by channel id + program
+    // start; saved on exit, cleared once playback reaches the end.
+    LaunchedEffect(Unit) {
+        if (!isCatchupMode) return@LaunchedEffect
+        val saved = com.aeriotv.android.core.playback.CatchupResumeStore.get(
+            context, initialChannelId, catchupStartMillis, catchupDurationMs,
+        ) ?: run {
+            Log.i(TAG, "[CATCHUP] no resume entry for $initialChannelId@$catchupStartMillis")
+            catchupResumeSettled = true
+            return@LaunchedEffect
+        }
+        // Let the initial tune come up before re-tuning to the saved spot.
+        var waited = 0L
+        while (exoHolder.player?.playbackState != androidx.media3.common.Player.STATE_READY &&
+            waited < 8_000L
+        ) {
+            delay(200L)
+            waited += 200L
+        }
+        // No playerError gate: the re-tune itself is the recovery path
+        // (native re-mints a fresh session, Xtream rebuilds the window URL).
+        catchupResumeMs = saved
+        commitScrubCatchup(saved)
+        catchupResumeSettled = true
+        Log.i(TAG, "[CATCHUP] resuming at ${saved / 1000L}s")
+    }
+    LaunchedEffect(Unit) {
+        if (!isCatchupMode) return@LaunchedEffect
+        while (true) {
+            delay(1_000L)
+            // ENDED alone is not "reached the end": a revoked session or a
+            // dropped TS connection also ends the progressive source mid-program.
+            if (exoHolder.player?.playbackState == androidx.media3.common.Player.STATE_ENDED &&
+                catchupPositionMs >= catchupDurationMs - com.aeriotv.android.core.playback.CatchupResumeStore.END_MARGIN_MS
+            ) {
+                com.aeriotv.android.core.playback.CatchupResumeStore.clear(
+                    context, initialChannelId, catchupStartMillis,
+                )
+            }
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            if (isCatchupMode) {
+                val ended = exoHolder.player?.playbackState ==
+                    androidx.media3.common.Player.STATE_ENDED &&
+                    catchupPositionMs >= catchupDurationMs - com.aeriotv.android.core.playback.CatchupResumeStore.END_MARGIN_MS
+                // Never observed READY (and no resume applied): keep any entry.
+                if (!ended && catchupResumeMs < 0L) return@onDispose
+                com.aeriotv.android.core.playback.CatchupResumeStore.save(
+                    context, initialChannelId, catchupStartMillis,
+                    if (ended) catchupDurationMs else catchupResumeMs, catchupDurationMs,
+                )
+            }
+        }
+    }
+    val scrubStep: (Int, Boolean) -> Unit = step@{ dir, isRepeat ->
+        if (!tsState.buffering && !isCatchupMode) return@step
+        val now = android.os.SystemClock.uptimeMillis()
+        // Native autorepeat arrives ~every 50ms on some remotes; 250ms
+        // throttle keeps held-scrub speed device-independent (VOD
+        // scrubStep parity).
+        if (isRepeat && now - scrubLastStepAt < 250L) return@step
+        if (dir == scrubLastDirection && now - scrubLastStepAt < 1_000L) {
+            scrubAccelCount += 1
+        } else {
+            scrubAccelCount = 0
+        }
+        scrubLastDirection = dir
+        scrubLastStepAt = now
+        val mult = minOf(12, 1 + scrubAccelCount / 2)
+        if (isCatchupMode) {
+            // Catch-up domain: PROGRAMME-relative ms in [0, duration].
+            val base = scrubTargetWallMs ?: catchupPositionMs
+            scrubTargetWallMs = (base + SkipIntervals.scrubDeltaMs(dir, isRepeat, mult)).coerceIn(0L, catchupDurationMs)
+        } else {
+            val w = timeshiftController.activeWriter
+            val head = w?.headWallMs ?: tsState.headWallMs
+            val tail = w?.tailWallMs ?: tsState.tailWallMs
+            val base = scrubTargetWallMs
+                ?: if (tsState.timeshifting) tsPositionWallMs else head
+            scrubTargetWallMs = (base + SkipIntervals.scrubDeltaMs(dir, isRepeat, mult)).coerceIn(tail, head)
+        }
+        scrubStepSerial += 1
+        scrubHudVisible = true
+        reportInteraction()
+    }
+    // Deferred single commit; the null branch runs after a commit (or
+    // cancel) and lets the HUD linger briefly so the user sees where
+    // playback landed. Keyed on the step serial too so a clamped-value
+    // hold keeps deferring instead of committing mid-hold.
+    LaunchedEffect(scrubTargetWallMs, scrubStepSerial) {
+        val target = scrubTargetWallMs
+        if (target == null) {
+            delay(1_500)
+            scrubHudVisible = false
+        } else {
+            delay(650)
+            if (isCatchupMode) commitScrubCatchup(target) else commitScrubWall(target)
+            scrubTargetWallMs = null
+        }
+    }
+
+    // The video PlayerView is mounted at MainActivity root via
+    // PersistentExoWindow (state-driven Fullscreen / Mini / Hidden).
+    // Our chrome (controls, tap-target, dim, sheets) renders ABOVE
+    // it automatically because the surface uses Android's default
+    // SurfaceView z-order (window UI layer above the dedicated
+    // surface). Box below is the chrome canvas -- transparent
+    // background so the video shows through.
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            // Phase 172: bump lastInteractionAt on every key event while
+            // chrome is visible so the auto-hide timer keeps re-arming.
+            // onPreviewKeyEvent returns false -> doesn't consume; the
+            // event still reaches the chrome buttons below.
+            .onPreviewKeyEvent { event ->
+                // Every key is a user action, whether or not the chrome is up:
+                // gating this on chromeVisible meant the press that REVEALED
+                // the chrome did not seed the countdown.
+                reportInteraction()
+                if (isTvForm && event.nativeKeyEvent.action == android.view.KeyEvent.ACTION_DOWN &&
+                    event.nativeKeyEvent.repeatCount == 0
+                ) {
+                    when (event.nativeKeyEvent.keyCode) {
+                        android.view.KeyEvent.KEYCODE_DPAD_CENTER, android.view.KeyEvent.KEYCODE_ENTER -> "Center"
+                        else -> com.aeriotv.android.ui.tv.TvFocusTrace.nameOf(event)
+                    }?.let { k ->
+                        com.aeriotv.android.ui.tv.TvFocusTrace.player(
+                            "key $k chrome=$chromeVisible mvSheet=$multiviewPickerOpen",
+                        )
+                    }
+                }
+                // GH #71: digit keys (and OK / Back while digits are
+                // pending) belong to channel-number entry on TV. Checked
+                // first so no mapping below can steal a digit; every other
+                // key falls through untouched.
+                if (isTvForm && !isCatchupMode && channelNumberEntry.onKeyEvent(event)) {
+                    return@onPreviewKeyEvent true
+                }
+                // Chrome hidden + rewind buffering: LEFT/RIGHT scrubs the
+                // timeline directly (band-only HUD renders; the single
+                // seek commits after the presses stop). Consume both
+                // actions so the release can't click anything behind.
+                val native = event.nativeKeyEvent
+                // Remote Control A2: OK short/long split. Only engaged when
+                // an okLong action is mapped (e.g. the standard scheme's long-OK =
+                // options menu) AND the chrome is hidden (visible chrome
+                // keeps OK operating the focused control). Short fires on
+                // RELEASE so a hold can fire the long action at the standard
+                // threshold instead; with okLong unmapped (the default map)
+                // this whole branch is skipped and the plain clickable
+                // handles OK exactly as before.
+                if (isTvForm && !chromeVisible && !recentsOverlayVisible && !channelListVisible &&
+                    (native.keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER ||
+                        native.keyCode == android.view.KeyEvent.KEYCODE_ENTER)
+                ) {
+                    val okLongAction = remoteMap.playerAction(com.aeriotv.android.core.remote.RemoteSlot.OK_LONG)
+                    if (okLongAction != com.aeriotv.android.core.remote.PlayerRemoteAction.NONE) {
+                        when (native.action) {
+                            android.view.KeyEvent.ACTION_DOWN -> {
+                                if (native.repeatCount == 0) {
+                                    okLongFired = false
+                                } else if (!okLongFired &&
+                                    (native.isLongPress || native.repeatCount >= 4)
+                                ) {
+                                    okLongFired = true
+                                    exoWindowState.onPlayerRemoteAction?.invoke(okLongAction)
+                                }
+                                return@onPreviewKeyEvent true
+                            }
+                            android.view.KeyEvent.ACTION_UP -> {
+                                if (!okLongFired) {
+                                    exoWindowState.onPlayerRemoteAction?.invoke(
+                                        remoteMap.playerAction(com.aeriotv.android.core.remote.RemoteSlot.OK_SHORT),
+                                    )
+                                }
+                                okLongFired = false
+                                return@onPreviewKeyEvent true
+                            }
+                        }
+                    }
+                }
+                // Remote Control: LEFT/RIGHT on bare fullscreen video
+                // (chrome hidden, no overlay). One unified block, two modes:
+                //  - transport (rewind buffering with a SEEK-mapped slot, or
+                //    ANY catch-up replay): every ACTION_DOWN scrubs, exactly
+                //    the pre-initiative behavior - held keys auto-repeat the
+                //    scrub, the band-only HUD renders, the single seek
+                //    commits after the presses stop;
+                //  - otherwise: short-vs-long split (short fires on RELEASE
+                //    so a hold can fire the long action) - default map:
+                //    Left = channel list, hold-Left = minimize to guide,
+                //    Right = previous-channel zap, hold-Right = program
+                //    info. Was two blocks; the scrub branch's early returns
+                //    (false on DOWN, consume on UP) starved the split of
+                //    every event whenever the live-rewind buffer was warm.
+                if (isTvForm && !chromeVisible && !recentsOverlayVisible && !channelListVisible &&
+                    (native.keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT ||
+                        native.keyCode == android.view.KeyEvent.KEYCODE_DPAD_RIGHT)
+                ) {
+                    val isLeft = native.keyCode == android.view.KeyEvent.KEYCODE_DPAD_LEFT
+                    val shortAction = remoteMap.playerAction(
+                        if (isLeft) com.aeriotv.android.core.remote.RemoteSlot.LEFT_SHORT
+                        else com.aeriotv.android.core.remote.RemoteSlot.RIGHT_SHORT,
+                    )
+                    val longAction = remoteMap.playerAction(
+                        if (isLeft) com.aeriotv.android.core.remote.RemoteSlot.LEFT_LONG
+                        else com.aeriotv.android.core.remote.RemoteSlot.RIGHT_LONG,
+                    )
+                    if (tsState.buffering || isCatchupMode) {
+                        val mappedDir = when (shortAction) {
+                            com.aeriotv.android.core.remote.PlayerRemoteAction.SEEK_BACKWARD -> -1
+                            com.aeriotv.android.core.remote.PlayerRemoteAction.SEEK_FORWARD -> +1
+                            else -> 0
+                        }
+                        // Catch-up replay: LEFT/RIGHT ALWAYS scrub the
+                        // programme, whatever the map says - it's a transport
+                        // context, and the standard scheme maps these slots
+                        // to live-only actions (channel list / zap-back).
+                        val dir = if (mappedDir == 0 && isCatchupMode) {
+                            if (isLeft) -1 else +1
+                        } else {
+                            mappedDir
+                        }
+                        if (dir != 0) {
+                            if (native.action == android.view.KeyEvent.ACTION_DOWN) {
+                                scrubStep(dir, native.repeatCount > 0)
+                            }
+                            return@onPreviewKeyEvent true
+                        }
+                        // Rewind buffer warm but the slot maps to a non-seek
+                        // action (the standard scheme): use the split below.
+                    }
+                    if (shortAction != com.aeriotv.android.core.remote.PlayerRemoteAction.NONE ||
+                        longAction != com.aeriotv.android.core.remote.PlayerRemoteAction.NONE
+                    ) {
+                        when (native.action) {
+                            android.view.KeyEvent.ACTION_DOWN -> {
+                                if (native.repeatCount == 0) {
+                                    horizLongFired = false
+                                    horizDownSeen = true
+                                } else if (!horizLongFired &&
+                                    (native.isLongPress || native.repeatCount >= 4)
+                                ) {
+                                    horizLongFired = true
+                                    if (longAction != com.aeriotv.android.core.remote.PlayerRemoteAction.NONE) {
+                                        exoWindowState.onPlayerRemoteAction?.invoke(longAction)
+                                    }
+                                }
+                                return@onPreviewKeyEvent true
+                            }
+                            android.view.KeyEvent.ACTION_UP -> {
+                                if (horizDownSeen && !horizLongFired &&
+                                    shortAction != com.aeriotv.android.core.remote.PlayerRemoteAction.NONE
+                                ) {
+                                    exoWindowState.onPlayerRemoteAction?.invoke(shortAction)
+                                }
+                                horizLongFired = false
+                                horizDownSeen = false
+                                return@onPreviewKeyEvent true
+                            }
+                        }
+                    }
+                }
+                // TV D-pad UP/DOWN channel-flip is handled by MainActivity
+                // .dispatchKeyEvent via exoWindowState.onLiveChannelFlip (see the
+                // DisposableEffect below). Routing it at the activity level makes
+                // it win over the chrome pill row + Options DropdownMenu popup,
+                // which used to swallow UP/DOWN when the controls were visible.
+                // Non-flip keys (LEFT / RIGHT / OK / Back) still fall through here
+                // to operate the visible controls: return false, don't consume.
+                false
+            },
+    ) {
+
+        // Transparent tap-target above the video to toggle chrome. Vertical drag
+        // on the same layer (while chrome is visible) flips to next/prev channel.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .focusRequester(playbackFocus)
+                .onFocusChanged {
+                    if (it.isFocused) com.aeriotv.android.ui.tv.TvFocusTrace.focus("player:surface")
+                    else com.aeriotv.android.ui.tv.TvFocusTrace.blurred("player:surface")
+                }
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                ) {
+                    // Remote Control map: player okShort. Default =
+                    // toggleControls; any other mapping routes through the
+                    // executor (NONE is a deliberate no-op there).
+                    when (val a = remoteMap.playerAction(com.aeriotv.android.core.remote.RemoteSlot.OK_SHORT)) {
+                        com.aeriotv.android.core.remote.PlayerRemoteAction.TOGGLE_CONTROLS ->
+                            chromeVisible = !chromeVisible
+                        else -> exoWindowState.onPlayerRemoteAction?.invoke(a)
+                    }
+                }
+                .pointerInput(channels.size, chromeVisible, appleTVChannelFlip) {
+                    if (!chromeVisible || !appleTVChannelFlip || channels.size < 2) return@pointerInput
+                    var totalDy = 0f
+                    detectVerticalDragGestures(
+                        onDragStart = { totalDy = 0f },
+                        onDragEnd = {
+                            val abs = abs(totalDy)
+                            if (abs > SWIPE_THRESHOLD_PX && currentIndex >= 0 && channels.isNotEmpty()) {
+                                val direction = if (totalDy < 0f) +1 else -1
+                                val next = (currentIndex + direction)
+                                    .coerceIn(0, channels.lastIndex)
+                                if (next != currentIndex) {
+                                    // Quiet EPG sweep holds off until this tune reaches its first frame.
+                                    com.aeriotv.android.core.data.repository.EpgSweepGate.onTuneStart()
+                                    exoHolder.markTunePress(channels[next].name)
+                                    currentIndex = next
+                                    chromeVisible = true
+                                }
+                            }
+                            totalDy = 0f
+                        },
+                        onVerticalDrag = { _, dy -> totalDy += dy },
+                    )
+                }
+                // Vertical slide in a narrow band at one screen edge adjusts
+                // brightness, the other volume (touch only, both off by
+                // default). Narrow band + a top/bottom exclusion keep it clear
+                // of the channel flip above and the minimize swipe below.
+                .playerEdgeSlideGestures(
+                    enabled = !isTvForm,
+                    brightnessEnabled = playerBrightnessGesture,
+                    volumeEnabled = playerVolumeGesture,
+                    brightnessEdge = playerBrightnessEdge,
+                )
+                // Pinch to switch Fit <-> Fill on touch devices (no-op on TV).
+                // Lives in the SAME chain as the tap / drag handlers: a sibling
+                // overlay Box would win hit testing and swallow every tap.
+                // Tablets (iPad parity): a pinch in below 0.85 also minimizes
+                // to the corner mini, through the same Back path as the
+                // top-strip swipe. This screen is a single stream (multiview
+                // has its own screen) and is never shown while minimized.
+                .videoScalePinch(
+                    settingsVm,
+                    enabled = !isTvForm,
+                    onPinchIn = tabletPinchMinimize(enabled = !isTvForm && !isCatchupMode),
+                )
+                // Swipe down from the top strip = Back = minimize (live only;
+                // catch-up cannot minimize yet, so it gets no gesture); cancels
+                // the channel-flip swipe above when it starts there. Must stay
+                // LAST in this chain (PhoneMiniPlayer.kt).
+                .playerTopSwipeDown(enabled = !isTvForm && !isCatchupMode, drivesWindow = !isRemote),
+        )
+
+        // Transient "Fit" / "Fill" label for the pinch gesture above (no-op on
+        // TV). Non-interactive: the pinch detector itself is a modifier on the
+        // tap layer, since an overlay Box would swallow its taps. All of the
+        // state lives in VideoScale.kt: this composable is register-pressure
+        // sensitive.
+        VideoScaleLabelOverlay(enabled = !isTvForm)
+
+
+        // Dead-upstream net: the holder's no-data watchdog reconnected once and
+        // still got zero bytes, so it flagged the channel unavailable + stopped.
+        // Task #150 (iOS parity): show WHAT failed, keep auto-retrying on an
+        // escalating 5s->30s delay, and offer a manual Retry button. D-pad
+        // up/down still bubbles to the root key handler so channel flips keep
+        // working (a flip clears the flag and resets the escalation).
+        // Client-driven no-first-byte stream failover (wires the holder's
+        // LiveStreamFailover hooks) plus the loading detail line under its
+        // status. One line here: this composable is register-pressure sensitive,
+        // so the whole feature lives in LoadingDetailLine.kt.
+        LiveFailoverStatusOverlay(
+            exoHolder, isTvForm, channels,
+            onLoadChannelStreams, onSwitchChannelStream, onLoadCurrentStreamId,
+        )
+        if (streamUnavailable && isCatchupMode) {
+            CatchupUnavailableCard(
+                exoHolder = exoHolder,
+                onClose = { closeCatchupReplay(exoHolder, exoWindowState, miniPlayerVm, context, onClose) },
+            )
+        } else if (streamUnavailable) {
+            StreamUnavailableCard(
+                exoHolder = exoHolder,
+                isTvForm = isTvForm,
+                unavailableRetrySerialState = unavailableRetrySerialState,
+            )
+        }
+
+        // Live Rewind ticker + chrome overlay live in their own composable
+        // (task #257): the buffer-window head/tail advance every couple of
+        // seconds while a session rolls, and reading that ticking state HERE
+        // recomposed the whole PlayerScreen body each time. The extracted
+        // section reads the ticking state itself so only it recomposes.
+        LiveRewindChromeSection(
+            exoHolder = exoHolder,
+            timeshiftController = timeshiftController,
+            settingsVm = settingsVm,
+            miniPlayerVm = miniPlayerVm,
+            exoWindowState = exoWindowState,
+            castSender = castSender,
+            companionRemote = companionRemote,
+            companionDiscovery = companionDiscovery,
+            scope = scope,
+            currentChannel = currentChannel,
+            nowProgramme = nowProgramme,
+            channels = channels,
+            remoteMap = remoteMap,
+            appleTVChannelFlip = appleTVChannelFlip,
+            liveRewindEnabled = liveRewindEnabled,
+            videoScaleMode = videoScaleMode,
+            isTvForm = isTvForm,
+            isCatchupMode = isCatchupMode,
+            catchupTitle = catchupTitle,
+            catchupDurationMs = catchupDurationMs,
+            chromeVisible = chromeVisible,
+            pillVisible = pillVisible,
+            streamUnavailable = streamUnavailable,
+            catchupPositionMsState = catchupPositionMsState,
+            tsPositionWallMsState = tsPositionWallMsState,
+            tsPausedState = tsPausedState,
+            livePauseWallMsState = livePauseWallMsState,
+            scrubTargetWallMsState = scrubTargetWallMsState,
+            scrubHudVisibleState = scrubHudVisibleState,
+            unavailableRetrySerialState = unavailableRetrySerialState,
+            recordTargetState = recordTargetState,
+            streamInfoState = streamInfoState,
+            subtitlesState = subtitlesState,
+            audioTracksState = audioTracksState,
+            switchStreamState = switchStreamState,
+            switchedStreamIdState = switchedStreamIdState,
+            playbackSpeedSheetState = playbackSpeedSheetState,
+            multiviewPickerOpenState = multiviewPickerOpenState,
+            chromeMenuOpenState = chromeMenuOpenState,
+            castChooserOpenState = castChooserOpenState,
+            sleepEndsAtState = sleepEndsAtState,
+            sleepRemainingMillisState = sleepRemainingMillisState,
+            commitScrubCatchup = commitScrubCatchup,
+            commitScrubWall = commitScrubWall,
+            scrubStep = scrubStep,
+            onLoadChannelStreams = onLoadChannelStreams,
+            onLoadCurrentStreamId = onLoadCurrentStreamId,
+            onRecheckSwitchStreamAllowed = onRecheckSwitchStreamAllowed,
+            reportInteraction = reportInteraction,
+            onClose = onClose,
+            onTuneChannelId = { id ->
+                val idx = channels.indexOfFirst { it.id == id }
+                if (idx >= 0 && idx != currentIndex) currentIndex = idx
+            },
+        )
+
+        // Remote Control: Left-press Channels overlay (GH #54), drawn above
+        // the video and all chrome.
+        if (channelListVisible) {
+            ChannelListOverlaySection(
+                initialGroup = initialGroup,
+                defaultGroupToken = defaultGroupToken,
+                onSetDefaultGroup = settingsVm::setDefaultGroupToken,
+                overlayGroups = overlayGroups,
+                hiddenGroups = hiddenGroups,
+                channels = channels,
+                currentChannel = currentChannel,
+                epgByChannel = epgByChannel,
+                channelListGroupState = channelListGroupState,
+                channelListVisibleState = channelListVisibleState,
+                channelListSidebarOpenState = channelListSidebarOpenState,
+                currentIndexState = currentIndexState,
+            )
+        }
+
+        // Remote Control: hold-Up Recently Watched overlay, drawn above the
+        // video and all chrome (last child of the root Box).
+        if (recentsOverlayVisible) {
+            RecentsOverlaySection(
+                recentChannelIds = recentChannelIds,
+                channels = channels,
+                currentChannel = currentChannel,
+                epgByChannel = epgByChannel,
+                recentsOverlayVisibleState = recentsOverlayVisibleState,
+                currentIndexState = currentIndexState,
+            )
+        }
+        // GH #71: channel-number readout (TV only; the state never fills
+        // on touch devices because digits are only fed on the TV form).
+        if (isTvForm) {
+            com.aeriotv.android.feature.livetv.ChannelNumberEntryOverlay(
+                state = channelNumberEntry,
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp),
+            )
+        }
+    }
+
+    // Auto-hide chrome after AUTO_HIDE_MS of inactivity. Phase 172:
+    // re-arms whenever the user interacts (lastInteractionAt advances),
+    // so D-pad navigation through the chrome buttons resets the timer
+    // instead of letting it fire mid-traversal. The key is
+    // lastInteractionAt -- changing that restarts the LaunchedEffect.
+    // While a menu or sheet is open, pause the auto-hide so the chrome (and the
+    // open panel) stay put while the user interacts. tvOS keeps the Options
+    // panel up until it is dismissed.
+    val interactionLocked = chromeMenuOpen || recordTarget != null || streamInfo != null ||
+        subtitles != null || audioTracks != null || playbackSpeedSheet != null ||
+        switchStream != null || multiviewPickerOpen || castChooserOpen
+    // Publish whether the surf keys should stay at the activity layer (see
+    // ExoWindowState.dpadVerticalCaptured). Chrome, scrub HUD, menus/sheets
+    // and the Recently Watched overlay all release UP/DOWN to Compose focus.
+    androidx.compose.runtime.SideEffect {
+        exoWindowState.dpadVerticalCaptured = !chromeVisible && !scrubHudVisible &&
+            scrubTargetWallMs == null && !recentsOverlayVisible &&
+            !channelListVisible && !interactionLocked
+    }
+    // GH #94 Skip Without Controls: Left/Right stay at the activity layer
+    // while nothing on screen wants them (see ExoWindowState).
+    androidx.compose.runtime.SideEffect {
+        exoWindowState.dpadHorizontalCaptured = !chromeVisible && !recentsOverlayVisible &&
+            !channelListVisible && !interactionLocked && !isCatchupMode
+    }
+    // Same seek the chrome's Rewind / Forward circles run; false when the
+    // transport is disabled (no rolling buffer and no catch-up).
+    val skipHook by androidx.compose.runtime.rememberUpdatedState { forward: Boolean ->
+        val seekEnabled = (tsState.buffering && !isCatchupMode) || isCatchupMode
+        if (!seekEnabled) {
+            false
+        } else {
+            val deltaMs = if (forward) SkipIntervals.forwardMs else -SkipIntervals.backMs
+            if (isCatchupMode) {
+                commitScrubCatchup(catchupPositionMs + deltaMs)
+            } else {
+                val nowWall = if (tsState.timeshifting) tsPositionWallMs else System.currentTimeMillis()
+                commitScrubWall(nowWall + deltaMs)
+            }
+            true
+        }
+    }
+    DisposableEffect(exoWindowState) {
+        exoWindowState.onSkipRequest = { forward -> skipHook(forward) }
+        onDispose {
+            exoWindowState.dpadVerticalCaptured = true
+            exoWindowState.dpadHorizontalCaptured = false
+            exoWindowState.onSkipRequest = null
+        }
+    }
+    // streamUnavailable is a KEY (not just a guard): when it clears on
+    // recovery, this effect must re-fire so the chrome that was pinned open
+    // during the outage auto-hides again. Without it in the keys, the
+    // controls stayed stuck up after the stream came back (Streamer test
+    // 2026-07-12).
+    LaunchedEffect(chromeVisible, lastInteractionAt, interactionLocked, streamUnavailable) {
+        // Never auto-hide while the stream is unavailable: the chrome hosts the
+        // Retry control the user needs, so it must stay put during an outage.
+        if (chromeVisible && !interactionLocked && !streamUnavailable) {
+            delay(PLAYER_CHROME_HIDE_MS)
+            chromeReason = "timer"
+            chromeVisible = false
+        }
+    }
+    // Auto-summon the controls on TV when the stream drops so the focusable
+    // Retry pill is immediately reachable (and re-summon on each retry cycle).
+    LaunchedEffect(streamUnavailable, unavailableRetrySerial) {
+        if (streamUnavailable && isTvForm) chromeVisible = true
+    }
+
+
+    // TV live channel surf via the hardware-key path. MainActivity.dispatchKeyEvent
+    // invokes exoWindowState.onLiveChannelFlip on D-pad UP/DOWN while THIS player
+    // is the frontmost Fullscreen window, so channel flip works even with the
+    // controls overlay visible (Compose focus traversal otherwise consumed UP/DOWN
+    // among the chrome pills / Options popup). currentIndex stays the single source
+    // of truth here. rememberUpdatedState so the long-lived lambda always sees
+    // fresh state without re-registering. Debounced so a held key surfs one channel
+    // per ~120ms instead of skipping wildly. Declines (returns false) while a
+    // menu/sheet is open (interactionLocked) so UP/DOWN navigate those instead.
+    // Task #148 milestone B: no channel flips during a catch-up replay
+    // (tvOS parity: the catch-up tile gates channel-flip off entirely).
+    val flipEnabled by rememberUpdatedState(
+        isTvForm && appleTVChannelFlip && channels.size >= 2 && !isCatchupMode,
+    )
+    val flipLocked by rememberUpdatedState(interactionLocked)
+    val flipIndex by rememberUpdatedState(currentIndex)
+    val flipChannels by rememberUpdatedState(channels)
+    // Task #148 (tvOS parity): UP/DOWN zap only rides fullscreen video
+    // (or the flip's own top-card window). With the bottom chrome
+    // summoned, declining hands the press back to Compose so UP reaches
+    // the focusable timeline and DOWN walks the pills; mid-scrub the
+    // HUD reads as player controls, so zapping would yank the channel
+    // out from under the user.
+    val flipBlockedByChrome by rememberUpdatedState(
+        chromeVisible || scrubHudVisible || scrubTargetWallMs != null ||
+            recentsOverlayVisible || channelListVisible,
+    )
+    var lastFlipAt by remember { mutableStateOf(0L) }
+    DisposableEffect(exoWindowState) {
+        exoWindowState.onLiveChannelFlip = flip@{ delta ->
+            reportInteraction()
+            if (!flipEnabled || flipLocked) return@flip false
+            if (flipBlockedByChrome) return@flip false
+            val list = flipChannels
+            val cur = flipIndex
+            if (cur < 0 || list.isEmpty()) return@flip false
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastFlipAt < FLIP_DEBOUNCE_MS) return@flip true // eat repeats, stay responsive
+            val next = (cur + delta).coerceIn(0, list.lastIndex)
+            if (next != cur) {
+                lastFlipAt = now
+                // Trace: stamp the real D-pad press for press->firstFrame.
+                // Quiet EPG sweep holds off until this tune reaches its first frame.
+                com.aeriotv.android.core.data.repository.EpgSweepGate.onTuneStart()
+                exoHolder.markTunePress(list[next].name)
+                currentIndex = next
+                // NO chromeVisible = true here (task #148, user
+                // directive): a flip surfaces only the top program card
+                // (the launch-hint window re-arms on the channel-id
+                // change), never the bottom player controls - and the
+                // hidden chrome is what keeps follow-up UP/DOWN presses
+                // flipping.
+            }
+            true
+        }
+        onDispose { exoWindowState.onLiveChannelFlip = null }
+    }
+
+    // Remote Control A2: generic player-action executor for mapped slots.
+    // Registered like the flip hook; MainActivity dispatches activity-level
+    // keys (long Up/Down, media keys) here, and PlayerScreen's own key
+    // sites call it for non-default slot assignments. All state reads go
+    // through Compose State delegates, so the lambda always sees fresh
+    // values. Returns false for actions this screen can't run (caller
+    // falls through).
+    DisposableEffect(exoWindowState) {
+        exoWindowState.onPlayerRemoteAction = act@{ action ->
+            // Activity-level dispatch (media keys, long Up/Down, mapped
+            // actions) never reaches this screen's onPreviewKeyEvent, so those
+            // presses used to leave the countdown running from the previous
+            // action -- the chrome then vanished "too soon" after them.
+            reportInteraction()
+            when (action) {
+                com.aeriotv.android.core.remote.PlayerRemoteAction.TOGGLE_CONTROLS -> {
+                    chromeVisible = !chromeVisible
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.SHOW_PROGRAM_INFO -> {
+                    programInfoPulse += 1
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.OPTIONS_MENU -> {
+                    chromeVisible = true
+                    chromeMenuOpen = true
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.MINIMIZE_TO_GUIDE -> {
+                    exoWindowState.requestMini()
+                    miniPlayerVm.showMiniPlayer()
+                    onClose()
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.CHANNEL_LIST -> {
+                    // Left press: Channels overlay (GH #54). A repeat press
+                    // while open just keeps it open; Back dismisses.
+                    if (!isCatchupMode) channelListVisible = true
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.RECENT_CHANNELS -> {
+                    // Hold-Up: Recently Watched overlay (a second hold while
+                    // open just keeps it open; Back / a pick dismisses).
+                    if (!isCatchupMode) recentsOverlayVisible = true
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.OPEN_SEARCH -> {
+                    // Hold-Down: global search. Same handoff shape as
+                    // minimizeToGuide - keep playing in the corner mini so
+                    // the search results land over a live picture - then the
+                    // nav layer pushes the search route.
+                    exoWindowState.requestMini()
+                    miniPlayerVm.showMiniPlayer()
+                    onClose()
+                    onOpenSearch()
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.STOP_PLAYBACK -> {
+                    // Hold-Back (fixed, dispatched by MainActivity): stop
+                    // outright, NO mini promotion. Same teardown as the
+                    // chrome's explicit X-close.
+                    miniPlayerVm.dismiss()
+                    exoWindowState.hide()
+                    exoHolder.stop()
+                    com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                        .stop(context)
+                    onClose()
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.LAST_CHANNEL -> {
+                    // Logan 2026-09-02: Right while an in-player overlay is up
+                    // steps OUT one layer (sidebar -> list -> player); it only
+                    // zaps to the last channel when nothing is overlaid. The
+                    // remote map dispatches here before the overlay's own key
+                    // handler sees the press, so gate it here.
+                    if (channelListSidebarOpen) { channelListSidebarOpen = false; return@act true }
+                    if (channelListVisible) { channelListVisible = false; return@act true }
+                    if (recentsOverlayVisible) { recentsOverlayVisible = false; return@act true }
+                    val zapId = exoWindowState.lastChannelId ?: return@act true
+                    val list = flipChannels
+                    val idx = list.indexOfFirst { it.id == zapId }
+                    if (idx >= 0 && idx != flipIndex && !flipLocked) {
+                        currentIndex = idx
+                    }
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.SEEK_FORWARD -> {
+                    scrubStep(+1, false)
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.SEEK_BACKWARD -> {
+                    scrubStep(-1, false)
+                    true
+                }
+                com.aeriotv.android.core.remote.PlayerRemoteAction.CHANNEL_UP ->
+                    exoWindowState.onLiveChannelFlip?.invoke(+1) ?: false
+                com.aeriotv.android.core.remote.PlayerRemoteAction.CHANNEL_DOWN ->
+                    exoWindowState.onLiveChannelFlip?.invoke(-1) ?: false
+                com.aeriotv.android.core.remote.PlayerRemoteAction.NONE -> true
+                else -> false
+            }
+        }
+        onDispose { exoWindowState.onPlayerRemoteAction = null }
+    }
+
+    // On TV, when the chrome hides (fullscreen video), pull D-pad focus to the
+    // playback surface so the remote's up/down reaches the channel-flip handler
+    // instead of being swallowed by a stale focus target.
+    LaunchedEffect(chromeVisible, isTvForm) {
+        if (isTvForm && !chromeVisible) {
+            delay(100)
+            runCatching { playbackFocus.requestFocus() }
+        }
+    }
+
+    // GH #33: read cast state LIVE at expiry. The effect is keyed only on
+    // sleepEndsAt, so a timer armed before the cast state changes (start/stop
+    // casting after arming) would otherwise branch on the stale captured value
+    // -- closing the player mid-cast, or no-op'ing stopCasting on a dead session
+    // and never closing the resumed local player.
+    val isCastingAtExpiry by rememberUpdatedState(isCasting)
+    val isCompanionAtExpiry by rememberUpdatedState(isCompanion)
+    LaunchedEffect(sleepEndsAt) {
+        val target = sleepEndsAt
+        if (target == null) {
+            sleepRemainingMillis = null
+            return@LaunchedEffect
+        }
+        while (true) {
+            val remaining = target - System.currentTimeMillis()
+            if (remaining <= 0L) {
+                sleepRemainingMillis = null
+                sleepEndsAt = null
+                // GH #33: a sleep timer set from the cast remote ends the CAST
+                // (the local player is already suspended); from the companion
+                // remote it pauses the TV (the TV keeps running -- it's the
+                // user's own device, unlike a cast session); otherwise close.
+                when {
+                    isCastingAtExpiry -> castSender.stopCasting()
+                    isCompanionAtExpiry -> { companionRemote.pause(); onClose() }
+                    else -> onClose()
+                }
+                break
+            }
+            sleepRemainingMillis = remaining
+            delay(1_000L)
+        }
+    }
+
+    PlayerSheets(
+        exoHolder = exoHolder,
+        exoWindowState = exoWindowState,
+        miniPlayerVm = miniPlayerVm,
+        castSender = castSender,
+        companionRemote = companionRemote,
+        isCasting = isCasting,
+        isCompanion = isCompanion,
+        currentChannel = currentChannel,
+        nowProgramme = nowProgramme,
+        recordTargetState = recordTargetState,
+        multiviewPickerOpenState = multiviewPickerOpenState,
+        streamInfoState = streamInfoState,
+        subtitlesState = subtitlesState,
+        audioTracksState = audioTracksState,
+        switchStreamState = switchStreamState,
+        switchedStreamIdState = switchedStreamIdState,
+        playbackSpeedSheetState = playbackSpeedSheetState,
+        scope = scope,
+        onSwitchChannelStream = onSwitchChannelStream,
+        onSaveChannelStreamOrder = onSaveChannelStreamOrder,
+        onRecheckSwitchStreamAllowed = onRecheckSwitchStreamAllowed,
+        onLoadChannelStreamsForReorder = onLoadChannelStreams,
+        onLoadCurrentStreamUrl = onLoadCurrentStreamUrl,
+        onLaunchMultiview = onLaunchMultiview,
+    )
+
+    DisposableEffect(Unit) {
+        onDispose { /* AndroidView.onRelease handles native cleanup. */ }
+    }
+}
+
+
+// Remote Control: Left-press Channels overlay (GH #54), drawn above
+// the video and all chrome (task #257 extraction).
+@Composable
+private fun ChannelListOverlaySection(
+    initialGroup: String,
+    defaultGroupToken: String,
+    onSetDefaultGroup: (String) -> Unit,
+    overlayGroups: List<String>,
+    hiddenGroups: Set<String>,
+    channels: List<M3UChannel>,
+    currentChannel: M3UChannel?,
+    epgByChannel: Map<String, List<EPGProgramme>>,
+    channelListGroupState: MutableState<String?>,
+    channelListVisibleState: MutableState<Boolean>,
+    channelListSidebarOpenState: MutableState<Boolean>,
+    currentIndexState: MutableIntState,
+) {
+    var channelListGroup by channelListGroupState
+    var channelListVisible by channelListVisibleState
+    var channelListSidebarOpen by channelListSidebarOpenState
+    var currentIndex by currentIndexState
+    val active = channelListGroup
+        ?: initialGroup.takeIf { it in overlayGroups }
+        ?: com.aeriotv.android.feature.livetv.fallbackGroupToken(overlayGroups)
+    // Settings > Live TV > Logo Size scales the logos in this list too.
+    val settingsVm: SettingsViewModel = hiltViewModel()
+    val channelLogoSize by settingsVm.channelLogoSize.collectAsStateWithLifecycle(initialValue = 100)
+    ChannelListOverlay(
+        logoScale = com.aeriotv.android.core.ui.liveTvLogoScale(channelLogoSize),
+        groups = overlayGroups,
+        activeGroup = active,
+        defaultToken = defaultGroupToken,
+        onSetDefault = onSetDefaultGroup,
+        channelsFor = { token ->
+            if (token == com.aeriotv.android.feature.playlist.PlaylistViewModel.ALL_GROUPS) {
+                channels.filter { it.groupTitle !in hiddenGroups }
+            } else {
+                channels.filter { it.groupTitle.equals(token, ignoreCase = true) }
+            }
+        },
+        currentChannelId = currentChannel?.id,
+        nowTitleFor = { ch -> epgByChannel[ch.guideMatchKey]?.nowPlaying()?.title },
+        sidebarOpen = channelListSidebarOpen,
+        onSidebarOpenChange = { channelListSidebarOpen = it },
+        onGroupChange = { channelListGroup = it },
+        onSelect = { ch ->
+            channelListVisible = false
+            channelListSidebarOpen = false
+            val idx = channels.indexOfFirst { it.id == ch.id }
+            if (idx >= 0 && idx != currentIndex) currentIndex = idx
+        },
+        onDismiss = {
+            channelListVisible = false
+            channelListSidebarOpen = false
+        },
+    )
+}
+
+// Remote Control: hold-Up Recently Watched overlay, drawn above the
+// video and all chrome (task #257 extraction).
+@Composable
+private fun RecentsOverlaySection(
+    recentChannelIds: List<String>,
+    channels: List<M3UChannel>,
+    currentChannel: M3UChannel?,
+    epgByChannel: Map<String, List<EPGProgramme>>,
+    recentsOverlayVisibleState: MutableState<Boolean>,
+    currentIndexState: MutableIntState,
+) {
+    var recentsOverlayVisible by recentsOverlayVisibleState
+    var currentIndex by currentIndexState
+    RecentChannelsOverlay(
+        recentIds = recentChannelIds,
+        channels = channels,
+        currentChannelId = currentChannel?.id,
+        nowTitleFor = { ch -> epgByChannel[ch.guideMatchKey]?.nowPlaying()?.title },
+        onSelect = { ch ->
+            recentsOverlayVisible = false
+            val idx = channels.indexOfFirst { it.id == ch.id }
+            if (idx >= 0 && idx != currentIndex) currentIndex = idx
+        },
+        onDismiss = { recentsOverlayVisible = false },
+    )
+}
+
+// Modal sheets + pickers hosted by PlayerScreen (task #257 extraction:
+// record, multiview picker, stream info, subtitles, audio tracks, switch
+// stream, playback speed). Bodies moved verbatim; state objects are the
+// parent's so reads/writes hit identical snapshots.
+@Composable
+private fun PlayerSheets(
+    exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
+    exoWindowState: ExoWindowState,
+    miniPlayerVm: MiniPlayerViewModel,
+    castSender: com.aeriotv.android.core.cast.AerioCastSender,
+    companionRemote: com.aeriotv.android.core.cast.companion.CompanionRemoteController,
+    isCasting: Boolean,
+    isCompanion: Boolean,
+    currentChannel: M3UChannel?,
+    nowProgramme: EPGProgramme?,
+    recordTargetState: MutableState<ProgramInfoTarget?>,
+    multiviewPickerOpenState: MutableState<Boolean>,
+    streamInfoState: MutableState<StreamInfoSnapshot?>,
+    subtitlesState: MutableState<SubtitlesState?>,
+    audioTracksState: MutableState<AudioTracksState?>,
+    switchStreamState: MutableState<SwitchStreamState?>,
+    switchedStreamIdState: MutableState<Int?>,
+    playbackSpeedSheetState: MutableState<Float?>,
+    scope: kotlinx.coroutines.CoroutineScope,
+    onSwitchChannelStream: suspend (String, Int) -> String?,
+    onSaveChannelStreamOrder: suspend (Int, List<Int>) -> Unit,
+    onRecheckSwitchStreamAllowed: suspend (String) -> Boolean,
+    onLoadChannelStreamsForReorder: suspend (Int) -> List<StreamOption>,
+    onLoadCurrentStreamUrl: suspend (String) -> String?,
+    onLaunchMultiview: () -> Unit,
+) {
+    val context = LocalContext.current
+    var recordTarget by recordTargetState
+    var multiviewPickerOpen by multiviewPickerOpenState
+    var streamInfo by streamInfoState
+    var subtitles by subtitlesState
+    var audioTracks by audioTracksState
+    var switchStream by switchStreamState
+    val reorderSaveLock = remember { kotlinx.coroutines.sync.Mutex() }
+    var reorderSaveGen by remember { androidx.compose.runtime.mutableIntStateOf(0) }
+    var switchedStreamId by switchedStreamIdState
+    var playbackSpeedSheet by playbackSpeedSheetState
+    recordTarget?.let { target ->
+        RecordProgramSheet(
+            target = target,
+            onDismiss = { recordTarget = null },
+        )
+    }
+    if (multiviewPickerOpen) {
+        val multiviewStore = com.aeriotv.android.feature.multiview.rememberMultiviewStoreHandle()
+        // Snapshot the pre-open staged set so Cancel restores it EXACTLY
+        // (protects any Guide-staged selection from being wiped). Captured at
+        // composition time, i.e. BEFORE the seed LaunchedEffect below runs.
+        val mvSnapshot = remember { multiviewStore.selected.value }
+        val mvSnapshotFocus = remember { multiviewStore.audioFocusedIndex.value }
+        // Seed the now-playing channel as Tile 1 (index 0 = audio focus),
+        // preserving any already-staged tiles behind it. Keyed on Unit so it
+        // runs once per open, never re-clobbering the user's picks.
+        LaunchedEffect(Unit) { currentChannel?.let { multiviewStore.seedCurrent(it) } }
+        AddToMultiviewSheet(
+            currentChannel = currentChannel,
+            multiviewStore = multiviewStore,
+            onLaunch = {
+                multiviewPickerOpen = false
+                PlayerCloseIntent.markMultiviewLaunch()
+                // Stop the single-stream player BEFORE navigating so only the
+                // multiview tiles produce audio (no double-audio). Same teardown
+                // as the proven X-close path; onLaunchMultiview() is LAST because
+                // it pops PLAYER (this very composable) off the back stack.
+                miniPlayerVm.dismiss()
+                exoWindowState.hide()
+                exoHolder.stop()
+                com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                    .stop(context.applicationContext)
+                onLaunchMultiview()
+            },
+            onCancel = {
+                multiviewPickerOpen = false
+                // Restore the exact pre-open selection (NOT clear()), so a
+                // Guide-staged set survives an opened-then-cancelled picker.
+                multiviewStore.restore(mvSnapshot, mvSnapshotFocus)
+            },
+            // BACK / scrim / swipe KEEPS whatever the user just toggled (mirrors
+            // MultiviewScreen's re-entrant picker). Only the explicit "Cancel"
+            // text button (onCancel) reverts to the pre-open snapshot. Without
+            // this, onDismiss defaulted to onCancel and BACK silently discarded
+            // the picks the user added while watching.
+            onDismiss = { multiviewPickerOpen = false },
+        )
+    }
+    streamInfo?.let { snapshot ->
+        StreamInfoSheet(
+            snapshot = snapshot,
+            onDismiss = { streamInfo = null },
+        )
+    }
+    subtitles?.let { state ->
+        SubtitlesSheet(
+            tracks = state.tracks,
+            currentTrackId = state.currentSid,
+            onSelect = { sid ->
+                exoHolder.player?.selectSubtitleTrack(sid)
+                subtitles = null
+            },
+            onDismiss = { subtitles = null },
+        )
+    }
+    audioTracks?.let { state ->
+        AudioTracksSheet(
+            tracks = state.tracks,
+            currentTrackId = state.currentAid,
+            onSelect = { aid ->
+                exoHolder.player?.selectAudioTrack(aid)
+                audioTracks = null
+            },
+            onDismiss = { audioTracks = null },
+        )
+    }
+    switchStream?.let { state ->
+        SwitchStreamSheet(
+            streams = state.streams,
+            currentStreamId = state.currentStreamId,
+            onSelect = { id ->
+                val ch = currentChannel
+                switchStream = null
+                if (ch != null) {
+                    // Optimistic radio mark; every failure path below puts the
+                    // previous one back (Apple SwitchStreamView parity).
+                    val previousSwitched = switchedStreamId
+                    switchedStreamId = id
+                    fun revert() {
+                        if (switchedStreamId == id) switchedStreamId = previousSwitched
+                    }
+                    val uuid = ch.id.removePrefix("disp:")
+                    val proxyUrl = ch.url
+                    scope.launch {
+                        // --- Why this dance (all verified against Dispatcharr source) ---
+                        // change_stream applies the switch to the LIVE session, usually
+                        // ASYNCHRONOUSLY (owner:false -> Redis event, applied by the owner
+                        // worker). The owner swaps the upstream IN PLACE on the running
+                        // stream_manager and resets its buffer; the new stream's bytes
+                        // arrive on our existing connection. Any reconnect is harmful:
+                        // a SECOND concurrent GET counts against user.stream_limit, and at
+                        // limit 1 Dispatcharr terminates our player's connection, the
+                        // channel drops to 0 clients (channel_shutdown_delay=0 stops it)
+                        // and the next GET cold-resolves to the DEFAULT stream, undoing
+                        // the switch (measured 2026-09-15). So:
+                        //   1. Confirm the switch actually landed: poll /status until
+                        //      status.url == the change_stream url. We gate on URL, never
+                        //      stream_id (the event-apply path refreshes metadata.url but
+                        //      leaves stream_id stale 20+s, so stream_id false-negatives).
+                        //   2. Keep the connection and let ExoPlayer play through the
+                        //      splice. No reopen on silence: Dispatcharr fails over itself;
+                        //      only a fatal player error or a confirmed dead session reopens.
+                        val first = runCatching { onSwitchChannelStream(uuid, id) }
+                        val newUrl = first.getOrNull()
+                        if (newUrl.isNullOrBlank()) {
+                            revert()
+                            val error = first.exceptionOrNull()
+                            Log.w(TAG, "[SwitchStream] change_stream failed stream=$id: ${error?.message ?: "no url in response"}")
+                            Toast.makeText(
+                                context,
+                                if (error != null) switchStreamFailureMessage("switch the stream", SWITCH_DENIED_MESSAGE, error)
+                                else SWITCH_NOT_CONFIRMED_MESSAGE,
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            if ((error as? com.aeriotv.android.core.network.DispatcharrHttpFailure)?.status == 403) {
+                                // The server says the level changed: re-read it
+                                // so the Switch Stream gate follows.
+                                onRecheckSwitchStreamAllowed("403 on change_stream")
+                            }
+                            return@launch
+                        }
+
+                        // confirm: poll status.url == target within budgetMs (strict equality)
+                        suspend fun confirm(target: String, budgetMs: Long): Boolean {
+                            val end = android.os.SystemClock.elapsedRealtime() + budgetMs
+                            while (android.os.SystemClock.elapsedRealtime() < end) {
+                                if (currentChannel?.id != ch.id || switchedStreamId != id) return false
+                                if (onLoadCurrentStreamUrl(uuid) == target) return true
+                                delay(150)
+                            }
+                            return false
+                        }
+                        var targetUrl = newUrl
+                        var confirmed = confirm(newUrl, 6_000L)
+                        if (!confirmed) {
+                            // Safe retry: re-issue once (may now hit the owner:true direct
+                            // path), brief re-confirm. Never re-prime blind on timeout.
+                            val u2 = runCatching { onSwitchChannelStream(uuid, id) }.getOrNull()
+                            if (!u2.isNullOrBlank()) { targetUrl = u2; confirmed = confirm(u2, 3_000L) }
+                        }
+                        if (currentChannel?.id != ch.id || switchedStreamId != id) return@launch
+                        if (!confirmed) {
+                            revert()
+                            Toast.makeText(
+                                context,
+                                SWITCH_NOT_CONFIRMED_MESSAGE,
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            return@launch
+                        }
+
+                        Toast.makeText(context, "Switching stream...", Toast.LENGTH_SHORT).show()
+                        // GH #33: while casting, the phone must NOT start a local decode.
+                        // change_stream already landed server-side (confirmed above), so the
+                        // channel's /proxy/ts/ URL now serves the switched upstream -- re-tune
+                        // the RECEIVER to the same channel and let the TV follow. Re-priming
+                        // the local player here would spin up a parallel decode (and phone-side
+                        // audio) alongside the cast. The switch follow below is local-only.
+                        if (isCasting) {
+                            castSender.setRemoteChannel(ch.id)
+                            return@launch
+                        }
+                        if (isCompanion) {
+                            // Same reasoning for the companion path: the switch
+                            // landed server-side; re-tune the TV, never the phone.
+                            companionRemote.setRemoteChannel(ch.id, ch.name)
+                            return@launch
+                        }
+                        // Follow the switched upstream on the kept connection (see
+                        // AerioExoPlayerHolder.followStreamSwitch).
+                        exoHolder.followStreamSwitch(
+                            url = proxyUrl,
+                            title = ch.name,
+                            subtitle = nowProgramme?.title.orEmpty(),
+                            artworkUri = ch.tvgLogo.takeIf { it.isNotBlank() }
+                                ?.let { runCatching { android.net.Uri.parse(it) }.getOrNull() },
+                            bypassCooldown = true,
+                            // Registers the target at once, so the follow-poller's next
+                            // poll adopts this status change instead of re-following it.
+                            targetStreamUrl = targetUrl,
+                        )
+                    }
+                }
+            },
+            onDismiss = { switchStream = null },
+            canReorder = com.aeriotv.android.ui.LocalIsDispatcharrAdmin.current &&
+                currentChannel?.dispatcharrChannelId != null,
+            saving = state.saving,
+            onReorder = { ids ->
+                val chPk = currentChannel?.dispatcharrChannelId ?: return@SwitchStreamSheet
+                // Read the LIVE state, not the captured one: a drop right after
+                // a refetch otherwise wrote the pre-refetch list back.
+                switchStream = (switchStream ?: return@SwitchStreamSheet).copy(saving = true)
+                val gen = ++reorderSaveGen
+                scope.launch {
+                    // Saves run one at a time in drop order (touch drags stay
+                    // live while a PATCH is in flight), so the last drop wins.
+                    val fresh = reorderSaveLock.withLock {
+                    // Fresh user level before the write; a demoted account gets
+                    // the permission message and the server's order back, with
+                    // no PATCH sent.
+                    val allowed = onRecheckSwitchStreamAllowed("stream reorder save")
+                    val failure = if (allowed) {
+                        runCatching { onSaveChannelStreamOrder(chPk, ids) }.exceptionOrNull()
+                    } else null
+                    if (!allowed) {
+                        Log.w(TAG, "[SwitchStream] reorder skipped ch=$chPk: account is not a Dispatcharr admin on a fresh read")
+                        Toast.makeText(
+                            context,
+                            REORDER_DENIED_MESSAGE,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    } else if (failure == null) {
+                        Log.i(TAG, "[SwitchStream] reorder saved ch=$chPk order=$ids")
+                    } else {
+                        val status = (failure as? com.aeriotv.android.core.network.DispatcharrHttpFailure)?.status
+                        Log.w(TAG, "[SwitchStream] reorder failed status=${status ?: -1} ch=$chPk: ${failure.message}")
+                        Toast.makeText(
+                            context,
+                            switchStreamFailureMessage("save the stream order", REORDER_DENIED_MESSAGE, failure),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        if (status == 403) onRecheckSwitchStreamAllowed("403 on stream reorder")
+                    }
+                    // Refetch either way so the sheet shows the server's order.
+                    runCatching { onLoadChannelStreamsForReorder(chPk) }.getOrNull()
+                    }
+                    // Only the newest save's refetch updates the sheet; an older
+                    // one would flash the order back while a later save runs.
+                    if (gen != reorderSaveGen) return@launch
+                    val open = switchStream ?: return@launch
+                    switchStream = open.copy(
+                        streams = fresh?.takeIf { it.isNotEmpty() } ?: open.streams,
+                        saving = false,
+                    )
+                }
+            },
+        )
+    }
+    playbackSpeedSheet?.let { current ->
+        PlaybackSpeedSheet(
+            currentSpeed = current,
+            onSelect = { speed ->
+                exoHolder.player?.applySpeed(speed)
+                playbackSpeedSheet = null
+            },
+            onDismiss = { playbackSpeedSheet = null },
+        )
+    }
+}
+
+// Live Rewind ticker + the chrome overlay (task #257). Extracted from the
+// PlayerScreen body so the ticking reads (buffer window head/tail, wall
+// position, catch-up position) recompose ONLY this section instead of the
+// whole screen. Same-file private composable; all state objects are the
+// parent's, passed as MutableState so reads/writes hit identical snapshots.
+@Composable
+private fun LiveRewindChromeSection(
+    exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
+    timeshiftController: com.aeriotv.android.core.timeshift.TimeshiftController,
+    settingsVm: SettingsViewModel,
+    miniPlayerVm: MiniPlayerViewModel,
+    exoWindowState: ExoWindowState,
+    castSender: com.aeriotv.android.core.cast.AerioCastSender,
+    companionRemote: com.aeriotv.android.core.cast.companion.CompanionRemoteController,
+    companionDiscovery: com.aeriotv.android.core.cast.companion.CompanionDiscovery,
+    scope: kotlinx.coroutines.CoroutineScope,
+    currentChannel: M3UChannel?,
+    nowProgramme: EPGProgramme?,
+    channels: List<M3UChannel>,
+    remoteMap: com.aeriotv.android.core.remote.RemoteControlMap,
+    appleTVChannelFlip: Boolean,
+    liveRewindEnabled: Boolean,
+    videoScaleMode: String,
+    isTvForm: Boolean,
+    isCatchupMode: Boolean,
+    catchupTitle: String,
+    catchupDurationMs: Long,
+    chromeVisible: Boolean,
+    pillVisible: Boolean,
+    streamUnavailable: Boolean,
+    catchupPositionMsState: MutableState<Long>,
+    tsPositionWallMsState: MutableState<Long>,
+    tsPausedState: MutableState<Boolean>,
+    livePauseWallMsState: MutableState<Long>,
+    scrubTargetWallMsState: MutableState<Long?>,
+    scrubHudVisibleState: MutableState<Boolean>,
+    unavailableRetrySerialState: MutableIntState,
+    recordTargetState: MutableState<ProgramInfoTarget?>,
+    streamInfoState: MutableState<StreamInfoSnapshot?>,
+    subtitlesState: MutableState<SubtitlesState?>,
+    audioTracksState: MutableState<AudioTracksState?>,
+    switchStreamState: MutableState<SwitchStreamState?>,
+    switchedStreamIdState: MutableState<Int?>,
+    playbackSpeedSheetState: MutableState<Float?>,
+    multiviewPickerOpenState: MutableState<Boolean>,
+    chromeMenuOpenState: MutableState<Boolean>,
+    castChooserOpenState: MutableState<Boolean>,
+    sleepEndsAtState: MutableState<Long?>,
+    sleepRemainingMillisState: MutableState<Long?>,
+    commitScrubCatchup: (Long) -> Unit,
+    commitScrubWall: (Long) -> Unit,
+    scrubStep: (Int, Boolean) -> Unit,
+    onLoadChannelStreams: suspend (Int) -> List<StreamOption>,
+    onLoadCurrentStreamId: suspend (String) -> Int?,
+    onRecheckSwitchStreamAllowed: suspend (String) -> Boolean,
+    reportInteraction: () -> Unit,
+    onClose: () -> Unit,
+    /** Keep Recent Channels Live: tune a kept channel from the Options menu. */
+    onTuneChannelId: (String) -> Unit = {},
+) {
+    val context = LocalContext.current
+    val keptLive by timeshiftController.retainedChannels.collectAsStateWithLifecycle()
+    // Own collector: this section is where the ticking window state is READ
+    // at composition, so its emissions invalidate only this scope.
+    val tsState by timeshiftController.state.collectAsStateWithLifecycle()
+    // Settings > Remote Control > Show remote hints.
+    val showRemoteHints by settingsVm.showRemoteHints
+        .collectAsStateWithLifecycle(initialValue = true)
+    // Resolution / frame rate readout for the band's right edge. Recomputed
+    // only on video-size / track changes, never polled.
+    val boundPlayerForBadge by exoHolder.playerInstance.collectAsStateWithLifecycle()
+    // Keyed on the channel so a flip clears the badge instead of showing the
+    // previous channel's numbers until the new format arrives.
+    val formatBadge = rememberVideoFormatBadge(boundPlayerForBadge, currentChannel?.id)
+    // Bottom-left pipeline readout ("ExoPlayer · TS"), from the holder's
+    // actual media source (Apple "AVPlayer · Remux TS" parity).
+    val pipelineLabel by exoHolder.pipelineLabel.collectAsStateWithLifecycle()
+    val badgeConfig = androidx.compose.ui.platform.LocalConfiguration.current
+    val showTouchFormatBadge = badgeConfig.smallestScreenWidthDp >= 600 ||
+        badgeConfig.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    var catchupPositionMs by catchupPositionMsState
+    var tsPositionWallMs by tsPositionWallMsState
+    var tsPaused by tsPausedState
+    var livePauseWallMs by livePauseWallMsState
+    var scrubTargetWallMs by scrubTargetWallMsState
+    var scrubHudVisible by scrubHudVisibleState
+    var unavailableRetrySerial by unavailableRetrySerialState
+    var recordTarget by recordTargetState
+    var streamInfo by streamInfoState
+    var subtitles by subtitlesState
+    var audioTracks by audioTracksState
+    var switchStream by switchStreamState
+    var switchedStreamId by switchedStreamIdState
+    var playbackSpeedSheet by playbackSpeedSheetState
+    var multiviewPickerOpen by multiviewPickerOpenState
+    var chromeMenuOpen by chromeMenuOpenState
+    var castChooserOpen by castChooserOpenState
+    var sleepEndsAt by sleepEndsAtState
+    var sleepRemainingMillis by sleepRemainingMillisState
+    // Live Rewind: the ticker that keeps the buffer window and
+    // playback wall-position fresh while a session is rolling. Wall
+    // position = the wall time playback entered the buffer + the
+    // player's position within that open (each re-open resets
+    // contentPosition to 0, so the sum stays correct across scrub
+    // re-opens). State declarations live in PlayerScreen so the root
+    // key handler can drive the D-pad scrub.
+    val tickerLifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(tsState.buffering) {
+        if (!tsState.buffering) return@LaunchedEffect
+        // STARTED-gated: without this the 500ms wakeup ran for the
+        // whole time the app sat backgrounded behind PiP.
+        tickerLifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        while (tsState.buffering) {
+            timeshiftController.refreshWindow()
+            tsPaused = exoHolder.isPaused()
+            if (tsState.timeshifting) {
+                val pos = exoHolder.player?.currentPosition ?: 0L
+                tsPositionWallMs = tsState.baseWallMs + pos
+                // Cable-DVR catch-up snap: riding the write head keeps
+                // ExoPlayer in perpetual BUFFERING (it can never build
+                // its minimum buffer against a source that grows in
+                // real time). When playback closes to within a few
+                // seconds of the head, return to the direct stream.
+                // READY gate: a freshly-prepared buffer source reports
+                // meaningless positions while BUFFERING, which made
+                // the snap bounce straight back to live on entry
+                // (Streamer field test).
+                if (!exoHolder.isPaused() &&
+                    exoHolder.player?.playbackState == androidx.media3.common.Player.STATE_READY &&
+                    tsPositionWallMs >= tsState.headWallMs - 4_000
+                ) {
+                    exoHolder.goLive()
+                }
+            }
+            kotlinx.coroutines.delay(500)
+        }
+        }
+    }
+
+    // App Behaviors > Player Info Card: element toggles for the chrome's
+    // program info card only. Collected here so they apply live.
+    val cardShowChannelLogo by settingsVm.playerCardShowChannelLogo
+        .collectAsStateWithLifecycle(initialValue = true)
+    val cardShowChannelName by settingsVm.playerCardShowChannelName
+        .collectAsStateWithLifecycle(initialValue = true)
+    val cardShowProgramName by settingsVm.playerCardShowProgramName
+        .collectAsStateWithLifecycle(initialValue = true)
+    val cardShowProgramTime by settingsVm.playerCardShowProgramTime
+        .collectAsStateWithLifecycle(initialValue = true)
+    val cardShowProgramSubtitle by settingsVm.playerCardShowProgramSubtitle
+        .collectAsStateWithLifecycle(initialValue = true)
+    val cardShowProgramDescription by settingsVm.playerCardShowProgramDescription
+        .collectAsStateWithLifecycle(initialValue = true)
+    val infoCardPrefs = PlayerInfoCardPrefs(
+        showChannelLogo = cardShowChannelLogo,
+        showChannelName = cardShowChannelName,
+        showProgramName = cardShowProgramName,
+        showProgramTime = cardShowProgramTime,
+        showProgramSubtitle = cardShowProgramSubtitle,
+        showProgramDescription = cardShowProgramDescription,
+    )
+    PlayerChromeOverlay(
+        channel = currentChannel,
+        nowProgramme = nowProgramme,
+        infoCardPrefs = infoCardPrefs,
+        keptLive = keptLive,
+        onKeptTune = onTuneChannelId,
+        onKeptStop = timeshiftController::stopRetainedChannel,
+        onKeptStopAll = timeshiftController::stopAllRetainedByUser,
+        timeshiftState = if (tsState.buffering) tsState else null,
+        timeshiftPositionWallMs = tsPositionWallMs,
+        // Live TV with pause/rewind OFF: the transport comes from Live Rewind,
+        // so hint that it's a setting rather than silently showing no controls.
+        // Only when the channel COULD buffer (raw TS) -- not HLS/DASH live.
+        showLiveRewindHint = !isCatchupMode && !liveRewindEnabled &&
+            currentChannel?.url?.takeIf { it.isNotBlank() }
+                ?.let { exoHolder.canBufferLiveRewind(it) } == true,
+        // Task #148 milestone B: catch-up transport context.
+        catchupMode = isCatchupMode,
+        catchupTitle = catchupTitle,
+        catchupPositionMs = catchupPositionMs,
+        catchupDurationMs = catchupDurationMs,
+        onCatchupSeekTo = { target -> commitScrubCatchup(target) },
+        isPlayerPaused = tsPaused,
+        onRewindTogglePause = {
+            when {
+                exoHolder.isTimeshifting -> {
+                    exoHolder.setPaused(!exoHolder.isPaused())
+                }
+                tsState.buffering && !exoHolder.isPaused() -> {
+                    // Cable-seamless pause: nothing switches, the frame
+                    // just freezes. The controller quietly brings up the
+                    // independent filler so the buffer keeps growing
+                    // underneath a long pause.
+                    livePauseWallMs = System.currentTimeMillis()
+                    exoHolder.setPaused(true)
+                    timeshiftController.onLivePaused()
+                }
+                tsState.buffering && exoHolder.isPaused() && livePauseWallMs > 0 -> {
+                    val pausedForMs = System.currentTimeMillis() - livePauseWallMs
+                    if (pausedForMs <= 6_000) {
+                        // Short pause: resume the untouched live
+                        // pipeline. Zero switch, zero glitch.
+                        exoHolder.setPaused(false)
+                        timeshiftController.onLiveResumedAtEdge()
+                    } else {
+                        // Long pause: one switch onto the buffer at the
+                        // pause point; the filler covered the gap.
+                        exoHolder.setPaused(false)
+                        exoHolder.playTimeshift(livePauseWallMs - 1_000)
+                    }
+                    livePauseWallMs = 0L
+                }
+                else -> exoHolder.setPaused(!exoHolder.isPaused())
+            }
+        },
+        onRewindSeekWall = { target ->
+            // Read the buffer window FRESH from the writer at action
+            // time: the composed state snapshot can lag (the Streamer
+            // test turned a -30s skip into -122s off a stale head).
+            val w = timeshiftController.activeWriter
+            val head = w?.headWallMs ?: tsState.headWallMs
+            val tail = w?.tailWallMs ?: tsState.tailWallMs
+            if (target >= head - 5_000) {
+                exoHolder.goLive()
+            } else {
+                exoHolder.playTimeshift(target.coerceAtLeast(tail))
+            }
+        },
+        onGoLive = { exoHolder.goLive() },
+        scrubPreviewWallMs = scrubTargetWallMs,
+        scrubHudVisible = scrubHudVisible,
+        onScrubStep = scrubStep,
+        onScrubCommit = {
+            // OK on the focused timeline: commit the pending scrub
+            // immediately instead of waiting out the debounce.
+            scrubTargetWallMs?.let { target ->
+                if (isCatchupMode) commitScrubCatchup(target) else commitScrubWall(target)
+                scrubTargetWallMs = null
+            }
+        },
+        chromeVisible = chromeVisible,
+        pillVisible = pillVisible,
+        isTv = isTvForm,
+        // Cast Connect (GH #33): phone/tablet Cast button, only on a build
+        // with a registered Cast App ID. Live channels cast their identity to
+        // the Android-TV receiver.
+        castSlot = if (!isTvForm && castSender.castConfigured) {
+            {
+                com.aeriotv.android.feature.cast.CastIconButton(
+                    sender = castSender,
+                    companionRemote = companionRemote,
+                    companionDiscovery = companionDiscovery,
+                    onChooserOpenChange = { castChooserOpen = it },
+                )
+            }
+        } else {
+            null
+        },
+        // Focusable Retry in the standard controls while the stream is
+        // unavailable (the center card's button can't take remote focus).
+        connectionIssue = streamUnavailable,
+        onRetry = {
+            unavailableRetrySerial += 1
+            exoHolder.retryUnavailable()
+        },
+        // Remote hint strip: generated from the user's EFFECTIVE map plus the
+        // player's live mode, so a remapped button is named as the user set
+        // it and a slot that does nothing here drops out. Off when the
+        // "Show remote hints" toggle is off.
+        // TV: always. Tablets (sw >= 600 dp) in both orientations and phones
+        // in landscape (fullscreen) show the same readout, as the iPad and
+        // iPhone landscape chrome do; portrait phones stay as they were.
+        formatBadge = if (isTvForm || showTouchFormatBadge) formatBadge else null,
+        pipelineLabel = if (isTvForm || showTouchFormatBadge) pipelineLabel else null,
+        hintPairs = if (isTvForm && showRemoteHints) {
+            com.aeriotv.android.core.remote.RemoteControlHints.livePlayerStripHints(
+                map = remoteMap,
+                catchupMode = isCatchupMode,
+                rewindBuffering = tsState.buffering,
+                channelFlip = appleTVChannelFlip && channels.size >= 2,
+                controlsVisible = true,
+            )
+        } else {
+            emptyList()
+        },
+        // Explicit X tap = user is done with this channel; clear the mini-player
+        // session, destroy the held MPV instance, and stop the background
+        // PlaybackService so the notification disappears. System back keeps
+        // the session + service alive instead (handled by BackHandler above).
+        // Phase 172: stop() rather than destroy() so the persistent
+        // SurfaceView mounted at MainActivity root stays alive --
+        // the next channel tap plays instantly on the existing
+        // handle. destroy() set holder.view=null and the next
+        // LaunchedEffect(currentChannel.id) couldn't find a view to
+        // playFile on, leaving subsequent channels permanently
+        // stuck.
+        onClose = {
+            PlayerDoubleBack.clear()
+            miniPlayerVm.dismiss()
+            exoWindowState.hide()
+            exoHolder.stop()
+            com.aeriotv.android.core.playback.AerioMediaPlaybackService
+                .stop(context)
+            onClose()
+        },
+        onAddToMultiview = { multiviewPickerOpen = true },
+        onShowRecord = { target -> recordTarget = target },
+        onShowStreamInfo = {
+            streamInfo = exoHolder.player?.captureStreamInfo() ?: StreamInfoSnapshot(
+                videoLines = listOf("(player not ready)"),
+                audioLines = emptyList(),
+                cacheLines = emptyList(),
+                syncLines = emptyList(),
+            )
+        },
+        onShowSwitchStream = {
+            val ch = currentChannel ?: return@PlayerChromeOverlay
+            val chPk = ch.dispatcharrChannelId ?: return@PlayerChromeOverlay
+            val uuid = ch.id.removePrefix("disp:")
+            scope.launch {
+                // Re-read the user level before opening: an admin can promote
+                // or demote the account at any time, and the picker follows
+                // the live answer (fail closed), not the launch-time one.
+                if (!onRecheckSwitchStreamAllowed("Switch Stream open")) {
+                    Toast.makeText(
+                        context,
+                        SWITCH_DENIED_MESSAGE,
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@launch
+                }
+                val streams = onLoadChannelStreams(chPk)
+                // Prefer the in-session selection for the radio mark: after an
+                // event-apply switch the server leaves /proxy/ts/status's stream_id
+                // stale (it only refreshes url), so switchedStreamId is the truthful
+                // "what we last switched to". Fall back to status stream_id when we
+                // haven't switched anything this session (correct on first read).
+                // Server first: when status names a stream that the app did
+                // not pick and the follow loop has adopted an external switch,
+                // switchedStreamId already holds the server's id. Otherwise
+                // the app's own pick wins over a stale event-apply stream_id.
+                val current = onLoadCurrentStreamId(uuid)
+                val marked = switchedStreamId ?: current
+                if (current != null && marked == current) {
+                    Log.i(TAG, "[SwitchStream] radio follows server stream_id=$current")
+                }
+                switchStream = SwitchStreamState(
+                    streams = streams,
+                    currentStreamId = marked,
+                )
+            }
+        },
+        onShowSubtitles = {
+            val player = exoHolder.player ?: return@PlayerChromeOverlay
+            subtitles = SubtitlesState(
+                tracks = player.readSubtitleTracks(),
+                currentSid = player.readCurrentSid(),
+            )
+        },
+        onShowAudioTracks = {
+            val player = exoHolder.player ?: return@PlayerChromeOverlay
+            audioTracks = AudioTracksState(
+                tracks = player.readAudioTracks(),
+                currentAid = player.readCurrentAid(),
+            )
+        },
+        onShowPlaybackSpeed = {
+            val player = exoHolder.player ?: return@PlayerChromeOverlay
+            playbackSpeedSheet = player.readSpeed()
+        },
+        videoScaleLabel = videoScaleLabel(videoScaleMode),
+        onCycleVideoScale = { settingsVm.cycleVideoScaleMode(videoScaleMode) },
+        // Radio Mode (Android#127): keep this channel's audio, drop to the
+        // Live TV tab with the Radio card. Hidden while casting or remote.
+        onRadioMode = if (castSender.state.value is com.aeriotv.android.core.cast.AerioCastSender.State.Connected || isCatchupMode || currentChannel == null) null else ({
+            currentChannel?.let { ch ->
+                com.aeriotv.android.feature.player.RadioMode.start(context, ch)
+                miniPlayerVm.dismiss()
+                onClose()
+            }
+        }),
+        onSetSleepMinutes = { minutes ->
+            sleepEndsAt = if (minutes == 0) null else System.currentTimeMillis() + minutes * 60_000L
+        },
+        sleepRemainingMillis = sleepRemainingMillis,
+        onInteractingChange = { chromeMenuOpen = it },
+        // Focus moves and clicks inside the chrome are user actions too, and
+        // they arrive as focus events rather than keys on some remotes.
+        onInteraction = reportInteraction,
+    )
+}
+
+// Leaving a catch-up replay (Back, or Go Back on the unavailable card): the
+// same teardown as the chrome X. The replay runs in the shared holder with the
+// persistent window in Fullscreen, and a bare stop() + pop left that window
+// Fullscreen under the guide. MainActivity then kept routing D-pad Up/Down to a
+// player that was gone (the remote went dead on the guide). Hidden is the only
+// valid mode once nothing plays.
+private fun closeCatchupReplay(
+    exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
+    exoWindowState: ExoWindowState,
+    miniPlayerVm: MiniPlayerViewModel,
+    context: android.content.Context,
+    onClose: () -> Unit,
+) {
+    miniPlayerVm.dismiss()
+    exoWindowState.hide()
+    exoHolder.stop()
+    com.aeriotv.android.core.playback.AerioMediaPlaybackService.stop(context)
+    onClose()
+}
+
+// Task #148 milestone B: a catch-up 4xx means the provider has no
+// archive for this window (flag-but-no-archive class). Retrying
+// can't conjure one, so no auto-reconnect - show why + Go Back.
+@Composable
+private fun CatchupUnavailableCard(
+    exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
+    onClose: () -> Unit,
+) {
+    val lastErrorText by exoHolder.lastErrorText.collectAsStateWithLifecycle()
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.72f))
+            .padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "Catch-up Unavailable",
+            style = MaterialTheme.typography.headlineSmall,
+            color = Color.White,
+        )
+        // A 4xx really means "no archive"; anything else (decoder,
+        // network) gets neutral copy so we don't blame the provider
+        // for a local failure.
+        val noArchive = lastErrorText.orEmpty().let {
+            it.contains("404") || it.contains("Not Found", ignoreCase = true) ||
+                it.contains("BAD_HTTP_STATUS")
+        }
+        Text(
+            text = if (noArchive) {
+                "Your provider doesn't have an archive for this programme."
+            } else {
+                "Playback of this programme's archive failed."
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.72f),
+            textAlign = TextAlign.Center,
+        )
+        if (!lastErrorText.isNullOrBlank()) {
+            Text(
+                text = lastErrorText.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.6f),
+                textAlign = TextAlign.Center,
+            )
+        }
+        Button(onClick = onClose) {
+            Text("Go Back")
+        }
+    }
+}
+
+// Dead-upstream net: the holder's no-data watchdog reconnected once and
+// still got zero bytes, so it flagged the channel unavailable + stopped.
+// Task #150 (iOS parity): show WHAT failed, keep auto-retrying on an
+// escalating 5s->30s delay, and offer a manual Retry button.
+@Composable
+private fun StreamUnavailableCard(
+    exoHolder: com.aeriotv.android.core.playback.AerioExoPlayerHolder,
+    isTvForm: Boolean,
+    unavailableRetrySerialState: MutableIntState,
+) {
+    var unavailableRetrySerial by unavailableRetrySerialState
+    val lastErrorText by exoHolder.lastErrorText.collectAsStateWithLifecycle()
+    var retryCountdown by remember { mutableIntStateOf(0) }
+    var reconnecting by remember { mutableStateOf(false) }
+    LaunchedEffect(unavailableRetrySerial) {
+        reconnecting = false
+        // Flat 5s between every auto-retry (Archie, 2026-07-12).
+        var remaining = 5
+        while (remaining > 0) {
+            retryCountdown = remaining
+            kotlinx.coroutines.delay(1_000)
+            remaining -= 1
+        }
+        retryCountdown = 0
+        reconnecting = true
+        unavailableRetrySerial += 1
+        exoHolder.retryUnavailable()
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.72f))
+            .padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "Channel Unavailable",
+            style = MaterialTheme.typography.headlineSmall,
+            color = Color.White,
+        )
+        if (!lastErrorText.isNullOrBlank()) {
+            Text(
+                text = lastErrorText.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.85f),
+                textAlign = TextAlign.Center,
+            )
+        }
+        Text(
+            text = when {
+                reconnecting -> "Reconnecting…"
+                retryCountdown > 0 -> "Retrying in ${retryCountdown}s"
+                else -> " "
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.72f),
+        )
+        // Phone/tablet: tappable Retry on the card itself. On TV the
+        // Retry lives in the standard controls (focusable via the
+        // remote) - the card stays informational there.
+        if (!isTvForm) {
+            Button(onClick = {
+                reconnecting = true
+                unavailableRetrySerial += 1
+                exoHolder.retryUnavailable()
+            }) {
+                Text("Retry Now")
+            }
+        }
+        Text(
+            text = if (isTvForm) {
+                "Retry is highlighted below - press Select. Back to exit, or D-pad up/down to change channels."
+            } else {
+                "Press Back to exit, or use the D-pad up/down to change channels."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.White.copy(alpha = 0.6f),
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+// GH #22: a tapped id that is NOT in the active playlist's channel list --
+// surface it and offer the way out instead of dying quietly (see the call
+// site for the full rationale).
+@Composable
+private fun ChannelNotAvailableCard(onClose: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "Channel Not Available",
+            style = MaterialTheme.typography.headlineSmall,
+            color = Color.White,
+        )
+        Text(
+            text = "This channel isn't in the active playlist. If you just " +
+                "switched playlists, go back and pick it again from the " +
+                "refreshed guide.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.72f),
+            textAlign = TextAlign.Center,
+        )
+        Button(onClick = onClose) {
+            Text("Go Back")
+        }
+    }
+}
+
+// Event channels whose stream isn't assigned yet render this instead of a
+// silent black screen (see the call site for the full rationale).
+@Composable
+private fun NoStreamAssignedCard(onClose: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(
+            text = "No Stream Assigned",
+            style = MaterialTheme.typography.headlineSmall,
+            color = Color.White,
+        )
+        Text(
+            text = "This channel doesn't have a stream yet. Event channels " +
+                "usually get one shortly before air time.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.White.copy(alpha = 0.72f),
+            textAlign = TextAlign.Center,
+        )
+        Button(onClick = onClose) {
+            Text("Go Back")
+        }
+    }
+}
+
+private data class SubtitlesState(
+    val tracks: List<SubtitleTrack>,
+    val currentSid: Int?,
+)
+
+private data class AudioTracksState(
+    val tracks: List<AudioTrack>,
+    val currentAid: Int?,
+)
+
+private data class SwitchStreamState(
+    val streams: List<StreamOption>,
+    val currentStreamId: Int?,
+    val saving: Boolean = false,
+)
+
+/**
+ * EntryPoint accessor so this Composable can grab the holder + window
+ * state singletons without routing through hiltViewModel (which would
+ * create them per-instance).
+ *
+ * The capture-stream-info / read-tracks / read-speed extension
+ * functions that used to live here moved to ExoPlayerReaders.kt
+ * (task #66). All chrome callbacks now read from / write to the
+ * ExoPlayer directly via those extensions.
+ */
+@EntryPoint
+@InstallIn(SingletonComponent::class)
+interface PlayerScreenEntryPoint {
+    fun exoPlayerHolder(): com.aeriotv.android.core.playback.AerioExoPlayerHolder
+    fun exoWindowState(): ExoWindowState
+    fun timeshiftController(): com.aeriotv.android.core.timeshift.TimeshiftController
+    fun castSender(): com.aeriotv.android.core.cast.AerioCastSender
+    fun castReceiver(): com.aeriotv.android.core.cast.AerioCastReceiverController
+    fun companionRemote(): com.aeriotv.android.core.cast.companion.CompanionRemoteController
+    fun companionDiscovery(): com.aeriotv.android.core.cast.companion.CompanionDiscovery
+    fun companionHost(): com.aeriotv.android.core.cast.companion.CompanionHostController
+}
+
+/** One-shot marker so the Live Rewind dispose can tell a multiview launch
+ *  (not retained) from a user close (retained with Keep Recent Channels Live). */
+internal object PlayerCloseIntent {
+    @Volatile private var multiview = false
+    fun markMultiviewLaunch() { multiview = true }
+    fun consumeMultiviewLaunch(): Boolean = multiview.also { multiview = false }
+}
+
+
+/** Apple SwitchStreamView wording, word for word. */
+private const val SWITCH_NOT_CONFIRMED_MESSAGE =
+    "The switch didn't take effect. The server may be busy; the current stream is unchanged."
+
+/** Plain denial lines for a pre-check denial or a 403, identical to Apple
+ *  SwitchStreamFlow.switchDeniedMessage / reorderDeniedMessage. */
+internal const val SWITCH_DENIED_MESSAGE =
+    "Your Dispatcharr account can't switch streams. Switching needs an administrator account."
+internal const val REORDER_DENIED_MESSAGE =
+    "Your Dispatcharr account can't reorder streams. Reordering needs an administrator account."
+
+/**
+ * Switch Stream / reorder failure line, identical to Apple
+ * SwitchStreamFlow.failureMessage: a 403 returns [deniedMessage]; otherwise
+ * "Couldn't switch the stream (HTTP 500): <server text>", or "Couldn't switch
+ * the stream (HTTP 500)." when the server sent no text, or "Couldn't switch
+ * the stream: <error>" with no HTTP status.
+ */
+internal fun switchStreamFailureMessage(action: String, deniedMessage: String, error: Throwable): String {
+    val http = error as? com.aeriotv.android.core.network.DispatcharrHttpFailure
+    if (http != null) {
+        if (http.status == 403) return deniedMessage
+        val reason = http.reason?.trim().orEmpty()
+        return if (reason.isNotEmpty()) "Couldn't $action (HTTP ${http.status}): $reason"
+        else "Couldn't $action (HTTP ${http.status})."
+    }
+    return "Couldn't $action: ${error.message ?: error.javaClass.simpleName}"
+}

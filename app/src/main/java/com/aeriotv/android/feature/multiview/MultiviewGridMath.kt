@@ -1,0 +1,500 @@
+package com.aeriotv.android.feature.multiview
+
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import kotlin.math.ceil
+import kotlin.math.sqrt
+
+/**
+ * Selectable multiview layout (iOS `MultiviewLayoutMode`, issue #48). One
+ * global, persisted choice for all tile counts; the picker lives in the tile
+ * context menu.
+ *
+ * `key` is the persisted DataStore value (AppPreferences.multiviewLayoutMode);
+ * `displayName` is the menu label. Ported 1:1 from
+ * `Features/Multiview/MultiviewGridMath.swift`.
+ */
+enum class MultiviewLayoutMode(val key: String, val displayName: String) {
+    /** The built-in default layout for the current count (layout1..layout9). */
+    Auto("auto", "Default"),
+
+    /** Balanced equal-size grid, landscape-preferred, last partial row centered. */
+    EvenGrid("evenGrid", "Even Grid"),
+
+    /** One large hero tile on the left with the rest stacked on the right. */
+    Spotlight("spotlight", "Spotlight"),
+
+    /** 6 only: the 5-tile hero layout with the empty bottom-right cell filled. */
+    HeroCorner("heroCorner", "Hero + Corner"),
+
+    /**
+     * One full-width column: every tile stacked top to bottom, equal heights.
+     *
+     * In portrait this is what Auto already picks for most counts, but on a TV
+     * (always landscape) nothing else produces a top/bottom split, so this is
+     * the only route to one there. Unlike the tables above it ignores container
+     * shape entirely: an explicit pick should stack in either orientation, not
+     * silently turn back into columns on rotation.
+     */
+    Stacked("stacked", "Stacked");
+
+    companion object {
+        fun from(key: String?): MultiviewLayoutMode =
+            entries.firstOrNull { it.key == key } ?: Auto
+
+        /**
+         * The grid-SHAPE modes worth offering at a given tile count. Spotlight is
+         * deliberately NOT a grid-shape option: it is exposed only as the per-tile
+         * "Spotlight This Tile" action (which picks a specific hero), because a
+         * grid-wide Spotlight was just "Spotlight on the first tile" and duplicated
+         * that action. So the picker only appears where a real alternative shape
+         * exists: 3/5 (Even Grid) and 6 (Hero + Corner).
+         *
+         * Stacked joins 2/3/4, which is why 2 and 4 now offer a picker at all:
+         * on a TV (always landscape) nothing else produces a top/bottom split.
+         * It stops at 4 because a 16:9 screen split 5+ ways vertically leaves
+         * each tile a sliver too short to letterbox video into. Counts 7/8/9
+         * and <= 1 still have only Default, so the picker stays hidden there.
+         */
+        fun available(forTileCount: Int): List<MultiviewLayoutMode> = when (forTileCount) {
+            2, 4 -> listOf(Auto, Stacked)
+            3 -> listOf(Auto, EvenGrid, Stacked)
+            5 -> listOf(Auto, EvenGrid)
+            6 -> listOf(Auto, HeroCorner)
+            else -> emptyList()
+        }
+    }
+}
+
+enum class NeighborDirection { Left, Right, Up, Down }
+
+/**
+ * Pure geometry port of iOS `MultiviewGridMath`
+ * (`Features/Multiview/MultiviewGridMath.swift`): turns
+ * (mode, tileCount, containerSize, spacing) into per-tile rects so Android and
+ * iOS/tvOS render the same shapes. Works in whatever unit width/height are
+ * given -- Dp values for on-screen placement, px for pointer hit-testing.
+ *
+ * The Android grid supplies its own inter-tile gap via a per-tile `.padding`,
+ * so callers pass `spacing = 0` here; the layout SHAPES are identical either
+ * way (spacing only shrinks tiles uniformly). The `spacing` parameter is kept
+ * for a faithful 1:1 mapping to the Swift.
+ *
+ * The layout1..layout9 table describes a LANDSCAPE (or square) container. A
+ * container taller than it is wide takes the portrait path instead: the hero
+ * shapes transpose (big tile on top, followers underneath) and the uniform
+ * grids re-shape to stack, so a 2-up splits top/bottom rather than left/right.
+ * Rotation needs no extra plumbing -- MultiviewScreen already re-runs this from
+ * a BoxWithConstraints, so a new container size picks the matching table.
+ */
+object MultiviewGridMath {
+
+    private fun rect(x: Float, y: Float, w: Float, h: Float) = Rect(x, y, x + w, y + h)
+
+    /**
+     * Resolve rects for an explicit layout MODE. Falls back to the per-count
+     * default for any mode that does not apply to the current count.
+     */
+    fun rects(
+        mode: MultiviewLayoutMode,
+        count: Int,
+        width: Float,
+        height: Float,
+        spacing: Float = 0f,
+    ): List<Rect> = when (mode) {
+        MultiviewLayoutMode.Auto -> autoRects(count, width, height, spacing)
+        MultiviewLayoutMode.EvenGrid -> evenGridRects(count, width, height, spacing)
+        MultiviewLayoutMode.Spotlight -> spotlightRects(count, width, height, spacing)
+        MultiviewLayoutMode.HeroCorner ->
+            if (count == 6) heroCornerRects(width, height, spacing)
+            else autoRects(count, width, height, spacing)
+        MultiviewLayoutMode.Stacked -> stackedRects(count, width, height, spacing)
+    }
+
+    /**
+     * One full-width column, equal heights, in reading order. Orientation plays
+     * no part: the user asked for a stack, so it stacks either way.
+     */
+    fun stackedRects(count: Int, w: Float, h: Float, s: Float): List<Rect> {
+        if (count <= 0 || w <= 0f || h <= 0f) return emptyList()
+        val n = count.coerceAtMost(9)
+        return gridRects(cols = 1, rows = n, count = n, w = w, h = h, s = s)
+    }
+
+    /**
+     * Tile-INDEXED rects with spotlight reconciliation (iOS
+     * `MultiviewLayoutView.tileLayout`). Spotlight is active when the Spotlight
+     * MODE is chosen OR a per-tile spotlight index is set; the hero tile takes
+     * the big rect[0] and the rest fill rect[1..] in tile order, so a toggle
+     * animates as a grow/shrink rather than a reshuffle. `spotlightIndex` is the
+     * tile position of the per-tile Spotlight selection (null when unset); the
+     * hero falls back to the first tile when only the MODE was picked.
+     */
+    fun resolvedRects(
+        mode: MultiviewLayoutMode,
+        count: Int,
+        spotlightIndex: Int?,
+        width: Float,
+        height: Float,
+        spacing: Float = 0f,
+    ): List<Rect> {
+        val spotActive =
+            (mode == MultiviewLayoutMode.Spotlight || spotlightIndex != null) && count > 1
+        if (spotActive) {
+            val spot = spotlightRects(count, width, height, spacing)
+            if (spot.size == count) {
+                // Clamp so exactly one tile claims spot[0]; a stale/out-of-range
+                // spotlightIndex would otherwise leave every tile pulling from
+                // spot[1..] and run off the end (IndexOutOfBounds).
+                val hero = (spotlightIndex ?: 0).takeIf { it in 0 until count } ?: 0
+                val out = ArrayList<Rect>(count)
+                var nextSmall = 1
+                for (i in 0 until count) {
+                    out.add(if (i == hero) spot[0] else spot[nextSmall++])
+                }
+                return out
+            }
+        }
+        return rects(mode, count, width, height, spacing)
+    }
+
+    // ── auto: the per-count default table ────────────────────────────────
+
+    private fun autoRects(count: Int, w: Float, h: Float, s: Float): List<Rect> {
+        if (count <= 0 || w <= 0f || h <= 0f) return emptyList()
+        if (isPortrait(w, h)) return portraitRects(count.coerceAtMost(9), w, h, s)
+        return when (count.coerceAtMost(9)) {
+            1 -> layout1(w, h)
+            2 -> layout2(w, h, s)
+            3 -> layout3(w, h, s)
+            4 -> layout4(w, h, s)
+            5 -> layout5(w, h, s)
+            6 -> layout6(w, h, s)
+            7 -> layout7(w, h, s)
+            8 -> layout8(w, h, s)
+            9 -> layout9(w, h, s)
+            else -> emptyList()
+        }
+    }
+
+    private fun layout1(w: Float, h: Float) = listOf(rect(0f, 0f, w, h))
+
+    /** Two tiles side-by-side, full height. */
+    private fun layout2(w: Float, h: Float, s: Float): List<Rect> {
+        val tw = (w - s) / 2
+        return listOf(
+            rect(0f, 0f, tw, h),
+            rect(tw + s, 0f, tw, h),
+        )
+    }
+
+    /** Big tile left (2/3 width, full height); two small stacked right (1/3, half each). */
+    private fun layout3(w: Float, h: Float, s: Float): List<Rect> {
+        val bigW = (w - s) * 2 / 3
+        val smallW = w - bigW - s
+        val smallH = (h - s) / 2
+        return listOf(
+            rect(0f, 0f, bigW, h),
+            rect(bigW + s, 0f, smallW, smallH),
+            rect(bigW + s, smallH + s, smallW, smallH),
+        )
+    }
+
+    /** Classic 2x2. */
+    private fun layout4(w: Float, h: Float, s: Float): List<Rect> =
+        uniformGrid(cols = 2, rows = 2, w = w, h = h, s = s)
+
+    /**
+     * 3x3's top-left 2x2 merged into one big tile, then 4 small tiles fill the
+     * right column (2) and the bottom row's left two cells; the (col2,row2)
+     * corner stays empty. Order: big -> (2,0) -> (2,1) -> (0,2) -> (1,2).
+     */
+    private fun layout5(w: Float, h: Float, s: Float): List<Rect> {
+        val cellW = (w - 2 * s) / 3
+        val cellH = (h - 2 * s) / 3
+        val bigW = 2 * cellW + s
+        val bigH = 2 * cellH + s
+        val col2X = 2 * (cellW + s)
+        val row2Y = 2 * (cellH + s)
+        return listOf(
+            rect(0f, 0f, bigW, bigH),
+            rect(col2X, 0f, cellW, cellH),
+            rect(col2X, cellH + s, cellW, cellH),
+            rect(0f, row2Y, cellW, cellH),
+            rect(cellW + s, row2Y, cellW, cellH),
+        )
+    }
+
+    /** 3 columns x 2 rows. */
+    private fun layout6(w: Float, h: Float, s: Float): List<Rect> =
+        uniformGrid(cols = 3, rows = 2, w = w, h = h, s = s)
+
+    /** 3x3 with bottom-left + bottom-right empty; centers the 7th tile at (1,2). */
+    private fun layout7(w: Float, h: Float, s: Float): List<Rect> {
+        val tw = (w - 2 * s) / 3
+        val th = (h - 2 * s) / 3
+        val rects = ArrayList<Rect>(7)
+        for (row in 0 until 2) {
+            for (col in 0 until 3) {
+                rects.add(rect(col * (tw + s), row * (th + s), tw, th))
+            }
+        }
+        rects.add(rect(tw + s, 2 * (th + s), tw, th))
+        return rects
+    }
+
+    /** 3x3 with the bottom-center cell (1,2) empty. */
+    private fun layout8(w: Float, h: Float, s: Float): List<Rect> {
+        val tw = (w - 2 * s) / 3
+        val th = (h - 2 * s) / 3
+        val positions = listOf(
+            0 to 0, 1 to 0, 2 to 0,
+            0 to 1, 1 to 1, 2 to 1,
+            0 to 2, /* skip (1,2) */ 2 to 2,
+        )
+        return positions.map { (col, row) ->
+            rect(col * (tw + s), row * (th + s), tw, th)
+        }
+    }
+
+    /** Full 3x3. */
+    private fun layout9(w: Float, h: Float, s: Float): List<Rect> =
+        uniformGrid(cols = 3, rows = 3, w = w, h = h, s = s)
+
+    /** Uniform cols x rows grid, reading order (row-major, top-left first). */
+    private fun uniformGrid(cols: Int, rows: Int, w: Float, h: Float, s: Float): List<Rect> {
+        val tw = (w - (cols - 1) * s) / cols
+        val th = (h - (rows - 1) * s) / rows
+        val rects = ArrayList<Rect>(cols * rows)
+        for (row in 0 until rows) {
+            for (col in 0 until cols) {
+                rects.add(rect(col * (tw + s), row * (th + s), tw, th))
+            }
+        }
+        return rects
+    }
+
+    // ── evenGrid: balanced equal-size grid, partial last row centered ────
+
+    fun evenGridRects(count: Int, w: Float, h: Float, s: Float): List<Rect> {
+        if (count <= 0 || w <= 0f || h <= 0f) return emptyList()
+        val n = count.coerceAtMost(9)
+        val cols: Int
+        val rows: Int
+        if (isPortrait(w, h)) {
+            // A tall container gets its shape from bestFitGrid instead, so the
+            // tiles stack rather than squeezing 16:9 video into narrow columns.
+            val fit = bestFitGrid(n, w, h, s)
+            cols = fit.first
+            rows = fit.second
+        } else {
+            rows = maxOf(1, sqrt(n.toDouble()).toInt())
+            cols = ceil(n.toDouble() / rows).toInt()
+        }
+        return gridRects(cols, rows, n, w, h, s)
+    }
+
+    /**
+     * `cols x rows` in reading order with a centered partial final row. Shared
+     * by [evenGridRects] and the portrait tables.
+     */
+    private fun gridRects(cols: Int, rows: Int, count: Int, w: Float, h: Float, s: Float): List<Rect> {
+        val tw = (w - (cols - 1) * s) / cols
+        val th = (h - (rows - 1) * s) / rows
+        val rects = ArrayList<Rect>(count)
+        var remaining = count
+        for (row in 0 until rows) {
+            val inRow = minOf(cols, remaining)
+            if (inRow <= 0) break
+            val rowW = inRow * tw + (inRow - 1) * s
+            val xStart = (w - rowW) / 2
+            for (i in 0 until inRow) {
+                rects.add(rect(xStart + i * (tw + s), row * (th + s), tw, th))
+            }
+            remaining -= inRow
+        }
+        return rects
+    }
+
+    // ── spotlight: one big tile (2/3) + rest stacked right ───────────────
+
+    fun spotlightRects(count: Int, w: Float, h: Float, s: Float): List<Rect> {
+        if (count <= 0 || w <= 0f || h <= 0f) return emptyList()
+        val n = count.coerceAtMost(9)
+        if (n == 1) return layout1(w, h)
+        // Portrait: hero on TOP (full width, 2/3 height) with the followers in
+        // a row beneath. The transpose keeps the hero at index 0 and the
+        // followers in order, which is the contract resolvedRects relies on.
+        if (isPortrait(w, h)) return transposed(w, h) { tw, th -> spotlightRects(n, tw, th, s) }
+        val bigW = (w - s) * 2 / 3
+        val smallW = w - bigW - s
+        val smallCount = n - 1
+        val smallH = (h - s * (smallCount - 1)) / smallCount
+        val rects = ArrayList<Rect>(n)
+        rects.add(rect(0f, 0f, bigW, h))
+        for (i in 0 until smallCount) {
+            val y = (smallH + s) * i
+            rects.add(rect(bigW + s, y, smallW, smallH))
+        }
+        return rects
+    }
+
+    // ── heroCorner: layout5 + a 6th tile in the empty bottom-right cell ──
+
+    fun heroCornerRects(w: Float, h: Float, s: Float): List<Rect> {
+        if (w <= 0f || h <= 0f) return emptyList()
+        if (isPortrait(w, h)) return transposed(w, h) { tw, th -> heroCornerRects(tw, th, s) }
+        val rects = ArrayList(layout5(w, h, s))
+        val cellW = (w - 2 * s) / 3
+        val cellH = (h - 2 * s) / 3
+        val col2X = 2 * (cellW + s)
+        val row2Y = 2 * (cellH + s)
+        rects.add(rect(col2X, row2Y, cellW, cellH))
+        return rects
+    }
+
+    // ── portrait ─────────────────────────────────────────────────────────
+
+    /**
+     * True when the container is taller than it is wide. A square container
+     * counts as landscape, which is also what guarantees [transposed] cannot
+     * recurse: it swaps the axes before re-entering, so the inner call always
+     * sees a landscape-or-square container.
+     */
+    private fun isPortrait(w: Float, h: Float) = h > w
+
+    /**
+     * Build a landscape table in an axis-swapped container, flip every rect
+     * back, and re-sort into reading order.
+     *
+     * Geometry transposes cleanly -- a hero on the left becomes a hero on top.
+     * The ORDER does not: transposing walks a grid column-major, so tile 2 of a
+     * 5-up would land bottom-left instead of top-right. Sorting by (top, left)
+     * restores the reading order the landscape table had, which is what keeps
+     * each tile in the same relative slot across a rotation.
+     */
+    private fun transposed(w: Float, h: Float, build: (Float, Float) -> List<Rect>): List<Rect> =
+        build(h, w)
+            .map { rect(it.top, it.left, it.height, it.width) }
+            .sortedWith { a, b ->
+                // 1px of slop so tiles sharing a row survive rounding.
+                if (kotlin.math.abs(a.top - b.top) > 1f) a.top.compareTo(b.top)
+                else a.left.compareTo(b.left)
+            }
+
+    /**
+     * Portrait counterpart of the per-count landscape table.
+     *
+     * The asymmetric hero shapes (3, 5) transpose: the big tile moves from the
+     * left edge to the top and its followers wrap underneath. Everything else is
+     * a uniform grid shaped by [bestFitGrid], so 2 tiles split top/bottom on a
+     * phone rather than standing up as two skinny full-height columns.
+     */
+    private fun portraitRects(n: Int, w: Float, h: Float, s: Float): List<Rect> = when (n) {
+        1 -> layout1(w, h)
+        3 -> transposed(w, h) { tw, th -> layout3(tw, th, s) }
+        5 -> transposed(w, h) { tw, th -> layout5(tw, th, s) }
+        else -> {
+            val fit = bestFitGrid(n, w, h, s)
+            gridRects(fit.first, fit.second, n, w, h, s)
+        }
+    }
+
+    /**
+     * Pick the `cols x rows` split that renders the most video, returned as
+     * (cols, rows).
+     *
+     * Candidates are scored by the area a 16:9 frame actually paints inside one
+     * cell, letterboxing included -- the metric that matters, because a cell far
+     * off the source aspect is mostly black bars. On a 393x780 phone that
+     * resolves 2 tiles to 1x2 and 4 tiles to 1x4; a squarer tablet container
+     * still resolves 4 to 2x2.
+     */
+    private fun bestFitGrid(n: Int, w: Float, h: Float, s: Float): Pair<Int, Int> {
+        val targetAspect = 16f / 9f
+        var best = 1 to maxOf(1, n)
+        var bestArea = -1f
+        for (rows in 1..maxOf(1, n)) {
+            val cols = ceil(n.toDouble() / rows).toInt()
+            // Reject shapes whose final row would be entirely empty (4 tiles in
+            // 3 rows of 2), which throw away a row's worth of height.
+            if (cols * (rows - 1) >= n) continue
+            val tw = (w - (cols - 1) * s) / cols
+            val th = (h - (rows - 1) * s) / rows
+            if (tw <= 0f || th <= 0f) continue
+            val videoW = minOf(tw, th * targetAspect)
+            val area = videoW * (videoW / targetAspect)
+            if (area > bestArea) {
+                bestArea = area
+                best = cols to rows
+            }
+        }
+        return best
+    }
+
+    // ── D-pad neighbor + hit-testing on arbitrary rects ──────────────────
+
+    /**
+     * Nearest physical neighbor of `index` in the given direction, chosen by
+     * edge adjacency + perpendicular overlap (iOS `physicalNeighbor`). Unlike
+     * iOS -- which always runs this against the `.auto` table -- Android passes
+     * the ACTUAL displayed rects (mode + spotlight applied) so D-pad nav always
+     * matches what is on screen. Reference rects use spacing 0 so `eps = 1`.
+     */
+    fun neighbor(
+        index: Int,
+        rects: List<Rect>,
+        direction: NeighborDirection,
+        eps: Float = 1f,
+    ): Int? {
+        if (index !in rects.indices) return null
+        val me = rects[index]
+        var best: Pair<Int, Float>? = null
+        for (i in rects.indices) {
+            if (i == index) continue
+            val r = rects[i]
+            val xOverlap = minOf(me.right, r.right) - maxOf(me.left, r.left)
+            val yOverlap = minOf(me.bottom, r.bottom) - maxOf(me.top, r.top)
+            val overlapsX = xOverlap > 1
+            val overlapsY = yOverlap > 1
+            val d: Float = when (direction) {
+                NeighborDirection.Left -> {
+                    if (!(r.right <= me.left + eps && overlapsY)) continue
+                    me.left - r.right
+                }
+                NeighborDirection.Right -> {
+                    if (!(r.left >= me.right - eps && overlapsY)) continue
+                    r.left - me.right
+                }
+                NeighborDirection.Up -> {
+                    if (!(r.bottom <= me.top + eps && overlapsX)) continue
+                    me.top - r.bottom
+                }
+                NeighborDirection.Down -> {
+                    if (!(r.top >= me.bottom - eps && overlapsX)) continue
+                    r.top - me.bottom
+                }
+            }
+            if (best == null || d < best.second) best = i to d
+        }
+        return best?.first
+    }
+
+    /**
+     * Tile index whose rect contains `pos`; falls back to the nearest tile
+     * center for points in an empty cell (layout5/7/8 leave a hole). Used for
+     * the drag-to-reorder drop target.
+     */
+    fun indexAt(pos: Offset, rects: List<Rect>): Int {
+        rects.forEachIndexed { i, r -> if (r.contains(pos)) return i }
+        var best = 0
+        var bestD = Float.MAX_VALUE
+        rects.forEachIndexed { i, r ->
+            val dx = r.center.x - pos.x
+            val dy = r.center.y - pos.y
+            val d = dx * dx + dy * dy
+            if (d < bestD) { bestD = d; best = i }
+        }
+        return best
+    }
+}

@@ -1,0 +1,1583 @@
+package com.aeriotv.android.feature.livetv.grid
+
+import com.aeriotv.android.ui.theme.decorSecondary
+import com.aeriotv.android.ui.theme.textAccent
+import com.aeriotv.android.ui.tv.TvFocusTrace
+import com.aeriotv.android.core.ui.subtitleIsRedundant
+import com.aeriotv.android.core.ui.rememberClockMode
+import com.aeriotv.android.core.ui.ClockFormat
+import android.os.Trace
+import android.view.KeyEvent as AndroidKeyEvent
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import coil3.SingletonImageLoader
+import coil3.request.ImageRequest
+import coil3.toBitmap
+import com.aeriotv.android.core.data.EPGProgramme
+import com.aeriotv.android.core.data.M3UChannel
+import com.aeriotv.android.core.ui.epgFlags
+import com.aeriotv.android.core.ui.seasonEpisodeLabel
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Info
+import com.aeriotv.android.core.remote.GuideRemoteAction
+import com.aeriotv.android.core.remote.RemoteSlot
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * The rebuilt guide grid (design doc "Guide grid renderer"). One focus owner
+ * (the grid), rows that draw all their cells in a single Canvas pass, cells
+ * positioned from [GuideGridState.viewportStartMs] in the draw phase so a pan
+ * redraws without recomposing, and every D-pad press resolved synchronously by
+ * [GuideGridState]. No per-cell composables, no Compose focus search.
+ */
+@Composable
+fun GuideGrid(
+    state: GuideGridState,
+    nowMs: Long,
+    hourWidth: Dp,
+    rowHeight: Dp,
+    railWidth: Dp,
+    headerHeight: Dp,
+    favoriteIds: Set<String>,
+    /** Scheduled / in-progress recording windows by Dispatcharr channel id (record dots). */
+    recordingWindows: Map<Int, List<LongRange>>,
+    isTv: Boolean,
+    onPlay: (M3UChannel, EPGProgramme) -> Unit,
+    onOpenMenu: (M3UChannel, EPGProgramme) -> Unit,
+    /** UP at the top row; return true if focus was taken. */
+    onLeaveTop: () -> Boolean,
+    /** Remote map lookup for a slot (Select, Left, Right, their holds, media keys); already resolved for the group selector. */
+    remoteAction: (RemoteSlot) -> GuideRemoteAction,
+    /** Host-level actions (group pills, mini player, program info, search). Return true if handled. */
+    onHostAction: (GuideRemoteAction) -> Boolean,
+    /** Hands the host this grid's action runner, so the guide's mapped Back
+     *  and Hold Back run the same code as every other mapped press. */
+    onActionRunner: ((GuideRemoteAction) -> Boolean) -> Unit = {},
+    focusRequester: FocusRequester,
+    /** False while the TV sidebar's Shift guide pane owns focus beside the grid. */
+    focusEnabled: Boolean = true,
+    /** Reports whether the grid node holds focus, so the host can settle launch focus. */
+    onGridFocusChanged: (Boolean) -> Unit = {},
+    listState: LazyListState = rememberLazyListState(),
+    modifier: Modifier = Modifier,
+    /** Guide jump (Apple parity): the target shown in the clock cell while away from now. */
+    jumpLabel: String? = null,
+    /** Clock cell tap: snap to now. */
+    onClockTap: () -> Unit = {},
+    /**
+     * Clock / date cell: open Jump To Day. Reached by a plain tap or Select
+     * AND by a long press (Logan 2026-09-19: the long press alone was
+     * undiscoverable, so the cell now carries a chevron and answers a tap).
+     */
+    onOpenJumpToDay: () -> Unit = {},
+    /** Channel Preview layout: cells keep the title and tags (the banner carries the rest). */
+    compact: Boolean = false,
+    /** Host gate snapshot for the trace (AerioFocus [KEY]/[GUIDE] lines); read only when a line is logged. */
+    traceGates: () -> String = { "" },
+    /** Bumped by the host to park the cursor on the clock (Down from the banner, tvOS). */
+    clockSelectTrigger: Int = 0,
+    /**
+     * GH #127: Settings > Live TV > Program Info Button ("off" / "current" /
+     * "all"). Phone and tablet only; the host passes [onOpenProgramInfo] null on TV.
+     */
+    programInfoButtonMode: String = com.aeriotv.android.core.preferences.GuideProgramInfoButton.OFF,
+    onOpenProgramInfo: ((M3UChannel, EPGProgramme) -> Unit)? = null,
+) {
+    val density = LocalDensity.current
+    val hourWidthPx = with(density) { hourWidth.toPx() }
+    val pxPerMs = hourWidthPx / 3_600_000f
+    val textMeasurer = rememberTextMeasurer(cacheSize = 512)
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val logoCache = remember(context) { GuideLogoCache(context.applicationContext) }
+    var gridFocused by remember { mutableStateOf(false) }
+    var leftHoldLatched by remember { mutableStateOf(false) }
+    var rightHoldLatched by remember { mutableStateOf(false) }
+    var leftDownSeen by remember { mutableStateOf(false) }
+    var rightDownSeen by remember { mutableStateOf(false) }
+    var okLongLatched by remember { mutableStateOf(false) }
+    var okDownSeen by remember { mutableStateOf(false) }
+
+    // Re-tap of the Live TV tab while the guide is showing (TabReselect): the
+    // CHANNEL ROWS go back to the top. The timeline is left where the user put
+    // it -- the clock cell is the control for that, and resetting both at once
+    // would throw away a deliberate jump to another hour.
+    com.aeriotv.android.feature.main.OnTabReselect(
+        com.aeriotv.android.feature.main.AppTab.LiveTV,
+    ) {
+        // Already at the top of the current group: nothing to animate.
+        if (listState.firstVisibleItemIndex != 0 || listState.firstVisibleItemScrollOffset != 0) {
+            listState.animateScrollToItem(0)
+        }
+    }
+
+    // Lane: keep the focused row two rows below the top edge once past it.
+    // snapshotFlow, not effect keys: reading focusRow in composition would
+    // recompose the whole grid (and every visible row) on each D-pad press.
+    val rowHeightPx = with(density) { rowHeight.toPx() }
+    LaunchedEffect(state, listState, rowHeightPx) {
+        snapshotFlow {
+            Triple(state.focusRow, state.rows, listState.layoutInfo.viewportEndOffset - listState.layoutInfo.viewportStartOffset)
+        }.collect { (row, _, viewportPx) ->
+            if (row < 0) return@collect
+            // Apple TV lane (Logan 2026-09-02): focus walks DOWN through the
+            // visible rows until it sits on the seventh row, then the list
+            // scrolls under it; going UP it walks to the top row first.
+            // The lane shrinks with the viewport (Logan 2026-09-02: with the
+            // mini player active the header is taller, fewer rows fit, and a
+            // fixed seventh row sat below the fold), and the viewport size
+            // is part of the flow so a mini appearing re-lanes the focus.
+            val visibleRows = if (rowHeightPx > 0f) (viewportPx / rowHeightPx).toInt() else LANE_ROWS + 1
+            val lane = minOf(LANE_ROWS, (visibleRows - 1).coerceAtLeast(1))
+            val current = listState.firstVisibleItemIndex
+            val offset = listState.firstVisibleItemScrollOffset
+            val target = when {
+                row > current + lane -> row - lane
+                row < current || (row == current && offset != 0) -> row
+                else -> current
+            }.coerceAtLeast(0)
+            val delta = if (target == current && row != current) 0f else (target - current) * rowHeightPx - offset
+            if (kotlin.math.abs(target - current) <= 3) {
+                // A one-row step goes through the scrollable so the lazy list
+                // PREFETCHES the next row after this frame; scrollToItem would
+                // compose the incoming row inside this press's measure pass.
+                if (delta != 0f) listState.scrollBy(delta)
+            } else {
+                listState.scrollToItem(target)
+            }
+        }
+    }
+
+    val runAction: (GuideRemoteAction) -> Boolean = { action ->
+        android.util.Log.d("GuideGrid", "remote action $action")
+        when (action) {
+            GuideRemoteAction.JUMP_TO_NOW -> { state.anchorToNow(nowMs); true }
+            GuideRemoteAction.JUMP_TO_TOP -> { state.anchorToNow(nowMs); state.focusRowAt(0); true }
+            GuideRemoteAction.TIMELINE_BACK -> { state.panBy(-(state.viewportDurationMs * 0.85f).toLong()); true }
+            GuideRemoteAction.TIMELINE_FORWARD -> { state.panBy((state.viewportDurationMs * 0.85f).toLong()); true }
+            GuideRemoteAction.PAGE_UP -> { state.moveRows(-pageRows(listState)); true }
+            GuideRemoteAction.PAGE_DOWN -> { state.moveRows(+pageRows(listState)); true }
+            GuideRemoteAction.NONE, GuideRemoteAction.NAVIGATE -> true
+            GuideRemoteAction.PLAY, GuideRemoteAction.PROGRAM_MENU -> {
+                val channel = state.focusRow.takeIf { it >= 0 }?.let { state.rows.channel(it) }
+                val cell = state.focusedCell()
+                if (channel != null && cell != null) {
+                    if (action == GuideRemoteAction.PLAY) onPlay(channel, cell) else onOpenMenu(channel, cell)
+                }
+                true
+            }
+            else -> onHostAction(action)
+        }
+    }
+    androidx.compose.runtime.SideEffect { onActionRunner(runAction) }
+    // UP out of the grid must land on the CURRENT tab's pill (Logan
+    // 2026-09-02), never on whichever pill is geometrically nearest: the nav
+    // switches tabs on focus, so a geometric search opened On Demand.
+    val topNav = com.aeriotv.android.feature.main.LocalTvTopNavFocusRequester.current
+    // GH #71: digit keys jump focus to a channel number (no tune); the
+    // number resolves against the rows on screen, so it respects the
+    // active group / filter.
+    val channelNumberEntry = com.aeriotv.android.feature.livetv.rememberChannelNumberEntry { entry ->
+        val target = com.aeriotv.android.feature.livetv.resolveChannelNumber(entry, state.rows.channels)
+        target != null && state.focusChannel(target.id)
+    }
+    // TV: the clock cell is a focus target above row 1 (tvOS GuideCornerClock):
+    // UP from the top row lands on it, OK snaps to now, a held OK opens Jump
+    // To, UP again leaves to the pills, DOWN returns to the grid.
+    // Virtual, like the grid's own cursor: no real focus move, so the grid's
+    // focus node (and the host's launch-focus settling) is untouched.
+    var clockSelected by remember { mutableStateOf(false) }
+    var clockOkHeld by remember { mutableStateOf(false) }
+    androidx.compose.runtime.LaunchedEffect(clockSelectTrigger) {
+        if (clockSelectTrigger > 0) { clockSelected = true; runCatching { focusRequester.requestFocus() } }
+    }
+    // Trace (AerioFocus): which branch decided the key; set inside the handler.
+    var traceBy = "none"
+    // GH #128: a key held in fullscreen (Left = Return to TV Guide, or Back)
+    // keeps auto-repeating after the guide opens; those repeats must not pan
+    // the timeline back in time. Any Left / Right / Back repeat whose first
+    // press the grid never saw is swallowed, along with its key-up, so the
+    // guide stays on now and the playing channel. Plain sets: never read in
+    // composition.
+    val keysDownSeen = remember { HashSet<Key>() }
+    val keysSwallowing = remember { HashSet<Key>() }
+    val keyHandlerInner: (KeyEvent) -> Boolean = handler@{ event ->
+        traceBy = "unhandled"
+        if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight || event.key == Key.Back) {
+            val rc = (event.nativeKeyEvent as? AndroidKeyEvent)?.repeatCount ?: 0
+            when (event.type) {
+                KeyEventType.KeyDown -> {
+                    if (rc == 0) { keysDownSeen.add(event.key); keysSwallowing.remove(event.key) }
+                    else if (event.key !in keysDownSeen) {
+                        if (keysSwallowing.add(event.key)) {
+                            android.util.Log.i("GuideGrid", "[PRESS] swallowed repeat after guide open (${guideTraceKeyName(event) ?: event.key})")
+                        }
+                        traceBy = "swallowed-repeat"
+                        return@handler true
+                    }
+                }
+                KeyEventType.KeyUp -> {
+                    keysDownSeen.remove(event.key)
+                    if (keysSwallowing.remove(event.key)) { traceBy = "swallowed-repeat-up"; return@handler true }
+                }
+                else -> Unit
+            }
+        }
+        if (clockSelected) {
+            traceBy = "clock"
+            val native = event.nativeKeyEvent as? AndroidKeyEvent
+            val down = event.type == KeyEventType.KeyDown
+            return@handler when (event.key) {
+                Key.DirectionDown -> { if (down) clockSelected = false; true }
+                // Frankie B. 2026-09-15: this used to clear the clock cursor
+                // FIRST and then try to leave. When neither the pill row nor
+                // the nav took focus (an empty pill row leaves its requester
+                // unattached, and the bar's onEnter can land nowhere), the
+                // grid had already dropped the cursor and focus ended up
+                // nowhere at all: [FOCUS] grid:r0 -> none, then every key
+                // declined by guide-screen(focus-not-in-grid). Only give the
+                // cursor up once something upstairs has actually taken focus.
+                Key.DirectionUp -> {
+                    if (down) {
+                        val left = onLeaveTop() ||
+                            (topNav?.let { runCatching { it.requestFocus() }.getOrDefault(false) } ?: false)
+                        if (left) clockSelected = false
+                    }
+                    true
+                }
+                Key.DirectionLeft, Key.DirectionRight -> true
+                Key.DirectionCenter, Key.Enter -> {
+                    if (down) {
+                        val rc = native?.repeatCount ?: 0
+                        if (rc == 0) clockOkHeld = false
+                        else if (!clockOkHeld && (rc >= HOLD_LEFT_REPEATS || native?.isLongPress == true)) {
+                            clockOkHeld = true
+                            android.util.Log.i("AerioGuide", "[GUIDE] clock long press: Jump To Day")
+                            onOpenJumpToDay()
+                        }
+                    } else {
+                        // Plain Select returns the guide to now; the long
+                        // press opens Jump To Day (Logan 2026-10-10, the
+                        // tvOS EPGGuideView clock: onTap snapToNow,
+                        // onLongPress showJumpSheet). The clock keeps the
+                        // cursor, as tvOS keeps focus on the cell. Left/Right
+                        // are untouched: the locked D-pad rule is only about
+                        // movement.
+                        if (!clockOkHeld) {
+                            android.util.Log.i("AerioGuide", "[GUIDE] clock select: back to now")
+                            onClockTap()
+                        }
+                        clockOkHeld = false
+                    }
+                    true
+                }
+                Key.Back -> { if (down) clockSelected = false; true }
+                else -> false
+            }
+        }
+        if (isTv && channelNumberEntry.onKeyEvent(event)) { traceBy = "channel-number-entry"; return@handler true }
+        val native = event.nativeKeyEvent as? AndroidKeyEvent
+        val repeat = native?.repeatCount ?: 0
+        // Some remotes (and adb --longpress) flag a hold instead of repeating.
+        val held = repeat >= HOLD_LEFT_REPEATS || (native?.isLongPress == true)
+        val down = event.type == KeyEventType.KeyDown
+        val up = event.type == KeyEventType.KeyUp
+        Trace.beginSection("GuideGrid.key")
+        try {
+            when (event.key) {
+                Key.DirectionUp -> {
+                    if (!down) return@handler true
+                    if (!state.moveRows(-1)) {
+                        if (isTv) { traceBy = "grid-top-row->clock"; clockSelected = true; return@handler true }
+                        if (onLeaveTop()) { traceBy = "grid-top-row->onLeaveTop"; return@handler true }
+                        traceBy = "grid-top-row->topNav"
+                        return@handler topNav?.let { runCatching { it.requestFocus() }.getOrDefault(false) } ?: false
+                    }
+                    traceBy = "grid-moveRows"
+                    true
+                }
+                Key.DirectionDown -> {
+                    if (down) traceBy = if (state.moveRows(+1)) "grid-moveRows" else "grid-moveRows-refused"
+                    true
+                }
+                // Left/Right pan on RELEASE, not on press (Logan 2026-09-02): a
+                // held Left opens the group sidebar and must not pan the
+                // timeline first; a held Right maps to its own action too.
+                // Both presses and holds come from the remote map (Settings >
+                // Remote Control); a hold mapped to NAVIGATE does not latch, so
+                // its release runs the short press instead.
+                Key.DirectionRight -> {
+                    traceBy = "grid-right(pans-on-release)"
+                    if (down) {
+                        if (repeat == 0) { rightHoldLatched = false; rightDownSeen = true }
+                        val holdAction = remoteAction(RemoteSlot.RIGHT_LONG)
+                        if (!rightHoldLatched && held && holdAction != GuideRemoteAction.NAVIGATE) {
+                            rightHoldLatched = true
+                            runAction(holdAction)
+                        }
+                    } else if (up) {
+                        if (rightDownSeen && !rightHoldLatched) {
+                            val action = remoteAction(RemoteSlot.RIGHT_SHORT)
+                            when {
+                                action == GuideRemoteAction.NAVIGATE -> state.stepRight()
+                                // Program actions fire on every press.
+                                action.columnIndependent -> runAction(action)
+                                // Edge-gated: a remapped Right fires only on the row's last program.
+                                else -> {
+                                    val last = state.atLastCell()
+                                    android.util.Log.d("GuideGrid", "right gate: action=$action row=${state.focusRow} cellStart=${state.focusCellStartMs} lastCell=$last -> ${if (last) "fire" else "step"}")
+                                    if (last) runAction(action) else state.stepRight()
+                                }
+                            }
+                        }
+                        rightDownSeen = false
+                    }
+                    true
+                }
+                Key.DirectionLeft -> {
+                    traceBy = "grid-left(pans-on-release)"
+                    if (down) {
+                        if (repeat == 0) { leftHoldLatched = false; leftDownSeen = true }
+                        val holdAction = remoteAction(RemoteSlot.LEFT_LONG)
+                        if (!leftHoldLatched && held && holdAction != GuideRemoteAction.NAVIGATE) {
+                            leftHoldLatched = true
+                            runAction(holdAction)
+                        }
+                    } else if (up) {
+                        if (leftDownSeen && !leftHoldLatched) {
+                            val action = remoteAction(RemoteSlot.LEFT_SHORT)
+                            when {
+                                action == GuideRemoteAction.NAVIGATE -> state.stepLeft(nowMs)
+                                // Program actions fire on every press.
+                                action.columnIndependent -> runAction(action)
+                                // Live-gated (Logan 2026-09-14, as on Apple TV): a remapped Left
+                                // fires only on the program airing now AND with the timeline at
+                                // its live position; panned into history (a hold browsing earlier
+                                // programs can leave focus on the live cell) it keeps stepping.
+                                else -> {
+                                    val airingNow = state.focusedCellIsAiringNow(nowMs)
+                                    val atLive = state.isTimelineAtLive(nowMs)
+                                    val fire = airingNow && atLive
+                                    android.util.Log.d("GuideGrid", "left gate: action=$action row=${state.focusRow} cellStart=${state.focusCellStartMs} now=$nowMs viewportStart=${state.viewportStartMs} airingNow=$airingNow atLive=$atLive -> ${if (fire) "fire" else "step"}")
+                                    if (fire) runAction(action) else state.stepLeft(nowMs)
+                                }
+                            }
+                        }
+                        leftDownSeen = false
+                    }
+                    true
+                }
+                Key.PageUp -> { if (down) state.moveRows(-pageRows(listState)); true }
+                Key.PageDown -> { if (down) state.moveRows(+pageRows(listState)); true }
+                Key.ChannelUp -> { if (down && repeat == 0) runAction(remoteAction(RemoteSlot.CHANNEL_UP).orDefault(GuideRemoteAction.PAGE_UP)); true }
+                Key.ChannelDown -> { if (down && repeat == 0) runAction(remoteAction(RemoteSlot.CHANNEL_DOWN).orDefault(GuideRemoteAction.PAGE_DOWN)); true }
+                Key.MediaRewind, Key.MediaPrevious -> { if (down && repeat == 0) runAction(remoteAction(RemoteSlot.REWIND).orDefault(GuideRemoteAction.TIMELINE_BACK)); true }
+                Key.MediaFastForward, Key.MediaNext -> { if (down && repeat == 0) runAction(remoteAction(RemoteSlot.FFWD).orDefault(GuideRemoteAction.TIMELINE_FORWARD)); true }
+                Key.MediaPlayPause, Key.MediaPlay -> { if (down && repeat == 0) runAction(remoteAction(RemoteSlot.PLAY_PAUSE).orDefault(GuideRemoteAction.RESUME_PLAYER)); true }
+                Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> {
+                    val channel = state.focusRow.takeIf { it >= 0 }?.let { state.rows.channel(it) }
+                    val cell = state.focusedCell()
+                    if (channel == null || cell == null) { traceBy = "grid-ok-no-cell"; return@handler true }
+                    traceBy = "grid-ok"
+                    if (down) {
+                        if (repeat == 0) { okLongLatched = false; okDownSeen = true }
+                        if (!okLongLatched && repeat >= OK_LONG_REPEATS) {
+                            okLongLatched = true
+                            runAction(remoteAction(RemoteSlot.OK_LONG))
+                        }
+                    } else if (up) {
+                        // Only a press that STARTED on the grid acts: the KeyUp of
+                        // the press that opened the tab must not tune a channel.
+                        if (okDownSeen && !okLongLatched) runAction(remoteAction(RemoteSlot.OK_SHORT))
+                        okDownSeen = false
+                    }
+                    true
+                }
+                else -> {
+                    // Android#114: a learned button's In the Guide action.
+                    val learned = com.aeriotv.android.core.remote.LearnedButtons
+                        .current[event.nativeKeyEvent.keyCode]
+                        ?.guide?.takeIf { it != GuideRemoteAction.NONE }
+                    if (learned != null) {
+                        traceBy = "grid-learned"
+                        if (down && repeat == 0) runAction(learned)
+                        true
+                    } else false
+                }
+            }
+        } finally {
+            Trace.endSection()
+        }
+    }
+    // One [KEY] line per D-pad KeyDown the grid node receives (onPreviewKeyEvent
+    // only runs while focus is on the grid), with the cell before and after and
+    // the vertical-move state. Built only for those keys, never per frame.
+    val keyHandler: (KeyEvent) -> Boolean = { event ->
+        val name = if (event.type == KeyEventType.KeyDown) guideTraceKeyName(event) else null
+        if (name == null) keyHandlerInner(event) else {
+            val before = guideTraceCell(state)
+            val rowBefore = state.focusRow
+            val clockBefore = clockSelected
+            val digitsBefore = channelNumberEntry.digits
+            val scrolling = listState.isScrollInProgress
+            val consumed = keyHandlerInner(event)
+            val repeat = (event.nativeKeyEvent as? AndroidKeyEvent)?.repeatCount ?: 0
+            val vertical = if (name == "Up" || name == "Down") {
+                val delta = if (name == "Up") -1 else 1
+                val target = rowBefore.coerceAtLeast(0) + delta
+                val refused = when {
+                    clockBefore -> "clock-selected"
+                    digitsBefore.isNotEmpty() -> "channel-number-entry"
+                    state.rows.isEmpty -> "no-rows"
+                    state.focusRow == rowBefore && target >= state.rows.size -> "at-last-row"
+                    state.focusRow == rowBefore && target < 0 -> "at-top-row"
+                    state.focusRow == rowBefore -> "row-unchanged"
+                    else -> null
+                }
+                " target=r$target rows=${state.rows.size} firstVisible=${listState.firstVisibleItemIndex}/${listState.firstVisibleItemScrollOffset}" +
+                    " visible=${listState.layoutInfo.visibleItemsInfo.size} scrollInProgress=$scrolling" +
+                    " refused=${refused ?: "no"}"
+            } else ""
+            TvFocusTrace.key(
+                name, consumed,
+                "$traceBy repeat=$repeat gridFocused=$gridFocused focusEnabled=$focusEnabled clock=$clockBefore->$clockSelected" +
+                    " cell=$before -> ${guideTraceCell(state)}$vertical" +
+                    " viewportStart=${state.viewportStartMs} drawStart=${state.drawViewportStartMs} ${traceGates()}",
+            )
+            consumed
+        }
+    }
+
+    // Timeline easing (tvOS parity): the draw offset follows the target
+    // viewport with a 300 ms ease-out after a pan or jump; a drag snaps.
+    //
+    // Eased as a 0..1 FRACTION between two exact Long instants (Logan
+    // 2026-10-04, Nothing Phone). The old Animatable held the epoch-ms
+    // viewport as a Float, whose step at ~1.8e12 is 131072 ms: a drag's snap
+    // stored the ROUNDED value, so drawViewportStartMs never equalled
+    // viewportStartMs again, the text cache below never saw a settled
+    // viewport, and cells measured while clipped at the strip edge kept
+    // their few-character layouts ("Spo...") for good.
+    androidx.compose.runtime.LaunchedEffect(state.viewportStartMs) {
+        val to = state.viewportStartMs
+        if (!state.viewportChangeAnimated) {
+            state.drawViewportStartMs = to; return@LaunchedEffect
+        }
+        val from = state.drawViewportStartMs
+        if (from != to) {
+            androidx.compose.animation.core.Animatable(0f).animateTo(
+                1f,
+                animationSpec = androidx.compose.animation.core.tween(300, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+            ) { state.drawViewportStartMs = from + ((to - from) * value.toDouble()).toLong() }
+        }
+        state.drawViewportStartMs = to
+    }
+    androidx.compose.runtime.CompositionLocalProvider(LocalLogoCache provides logoCache) {
+    Box(modifier = modifier) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .focusRequester(focusRequester)
+            .focusProperties {
+                if (topNav != null) up = topNav
+                left = FocusRequester.Cancel
+                right = FocusRequester.Cancel
+            }
+            .onFocusChanged {
+                if (it.isFocused != gridFocused) {
+                    if (it.isFocused) {
+                        TvFocusTrace.focus("grid:r${state.focusRow}")
+                        TvFocusTrace.guide("grid focus gained cell=${guideTraceCell(state)} focusEnabled=$focusEnabled ${traceGates()}")
+                    } else {
+                        TvFocusTrace.guide("grid focus lost cell=${guideTraceCell(state)} focusEnabled=$focusEnabled hasFocus=${it.hasFocus} ${traceGates()}")
+                        TvFocusTrace.blurred("grid:r${state.focusRow}")
+                    }
+                }
+                gridFocused = it.isFocused; onGridFocusChanged(it.isFocused)
+            }
+            .focusable(enabled = focusEnabled)
+            .onPreviewKeyEvent(keyHandler),
+    ) {
+        TimeHeader(state, nowMs, railWidth, headerHeight, pxPerMs, textMeasurer,
+                   jumpLabel = jumpLabel, onClockTap = onClockTap, onOpenJumpToDay = onOpenJumpToDay,
+                   clockSelected = clockSelected, isTv = isTv)
+        val railPx = with(density) { railWidth.toPx() }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .onSizeChanged { size ->
+                    val stripPx = (size.width - railPx).coerceAtLeast(1f)
+                    state.resizeViewport((stripPx / pxPerMs).toLong())
+                },
+        ) {
+            val rows = state.rows
+            items(count = rows.size, key = { rows.channel(it).id }) { row ->
+                GridRow(
+                    state = state,
+                    row = row,
+                    nowMs = nowMs,
+                    rowHeight = rowHeight,
+                    railWidth = railWidth,
+                    pxPerMs = pxPerMs,
+                    gridFocused = gridFocused && !clockSelected,
+                    compact = compact,
+                    isTv = isTv,
+                    isFavorite = rows.channel(row).id in favoriteIds,
+                    recordingWindows = rows.channel(row).dispatcharrChannelId?.let { recordingWindows[it] } ?: emptyList(),
+                    textMeasurer = textMeasurer,
+                    onPlay = onPlay,
+                    onOpenMenu = onOpenMenu,
+                    infoButtonMode = if (onOpenProgramInfo != null) programInfoButtonMode else com.aeriotv.android.core.preferences.GuideProgramInfoButton.OFF,
+                    onOpenProgramInfo = onOpenProgramInfo,
+                    onTapFocus = { r, cell ->
+                        state.focusRowAt(r, cell.startMillis)
+                        runCatching { focusRequester.requestFocus() }
+                    },
+                )
+            }
+        }
+    }
+    if (isTv) {
+        com.aeriotv.android.feature.livetv.ChannelNumberEntryOverlay(
+            state = channelNumberEntry,
+            modifier = Modifier.align(Alignment.TopCenter).padding(top = 12.dp),
+        )
+    }
+    }
+    }
+}
+
+/** Rows per page: the fully visible rows minus one, so a page keeps one row of context. Deterministic (no partial-row dependence). */
+private fun pageRows(listState: LazyListState): Int {
+    val info = listState.layoutInfo
+    val rowH = info.visibleItemsInfo.firstOrNull()?.size ?: return 1
+    val viewport = info.viewportEndOffset - info.viewportStartOffset
+    return ((viewport / rowH) - 1).coerceAtLeast(1)
+}
+
+@Composable
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+private fun TimeHeader(
+    state: GuideGridState,
+    nowMs: Long,
+    railWidth: Dp,
+    headerHeight: Dp,
+    pxPerMs: Float,
+    textMeasurer: androidx.compose.ui.text.TextMeasurer,
+    jumpLabel: String? = null,
+    onClockTap: () -> Unit = {},
+    onOpenJumpToDay: () -> Unit = {},
+    /** TV: the grid's virtual cursor sits on the clock (accent ring). */
+    clockSelected: Boolean = false,
+    /** TV: the clock is driven by the grid's virtual cursor, never by real focus. */
+    isTv: Boolean = false,
+) {
+    // Apple TV: time labels in the accent colour.
+    // Apple iOS: time labels textSecondary on an appBackground strip.
+    val labelStyle = TextStyle(
+        color = if (isTv) MaterialTheme.colorScheme.textAccent else MaterialTheme.colorScheme.onSurfaceVariant,
+        fontSize = 12.sp,
+        fontWeight = FontWeight.Medium,
+    )
+    // Apple iOS: header rule accentPrimary 0.15, no half-hour ticks.
+    val rule = if (isTv) androidx.compose.ui.graphics.Color.White.copy(alpha = 0.08f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+    val cornerFill = if (isTv) androidx.compose.ui.graphics.Color.Transparent else MaterialTheme.colorScheme.surface
+    val clockMode = rememberClockMode()
+    val fmt = remember(clockMode) { ClockFormat.guideLabel(clockMode) }
+    Row(modifier = Modifier.fillMaxWidth().height(headerHeight)) {
+        // Clock / date cell: a plain tap (or Select on TV) opens Jump To Day,
+        // and so does the long press that used to be the only way in (Roman
+        // via Discord 2026-09-06; discoverability, Logan 2026-09-19). The
+        // chevron under the label says so. While a jump is active the cell
+        // shows the target in the accent colour and a tap returns to now.
+        val focused = clockSelected
+        Box(
+            modifier = Modifier
+                .width(railWidth)
+                .fillMaxSize()
+                // Apple iOS corner clock cell: cardBackground.
+                .background(cornerFill)
+                .padding(4.dp)
+                // tvOS: the clock draws its own accent ring when focused.
+                .clip(androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                .then(if (focused) Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)) else Modifier)
+                .border(2.dp, if (focused) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Transparent, androidx.compose.foundation.shape.RoundedCornerShape(6.dp))
+                // Touch only. combinedClickable() is focusable, so on TV the
+                // clock cell became a REAL focus target sitting above row 0
+                // with no D-pad handling of its own: focus could land on it
+                // and neither Up nor Down moved anywhere ("can't get past the
+                // time"). On TV the clock is the grid's virtual cursor
+                // (clockSelected) and must not take focus at all.
+                .then(
+                    if (isTv) Modifier
+                    else Modifier.combinedClickable(
+                        onClick = onClockTap,
+                        onLongClick = onOpenJumpToDay,
+                    ),
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            val clock = remember(nowMs / 60_000L, clockMode) { ClockFormat.short(clockMode).format(Date(nowMs)) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                jumpLabel ?: clock,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (jumpLabel != null) MaterialTheme.colorScheme.textAccent else androidx.compose.ui.graphics.Color.Unspecified,
+                fontWeight = if (jumpLabel != null) FontWeight.SemiBold else null,
+                maxLines = 1,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            // The affordance for Jump To Day. Small and dim: the cell is 78 dp
+            // wide on a phone and the time has to stay readable.
+            androidx.compose.material3.Icon(
+                androidx.compose.material.icons.Icons.Filled.KeyboardArrowDown,
+                contentDescription = "Jump to day",
+                tint = if (jumpLabel != null) MaterialTheme.colorScheme.textAccent
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 1.dp).size(13.dp),
+            )
+            }
+        }
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            // Same clamp as the rows, so the hour labels cannot drift out of
+            // the window the cells are drawn from.
+            val vs = state.drawStartMs
+            // Half-hour slots from the first slot boundary at or before the viewport edge.
+            val slot = 30 * 60_000L
+            var t = (vs / slot) * slot
+            val ve = vs + (size.width / pxPerMs).toLong()
+            clipRect {
+                while (t < ve) {
+                    val x = (t - vs) * pxPerMs
+                    if (isTv) drawLine(rule, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1f)
+                    val label = fmt.format(Date(t)).lowercase(Locale.getDefault())
+                    // The edge sits at now (Logan 2026-10-08), so the first slot is
+                    // partial: only half-hour marks at or right of the edge get a label.
+                    if (x >= -1f) {
+                        drawText(textMeasurer, label, topLeft = Offset(x.coerceAtLeast(0f) + 6f, (size.height - 16.sp.toPx()) / 2f), style = labelStyle, maxLines = 1)
+                    }
+                    t += slot
+                }
+            }
+            drawLine(rule, Offset(0f, size.height - 1f), Offset(size.width, size.height - 1f), strokeWidth = 1f)
+        }
+    }
+}
+
+@Composable
+private fun GridRow(
+    state: GuideGridState,
+    row: Int,
+    nowMs: Long,
+    rowHeight: Dp,
+    railWidth: Dp,
+    pxPerMs: Float,
+    gridFocused: Boolean,
+    isFavorite: Boolean,
+    recordingWindows: List<LongRange>,
+    textMeasurer: androidx.compose.ui.text.TextMeasurer,
+    onPlay: (M3UChannel, EPGProgramme) -> Unit,
+    onOpenMenu: (M3UChannel, EPGProgramme) -> Unit,
+    onTapFocus: (Int, EPGProgramme) -> Unit,
+    compact: Boolean = false,
+    isTv: Boolean = false,
+    infoButtonMode: String = com.aeriotv.android.core.preferences.GuideProgramInfoButton.OFF,
+    onOpenProgramInfo: ((M3UChannel, EPGProgramme) -> Unit)? = null,
+) {
+    val channel = state.rows.channel(row)
+    // GH #127 (Apple 363b9db / d051505 / 3a9f8c5): small info-circle button in
+    // the bottom-right corner of the cell's VISIBLE part, on cells at least
+    // about 120 dp wide. Stays during Multiview picking (Apple 1cbfae5).
+    val infoPainter = androidx.compose.ui.graphics.vector.rememberVectorPainter(androidx.compose.material.icons.Icons.Outlined.Info)
+    fun showsInfoButton(cell: EPGProgramme, visibleW: Float, minW: Float): Boolean =
+        onOpenProgramInfo != null && !cell.isPlaceholder && visibleW >= minW &&
+            com.aeriotv.android.core.preferences.GuideProgramInfoButton.shows(
+                infoButtonMode, nowMs in cell.startMillis until cell.endMillis,
+            )
+    val colors = MaterialTheme.colorScheme
+    // Only the row that gains or loses focus redraws on a vertical move:
+    // derivedStateOf notifies the draw scope only when THIS row's answer
+    // changes, instead of every visible row re-recording its cells.
+    val focusedCellStart by remember(state, row) {
+        derivedStateOf { if (state.focusRow == row) state.focusCellStartMs else Long.MIN_VALUE }
+    }
+    // Phone / tablet cells follow Apple iOS EPGGuideView (cardBackground
+    // surfaces, textPrimary / textSecondary / textTertiary inks); the TV cell
+    // keeps the Apple TV white-on-dark styling.
+    val titleInk = if (isTv) Color.White else colors.onSurface
+    val titleStyle = TextStyle(color = titleInk, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+    val titleDimStyle = titleStyle.copy(color = titleInk.copy(alpha = 0.55f), fontWeight = FontWeight.Normal)
+    // Apple TV cell: bold title, italic accent subtitle, accent-tinted
+    // description, then a dim time line with the S/E pill and flag badges.
+    val accent = MaterialTheme.colorScheme.primary
+    // Subtext Size + Text Contrast for the secondary lines. Guide cells are
+    // always dark (white titles), so contrast blends toward white in both modes.
+    val subScale = com.aeriotv.android.ui.scale.LocalSubtextScale.current
+    val textContrast = com.aeriotv.android.ui.theme.LocalTextContrast.current
+    fun cellText(c: Color) = com.aeriotv.android.ui.theme.contrastBlend(c, textContrast, isDark = true)
+    // Apple iOS: description and sub-title textSecondary, time textTertiary.
+    // colors.onSurfaceVariant / colors.tertiary already carry Text Contrast.
+    val timeStyle = TextStyle(color = if (isTv) cellText(Color.White.copy(alpha = 0.55f)) else colors.tertiary, fontSize = 10.5.sp * subScale)
+    val descStyle = TextStyle(color = if (isTv) cellText(accent.copy(alpha = 0.85f)) else colors.onSurfaceVariant, fontSize = 10.5.sp * subScale)
+    val subStyle = TextStyle(color = if (isTv) cellText(accent) else colors.onSurfaceVariant, fontSize = 10.5.sp * subScale, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
+    // SEASON / EPISODE PILL (restored 2026-09-19). 0.5.9 moved S/E into the
+    // Channel Preview banner, which only the TV preview layout draws: on the
+    // phone, the tablet and the TV's standard layout the label vanished
+    // completely. It is back on the badge line of every cell EXCEPT the
+    // preview layout's compact cell, where the banner still owns it. Outlined
+    // pill, never a solid colour chip, so it reads as metadata and not as a
+    // flag badge (Apple's SeasonEpisodePill, compactBadgeRow).
+    val pillStyle = TextStyle(color = if (isTv) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f) else MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 7.5.sp, fontWeight = FontWeight.Medium)
+    // Apple SeasonEpisodePill: stroke borderMedium = accent 0.18.
+    val outline = if (isTv) MaterialTheme.colorScheme.decorSecondary.copy(alpha = 0.45f) else accent.copy(alpha = 0.18f)
+    // Color Programs by Category (Apple CategoryColor.backgroundColor).
+    val palette = com.aeriotv.android.core.category.LocalCategoryPalette.current
+    val tintScale = com.aeriotv.android.core.category.categoryTintScale(com.aeriotv.android.ui.theme.LocalTrueBlack.current)
+    val badgeStyle = TextStyle(color = Color.White, fontSize = 7.5.sp, fontWeight = FontWeight.Bold)
+    val showBadges = com.aeriotv.android.core.ui.LocalShowEpgBadges.current
+    val showSubtitles = com.aeriotv.android.core.ui.LocalShowProgramSubtitles.current
+    val hiddenBadges = com.aeriotv.android.core.ui.LocalHiddenEpgBadges.current
+    val clockMode = rememberClockMode()
+    val rail = com.aeriotv.android.core.ui.LocalGuideRailPrefs.current
+    // Keep Recent Channels Live: KEPT chip in the rail band.
+    val isKept = channel.id in com.aeriotv.android.feature.livetv.LocalRetainedChannelIds.current
+    val keptLabel = remember(textMeasurer, isTv) {
+        textMeasurer.measure("KEPT", style = TextStyle(color = Color.White, fontSize = if (isTv) 7.sp else 7.5.sp, fontWeight = FontWeight.Bold), maxLines = 1)
+    }
+    // Appearance > "Rounded corners in Guide view" (default OFF). The rail is
+    // the ONLY surface this flag covers; every card surface reads the List
+    // flag instead. Read here in composition and handed to the shared rounding
+    // rule inside the Canvas.
+    val roundedArtwork = com.aeriotv.android.core.ui.LocalRoundedArtwork.current.guide
+    // Live TV > "Rounded Program Cells" (default OFF): the program cell shape
+    // has its own flag so logos and cells round independently.
+    val roundedCells = com.aeriotv.android.core.ui.LocalRoundedArtwork.current.programCells
+    val shortFmt = remember(clockMode) { ClockFormat.guideShort(clockMode) }
+    val catchupPainter = androidx.compose.ui.graphics.vector.rememberVectorPainter(androidx.compose.material.icons.Icons.Outlined.History)
+    val starPainter = androidx.compose.ui.graphics.vector.rememberVectorPainter(androidx.compose.material.icons.Icons.Filled.Star)
+    // A VectorPainter caches ONE raster at the size of its latest draw. The
+    // program strip draws its replay badge at about 0.7 of the title height
+    // and the rail band draws the clock at the 8 dp glyph size; sharing one
+    // painter left the rail clock drawing the strip-sized raster clipped to
+    // its 8 dp box, so only the top-right of the clock showed (Logan
+    // 2026-10-02, Streamer). Each size gets its own painter.
+    val stripCatchupPainter = androidx.compose.ui.graphics.vector.rememberVectorPainter(androidx.compose.material.icons.Icons.Outlined.History)
+    val fmt = remember(clockMode) { ClockFormat.guideLabel(clockMode) }
+    // tvOS: a 1 pt hairline gap between cells and rows, nothing wider.
+    val seam = 1f
+    val padH = 8f
+    val appTextScale = com.aeriotv.android.ui.scale.LocalAppTextScale.current
+    // Same growth GuideScreen applies to the phone row height.
+    val subRowGrowth = 1f + (com.aeriotv.android.ui.scale.LocalSubtextScale.current - 1f).coerceAtLeast(0f) * GUIDE_PHONE_SUBTEXT_SHARE
+    // Text layouts are measured once per (cell, width) and drawn many times:
+    // measuring through TextMeasurer on every draw was ~1 ms per row.
+    // Keyed on fontScale too: cached layouts are measured in sp, so a live
+    // Text Size change must re-measure instead of drawing stale sizes.
+    val textCache = remember(state.rows, row, showBadges, showSubtitles, clockMode, rail, LocalDensity.current.fontScale, subScale, textContrast, accent) { HashMap<Long, CellText>() }
+    val rangeCache = remember(state.rows, row, clockMode) { HashMap<Long, String>() }
+    val railWidthPx = with(LocalDensity.current) { railWidth.toPx() }
+    val logos = LocalLogoCache.current
+    val onSurface = colors.onSurface
+    val tertiary = colors.tertiary
+    val surface = colors.surface
+    val railNameStyle = TextStyle(color = onSurface, fontSize = 10.sp)
+    // TV BAND number (Logan 2026-09-16, Apple TV parity): the number lives in
+    // the rail's own top band, sized to fill it, so it reads from the couch.
+    val railBandNumberStyle = TextStyle(color = tertiary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    // PHONE / TABLET band number (Logan 2026-09-16): the same band, scaled to a
+    // 78 dp column. 11 sp bold so the widest number the app emits ("1500.5")
+    // still clears the two end glyphs without overlapping them.
+    val railSmallBandNumberStyle = TextStyle(color = tertiary, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    // TalkBack: one node per row (channel + what is on now). Read in
+    // composition on the 30 s tick only, never per press.
+    val rowDescription = remember(channel.id, nowMs / 60_000L) {
+        val onNow = state.rows.cellAt(row, nowMs)?.takeIf { !it.isPlaceholder }?.title
+        buildString {
+            channel.channelNumber?.let { append(it).append(", ") }
+            append(channel.name)
+            if (onNow != null) append(", now: ").append(onNow)
+        }
+    }
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(rowHeight)
+            .semantics { contentDescription = rowDescription }
+            // Keyed on the minute tick as well as the row: the tap handler
+            // resolves the rail's "airing now" cell from nowMs, and a stale
+            // capture there would replay a program that just ended.
+            .pointerInput(row, nowMs / 60_000L) {
+                detectTapGestures(
+                    onTap = { pos ->
+                        if (pos.x < railWidthPx) {
+                            // Rail (logo / name) = tune this channel live. Hand
+                            // onPlay the cell airing NOW, not the row's first
+                            // cell: the first cell is usually already in the
+                            // past, and a past cell now means "play it back".
+                            val railCell = state.rows.cellAt(row, nowMs) ?: state.rows.cells(row).first()
+                            onTapFocus(row, railCell); onPlay(channel, railCell); return@detectTapGestures
+                        }
+                        val t = state.drawViewportStartMs + ((pos.x - railWidthPx) / pxPerMs).toLong()
+                        val tapped = state.rows.cellAt(row, t)
+                        if (tapped != null && onOpenProgramInfo != null) {
+                            // Hit-test the corner button on the cell's visible slice.
+                            val stripW = size.width - railWidthPx
+                            val vs = state.drawStartMs
+                            val cx0 = ((tapped.startMillis - vs) * pxPerMs).coerceAtLeast(0f)
+                            val cx1 = ((tapped.endMillis - vs) * pxPerMs).coerceAtMost(stripW)
+                            val hit = GUIDE_INFO_BUTTON_HIT.toPx()
+                            val sx = pos.x - railWidthPx
+                            if (showsInfoButton(tapped, cx1 - cx0, GUIDE_INFO_BUTTON_MIN_CELL.toPx()) &&
+                                sx >= cx1 - hit && sx <= cx1 && pos.y >= size.height - hit
+                            ) {
+                                onTapFocus(row, tapped); onOpenProgramInfo(channel, tapped); return@detectTapGestures
+                            }
+                        }
+                        tapped?.let { cell -> onTapFocus(row, cell); onPlay(channel, cell) }
+                    },
+                    onLongPress = { pos ->
+                        val t = state.drawViewportStartMs + ((pos.x - railWidthPx).coerceAtLeast(0f) / pxPerMs).toLong()
+                        state.rows.cellAt(row, t)?.let { cell -> onTapFocus(row, cell); onOpenMenu(channel, cell) }
+                    },
+                )
+            }
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures { _, dx ->
+                    state.scrollViewportTo(state.viewportStartMs - (dx / pxPerMs).toLong(), animated = false)
+                }
+            },
+    ) {
+        Trace.beginSection("GuideGrid.row")
+        // Rail: number, logo, name. Drawn here so a row is ONE draw node and
+        // composing a newly visible row costs nothing measurable.
+        drawRect(surface, topLeft = Offset.Zero, size = Size(railWidthPx, size.height))
+        // TV RAIL BAND (Logan 2026-09-16, final Apple TV layout). Every TV rail
+        // cell opens with a dedicated band of [GUIDE_TV_RAIL_BAND]: the channel
+        // number at the start, the favorite star and the catch-up clock at the
+        // end. The band is drawn on EVERY row whether or not that row has a
+        // number or a glyph, so the logo block under it starts at the same y on
+        // every row and can never be shifted or shrunk by a neighbour's glyph.
+        // Below the band the logo and the name are centered in the FULL cell
+        // width in every toggle state: no number column, no glyph gutter and no
+        // balance inset, because the band already owns both of those.
+        // The PHONE and TABLET guide column gets the same band at its own size
+        // (Logan 2026-09-16); only the List view keeps the old stacked form.
+        val bandH = (if (isTv) GUIDE_TV_RAIL_BAND else GUIDE_PHONE_RAIL_BAND).toPx()
+        val bandInset = (if (isTv) GUIDE_TV_BAND_INSET else GUIDE_PHONE_BAND_INSET).toPx()
+        val bandGlyph = (if (isTv) GUIDE_TV_BAND_GLYPH else GUIDE_PHONE_BAND_GLYPH).toPx()
+        // SIDE INSETS ON EVERY IDIOM (Logan 2026-09-16). The logo is
+        // width-driven now, so a wide logo takes the whole column width it is
+        // given: with the TV path left flush at 0 the logo ran edge to edge,
+        // butting into the rail's hairline on the right and the cell edge on
+        // the left, which read as clipped on both sides (ESPN2 / ESPNU /
+        // ESPNews; a small-source logo like ESPN HD never reached the edges
+        // and looked fine). The logo column is inset on BOTH sides, so the
+        // fitted logo can never touch either edge.
+        val railStart = (if (isTv) GUIDE_TV_LOGO_INSET else GUIDE_PHONE_BAND_INSET).toPx()
+        val nameLeft = railStart
+        val nameW = (railWidthPx - 2 * railStart).toInt().coerceAtLeast(1)
+        // Settings > Appearance > Channel List toggles (Show Channel Logos /
+        // Numbers / Names): each element is skipped when off, and the rest
+        // re-centre in the freed space.
+        val numberStyleForRail = if (isTv) railBandNumberStyle else railSmallBandNumberStyle
+        val underNumber = if (rail.numbers) textCache.getOrPut(RAIL_UNDER_NUMBER_KEY) {
+            CellText(
+                textMeasurer.measure(
+                    channel.channelNumber.orEmpty(),
+                    style = numberStyleForRail,
+                    maxLines = 1,
+                    constraints = Constraints(maxWidth = nameW),
+                ),
+                null,
+            )
+        } else null
+        // Phone and tablet rails keep the stacked number under the logo; on TV
+        // the number has moved into the band, so it costs the logo block
+        // neither width nor height.
+        val railContentLeft = nameLeft
+        // The width the rail content may use. On TV that is the whole cell.
+        val railContentW = nameW
+        // The width the logo and the name actually get.
+        val logoColumnW = railContentW
+        val name = if (rail.names) textCache.getOrPut(RAIL_NAME_KEY) {
+            // The star is always the corner glyph now (Logan 2026-09-10: left
+            // of the catch-up clock on TV too), never inline in the name.
+            CellText(textMeasurer.measure(channel.name, style = railNameStyle, maxLines = 1, overflow = TextOverflow.Ellipsis, constraints = Constraints(maxWidth = logoColumnW)), null)
+        } else null
+        val logo = if (rail.logos && channel.tvgLogo.isNotBlank()) logos.bitmap(channel.tvgLogo) else null
+        // SHARED GEOMETRY (core/ui/ChannelBadge.kt). The rail keeps its
+        // Canvas for scroll performance, so it cannot host the ChannelBadge
+        // composable; instead both surfaces call the SAME pure functions, so
+        // the slot rect, the number rect, the name rect, the fitted image rect
+        // and the corner rule are identical by construction.
+        // Order: logo, number, name.
+        // The number is in the band on every guide rail now, so it costs the
+        // logo block neither width nor height.
+        val numberH = 0f
+        val nameH = (name?.title?.size?.height ?: 0).toFloat()
+        val lineGap = com.aeriotv.android.core.ui.CHANNEL_BADGE_LINE_GAP.toPx()
+        val logoGap = if (isTv) 2.dp.toPx() else 4.dp.toPx()
+        // Top clearance for the favorite star / catch-up clock glyphs. Always
+        // reserved, on EVERY row, even when this row has neither glyph: rail
+        // rows are all one height, so a per-row inset was the one thing that
+        // could still make one row's logo bigger than its neighbour's
+        // (Logan 2026-09-16).
+        // On TV the row is SHORT (48 dp) and the corner glyphs sit at the far
+        // right of the rail, clear of the centered logo column, so reserving
+        // the full 18 dp clearance there left the logo about a quarter of the
+        // row tall. TV keeps the plain 4 dp inset; phone and tablet rails,
+        // whose logo spans the whole rail width, keep the glyph clearance.
+        // The glyphs live in the band now, so nothing needs top clearance.
+        val topInset = 0f
+        // Both number AND name shown: the logo keeps its stock box so a tall
+        // row does not blow the logo up past the rail's design. Any element
+        // hidden and the logo takes all the room that is left.
+        // TV rail (Logan 2026-09-16): the number gets its own column on the
+        // LEFT, measured from the widest number, and the logo with the name
+        // under it takes the rest. Because the number no longer costs the logo
+        // any HEIGHT, the logo grows here too rather than clamping to the
+        // stock box - the clamp only survives on the phone/tablet rail, where
+        // the layout is still stacked.
+        // The column is exactly THIS row's number wide, so the number hugs
+        // the left edge and the logo column starts right after it. Sizing it
+        // from the widest number the app can show ("1500.5") pushed a short
+        // number into the middle of a wide column and pushed the logo and the
+        // name right along with it (Logan 2026-09-16).
+        // NO STOCK BOX anywhere any more (Logan 2026-09-16): the phone and
+        // tablet guide logo is sized exactly like the TV one, width-driven to
+        // the column and capped only by the height left under the band.
+        //
+        // NATIVE CAP (Logan 2026-09-17, Apple TV parity). Apple draws a logo at
+        // at most ONE SOURCE PIXEL PER POINT: a 120 px wide image may be drawn
+        // up to 120 pt wide and no wider, and a small source simply stays small,
+        // centered in its box, rather than being blown up. Android's equivalent
+        // of a point is a dp, so the cap is the source's pixel dimensions read
+        // as dp. The decode target below is at least the box size in physical
+        // px, so a bitmap that came back SMALLER than that target was never
+        // downsampled and its decoded dimensions ARE the source's.
+        val nativeCapW = (logo?.width ?: 0).dp.toPx()
+        val nativeCapH = (logo?.height ?: 0).dp.toPx()
+        val geometry = com.aeriotv.android.core.ui.channelBadgeLayout(
+            slotWidth = railContentW.toFloat(),
+            // The band is carved off the top first; the logo and the name own
+            // everything under it.
+            slotHeight = (size.height - bandH).coerceAtLeast(0f),
+            showLogo = logo != null,
+            numberHeight = numberH,
+            nameHeight = nameH,
+            topInset = topInset,
+            bottomInset = if (isTv) 0f else RAIL_LOGO_INSET.toPx(),
+            logoGap = logoGap,
+            lineGap = lineGap,
+            // TV rail: the logo is sized from the COLUMN WIDTH (Apple TV puts
+            // it at roughly 60 percent of the row height, centered in the
+            // width left beside the number) and the row height only CAPS it,
+            // so the logo is never cropped and never collapses to a stamp.
+            logoAspect = if (logo != null) logo.width.toFloat() / logo.height.toFloat() else 0f,
+            widthDrivenLogo = true,
+            maxLogoWidth = if (logo != null) nativeCapW else Float.MAX_VALUE,
+            maxLogoHeight = if (logo != null) nativeCapH else Float.MAX_VALUE,
+            // Settings > Live TV > Logo Size, on top of everything above.
+            logoScale = rail.logoScale,
+            logoFloor = 8.dp.toPx(),
+        )
+        geometry.logo?.let { slot ->
+            val image = logo!!
+            val fitted = com.aeriotv.android.core.ui.fitArtwork(
+                slotWidth = slot.width,
+                slotHeight = slot.height,
+                imageWidth = image.width.toFloat(),
+                imageHeight = image.height.toFloat(),
+            )
+            val left = railContentLeft + slot.left + fitted.left
+            val top = bandH + slot.top + fitted.top
+            val radius = com.aeriotv.android.core.ui.artworkRadiusPx(
+                fitted = fitted,
+                containerRadiusPx = GUIDE_RAIL_CORNER.toPx(),
+                rounded = roundedArtwork,
+                // Same decoded-image verdict the list row gets: opaque tile
+                // rounds, floating logo stays square.
+                isTile = com.aeriotv.android.core.ui.ArtworkTile
+                    .verdict(channel.tvgLogo) == true,
+            )
+            val drawLogo = {
+                drawImage(
+                    image,
+                    dstOffset = IntOffset(left.toInt(), top.toInt()),
+                    dstSize = IntSize(fitted.width.toInt(), fitted.height.toInt()),
+                )
+            }
+            if (radius > 0f) {
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    addRoundRect(
+                        androidx.compose.ui.geometry.RoundRect(
+                            left = left,
+                            top = top,
+                            right = left + fitted.width,
+                            bottom = top + fitted.height,
+                            cornerRadius = CornerRadius(radius, radius),
+                        ),
+                    )
+                }
+                clipPath(path) { drawLogo() }
+            } else {
+                drawLogo()
+            }
+        }
+        if (isKept) {
+            // KEPT chip in the band, right after the number (accent, same
+            // chip construction as the program flag badges).
+            val chipH = (bandH - 2.dp.toPx()).coerceAtLeast(6.dp.toPx())
+            val chipW = keptLabel.size.width + 5.dp.toPx()
+            val numberW = underNumber?.title?.size?.width?.toFloat() ?: 0f
+            val chipX = bandInset + (if (numberW > 0f) numberW + 4.dp.toPx() else 0f)
+            val chipY = ((bandH - chipH) / 2f).coerceAtLeast(0f)
+            drawRoundRect(accent, topLeft = Offset(chipX, chipY), size = Size(chipW, chipH), cornerRadius = CornerRadius(3.dp.toPx()))
+            drawText(keptLabel, topLeft = Offset(chipX + 2.5.dp.toPx(), chipY + (chipH - keptLabel.size.height) / 2f))
+        }
+        geometry.number?.let { rect ->
+            underNumber?.let {
+                drawText(it.title, topLeft = Offset(railContentLeft + rect.left + (rect.width - it.title.size.width) / 2f, bandH + rect.top))
+            }
+        }
+        geometry.name?.let { rect ->
+            name?.let {
+                drawText(it.title, topLeft = Offset(railContentLeft + rect.left + (rect.width - it.title.size.width) / 2f, bandH + rect.top))
+            }
+        }
+        // THE BAND on TV: number at the start, glyphs at the end, both
+        // vertically centered in the band. Off TV the glyphs keep their old
+        // top-right corner placement and the number stays in the badge stack.
+        run {
+            underNumber?.let {
+                drawText(
+                    it.title,
+                    topLeft = Offset(
+                        bandInset,
+                        ((bandH - it.title.size.height) / 2f).coerceAtLeast(0f),
+                    ),
+                )
+            }
+        }
+        run {
+            val iconPx = bandGlyph
+            // END INSET (Logan 2026-09-17, Streamer: the catch-up clock was
+            // cut off on the right). The rail's own hairline is a 1 dp stroke
+            // centered on railWidth - 0.5, so it covers the last half dp of the
+            // rail and the first half dp past it. The glyph's RIGHT EDGE is
+            // therefore placed a full inset PLUS that hairline inside the rail,
+            // so the whole 8 dp box is clear of both the hairline and the
+            // program strip that starts at railWidth.
+            val hairlinePx = 1.dp.toPx()
+            val endInset = bandInset + hairlinePx
+            val gap = (if (isTv) GUIDE_TV_BAND_GLYPH_GAP else 4.dp).toPx()
+            val glyphTop = ((bandH - iconPx) / 2f).coerceAtLeast(0f)
+            // The clock sits hard at the end; the star sits one gap before it.
+            val clockLeft = (railWidthPx - iconPx - endInset).coerceAtLeast(0f)
+            if (isFavorite) {
+                // Same box and same baseline as the catch-up clock so the two
+                // sit on one line (a text glyph sat lower, Logan 2026-09-09).
+                val left = (clockLeft - (if (channel.hasCatchup) iconPx + gap else 0f)).coerceAtLeast(0f)
+                translate(left = left, top = glyphTop) {
+                    with(starPainter) { draw(Size(iconPx, iconPx), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(Color(0xFFFFA502))) }
+                }
+            }
+            if (channel.hasCatchup) {
+                translate(left = clockLeft, top = glyphTop) {
+                    with(catchupPainter) { draw(Size(iconPx, iconPx), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(tertiary.copy(alpha = 0.8f))) }
+                }
+            }
+        }
+        // Neutral hairlines (tvOS: the app background shows through a 1 pt
+        // gap; accent-tinted rules read as heavy borders, Logan 2026-09-10).
+        // Phone / tablet: Apple iOS rail rule, accentPrimary 0.20.
+        drawLine(if (isTv) Color.White.copy(alpha = 0.08f) else accent.copy(alpha = 0.2f), Offset(railWidthPx - 0.5f, 0f), Offset(railWidthPx - 0.5f, size.height), strokeWidth = 1.dp.toPx())
+
+        // Programme strip.
+        clipRect(railWidthPx, 0f, size.width, size.height) {
+        translate(left = railWidthPx) {
+            val stripW = size.width - railWidthPx
+            // Clamped: a draw start outside the rows window used to leave the
+            // whole row blank (Logan 2026-09-19).
+            val vs = state.drawStartMs
+            val ve = vs + (stripW / pxPerMs).toLong()
+            val focusStart = focusedCellStart
+            val focusedHere = gridFocused && focusStart != Long.MIN_VALUE
+            // Settled = the eased draw start has reached the logical viewport.
+            val viewportSettled = state.drawViewportStartMs == state.viewportStartMs
+            // Drop cached layouts for programs well outside the drawn window
+            // so the per-row map stays bounded while the user pans.
+            if (textCache.size > CELL_TEXT_CACHE_SOFT_CAP) {
+                val keepFrom = vs - CELL_TEXT_EVICT_MARGIN_MS
+                val keepTo = ve + CELL_TEXT_EVICT_MARGIN_MS
+                textCache.values.removeAll { it.startMs != Long.MIN_VALUE && (it.startMs < keepFrom || it.startMs >= keepTo) }
+            }
+            val cells = state.rows.cells(row)
+            var i = state.rows.cellIndexAt(row, vs).let { if (it < 0) 0 else it }
+            // Sticky labels: x0 is clamped to the strip's left edge, so a
+            // cell scrolled partly off screen draws its title and subtitle
+            // from the visible edge (the clipRect below follows x0). The
+            // airing cell clipped at now also keeps a minimum visible width
+            // so even a 5-minute sliver shows its title (Logan 2026-10-11);
+            // the next cell starts after it. Plain floats, no allocation.
+            val airingMinPx = AIRING_MIN_VISIBLE.toPx()
+            var drawnRight = 0f
+            while (i < cells.size) {
+                val cell = cells[i]
+                if (cell.startMillis >= ve) break
+                i++
+                if (cell.endMillis <= vs) continue
+                // The 5 minute lead (GuideGridState.leadMs) puts the strip edge
+                // before the first half-hour mark, so a program that already
+                // ended inside the lead drew as an untitled sliver left of the
+                // first header label (Logan 2026-10-15). Leave the lead blank
+                // for those; the airing cell still draws from the edge.
+                if (cell.startMillis < vs && cell.endMillis <= nowMs && cell.endMillis <= vs + state.leadMs) continue
+                val airing = nowMs in cell.startMillis until cell.endMillis
+                val x0 = ((cell.startMillis - vs) * pxPerMs).coerceAtLeast(drawnRight)
+                var x1 = ((cell.endMillis - vs) * pxPerMs).coerceAtMost(stripW)
+                if (airing && cell.startMillis < vs && x1 - x0 < airingMinPx) x1 = (x0 + airingMinPx).coerceAtMost(stripW)
+                if (x1 - x0 < MIN_CELL_PX + seam) { drawnRight = maxOf(drawnRight, x1); if (x1 <= x0) continue }
+                drawnRight = maxOf(drawnRight, x1)
+                val w = (x1 - x0 - seam).coerceAtLeast(MIN_CELL_PX)
+                val focused = focusedHere && cell.startMillis == focusStart
+                // Category tint first (Apple: tvOS 0.55 focused / 0.35 live /
+                // 0.22, iOS 0.45 live / 0.28), then the idiom's neutral fill:
+                // iOS = accentPrimary 0.25 airing, cardBackground otherwise.
+                val catBase = if (cell.isPlaceholder) null else palette?.resolveBaseColor(cell.category)
+                val fill = when {
+                    catBase != null && isTv -> catBase.copy(alpha = (if (focused) 0.55f else if (airing) 0.35f else 0.22f) * tintScale)
+                    focused -> Color.White.copy(alpha = 0.3f)
+                    catBase != null -> catBase.copy(alpha = (if (airing) 0.45f else 0.28f) * tintScale)
+                    cell.isPlaceholder -> Color.White.copy(alpha = 0.03f)
+                    !isTv && airing -> accent.copy(alpha = 0.25f)
+                    !isTv -> surface
+                    airing -> Color.White.copy(alpha = 0.12f)
+                    else -> Color.White.copy(alpha = 0.05f)
+                }
+                // Logan 2026-09-02: the ring follows the cell's own shape.
+                // GH #87: "Rounded Program Cells" rounds the program cells at
+                // the rail's radius, separate from the logo toggle.
+                val radius = if (roundedCells) CornerRadius(GUIDE_RAIL_CORNER.toPx()) else CornerRadius.Zero
+                drawRoundRect(fill, topLeft = Offset(x0, 0f), size = Size(w, size.height - 1f), cornerRadius = radius)
+                if (focused) {
+                    // Apple TV draws a 4pt ring at 1080p (about 4px); Android TV
+                    // density is 2x, so 2dp is the same visual weight (Logan 2026-09-01).
+                    val bw = 2.dp.toPx()
+                    drawRoundRect(
+                        Color.White,
+                        topLeft = Offset(x0 + bw / 2, bw / 2),
+                        size = Size(w - bw, size.height - 1f - bw),
+                        cornerRadius = if (roundedCells) CornerRadius((radius.x - bw / 2).coerceAtLeast(0f)) else radius,
+                        style = Stroke(width = bw),
+                    )
+                }
+                val infoButton = showsInfoButton(cell, w, GUIDE_INFO_BUTTON_MIN_CELL.toPx())
+                val infoReserve = if (infoButton) GUIDE_INFO_BUTTON_SIZE.toPx() + GUIDE_INFO_BUTTON_INSET.toPx() else 0f
+                if (w >= 40.dp.toPx()) {
+                    // Text stops short of the info button when it shows.
+                    val textW = (w - 2 * padH - infoReserve).toInt().coerceAtLeast(1)
+                    val tall = size.height >= 44.dp.toPx()
+                    // Phone rows (98dp, Logan 2026-09-05 / EPGGuideView.swift)
+                    // have room for TWO description lines under the title and
+                    // subtitle; the 72dp / TV rows keep one.
+                    // Threshold follows the Text Size so the phone row (98dp x
+                    // Text Size) keeps its two lines at every stop.
+                    val descLines = if (size.height >= 90.dp.toPx() * appTextScale * subRowGrowth) 2 else 1
+                    // The key identifies every input the measured layouts
+                    // depend on that the cache's own remember() key does not
+                    // already cover: the program, the line count and the cell
+                    // shape. The badge line (flags plus the restored S/E pill)
+                    // is part of the shape, so showBadges rides in here too
+                    // rather than relying on the map being rebuilt.
+                    // The width is NOT in the key (perf 2026-10-03): a cell
+                    // clipped at the strip edge changes width on every frame
+                    // of the 0.3 s pan ease, which re-measured it per frame
+                    // and grew the map without bound. One entry per cell holds
+                    // the width it was measured at; while the pan eases the
+                    // existing layout is drawn (clipped by the cell rect), and
+                    // once the viewport settles a width change re-measures, so
+                    // the resting guide looks exactly as before.
+                    val key = ((cell.startMillis * 4 + descLines) * 2 + (if (compact) 1 else 0)) * 2 +
+                        (if (showBadges) 1 else 0)
+                    // Clipped = the cell runs past either strip edge, so textW
+                    // is only its visible slice. A layout measured clipped is
+                    // never final: it is reused mid-pan only while the cell is
+                    // still clipped, re-measured the moment the cell is fully
+                    // on screen, and in any case once the viewport settles at
+                    // a different width (Logan 2026-10-04: "Spo..." cells).
+                    val clippedNow = cell.startMillis < vs || cell.endMillis > ve
+                    val cachedText = textCache[key]
+                    val reuse = cachedText != null && (
+                        cachedText.measuredW == textW ||
+                            (!viewportSettled && !(cachedText.measuredClipped && !clippedNow))
+                        )
+                    val text = if (reuse) cachedText!! else run {
+                        fun measure(t: String, st: TextStyle, maxH: Float, ellipsis: Boolean = true, lines: Int = 1, maxW: Int = textW) = textMeasurer.measure(
+                            text = t, style = st, maxLines = lines,
+                            overflow = if (ellipsis) TextOverflow.Ellipsis else TextOverflow.Clip,
+                            constraints = Constraints(maxWidth = maxW.coerceAtLeast(1), maxHeight = maxH.toInt().coerceAtLeast(1)),
+                        )
+                        // A date-coded season ("S2026 E917") is real provider
+                        // data and must stay readable, but it must never eat
+                        // the flag badges beside it, so the pill ellipsizes
+                        // itself at a third of the text column.
+                        fun pill(c: EPGProgramme) = if (!showBadges) null else c.seasonEpisodeLabel()
+                            ?.let { measure(it, pillStyle, 12.sp.toPx(), maxW = textW / 3) }
+                        val title = measure(cell.title, if (cell.isPlaceholder) titleDimStyle else titleStyle, 20.sp.toPx())
+                        if (cell.isPlaceholder || !tall) CellText(title, null) else if (compact) {
+                            // Channel Preview (tvOS): title, the subtitle
+                            // line, then the S/E pill and flag badges on the
+                            // bottom line; the banner carries the time and
+                            // the description.
+                            val sub = cell.subTitle?.takeIf { showSubtitles && !subtitleIsRedundant(it, cell.title, cell.description) }
+                                ?.let { measure(it, subStyle, 15.sp.toPx() * subScale) }
+                            // The S/E label is NOT drawn in a program cell any
+                            // more (Logan 2026-09-17): it lives in the preview
+                            // banner's meta line, so the cell does not even
+                            // measure it.
+                            val badges = if (showBadges) cell.epgFlags().filter { it.label !in hiddenBadges }
+                                .map { measure(it.label, badgeStyle, 12.sp.toPx(), ellipsis = false) to it.color } else emptyList()
+                            CellText(title, null, null, sub, badges)
+                        } else {
+                            // Apple parity: the sub-title never double-prints
+                            // the title or the description (feeds that promote
+                            // sub-title into <desc>), and the Appearance
+                            // toggle drops the line entirely.
+                            val sub = cell.subTitle?.takeIf { showSubtitles && !subtitleIsRedundant(it, cell.title, cell.description) }
+                                ?.let { measure(it, subStyle, 15.sp.toPx() * subScale) }
+                            val desc = cell.description.takeIf { it.isNotBlank() }
+                                ?.let { measure(it, descStyle, 15.sp.toPx() * subScale * descLines, lines = descLines) }
+                            val range = rangeCache.getOrPut(cell.startMillis) {
+                                shortFmt.format(Date(cell.startMillis)) + " - " + shortFmt.format(Date(cell.endMillis))
+                            }
+                            val time = measure(range, timeStyle, 15.sp.toPx() * subScale, ellipsis = false)
+                            val badges = if (showBadges) cell.epgFlags().filter { it.label !in hiddenBadges }
+                                .map { measure(it.label, badgeStyle, 12.sp.toPx(), ellipsis = false) to it.color } else emptyList()
+                            CellText(title, time, desc, sub, badges, pill(cell))
+                        }
+                    }.also { if (it !== cachedText) { it.measuredW = textW; it.measuredClipped = clippedNow; it.startMs = cell.startMillis; textCache[key] = it } }
+                    val recording = !cell.isPlaceholder && recordingWindows.any { win ->
+                        cell.startMillis < win.last && cell.endMillis > win.first
+                    }
+                    clipRect(x0, 0f, x0 + w, size.height) {
+                        val x = x0 + padH
+                        var y = 3.dp.toPx()
+                        // Per-program catch-up badge (iPhone EPGGuideView cell,
+                        // ChannelListView.canReplay): aired, and still inside the
+                        // channel's archive window (capped at 30 days). Drawn
+                        // before the title in the accent colour.
+                        val replayable = !cell.isPlaceholder && channel.hasCatchup && cell.endMillis <= nowMs &&
+                            nowMs - cell.endMillis <= minOf(channel.catchupDays, 30) * 86_400_000L
+                        var titleX = x
+                        if (replayable) {
+                            val iconPx = (text.title.size.height * 0.7f)
+                            translate(left = x, top = y + (text.title.size.height - iconPx) / 2f) {
+                                with(stripCatchupPainter) { draw(Size(iconPx, iconPx), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(colors.primary)) }
+                            }
+                            titleX += iconPx + 4.dp.toPx()
+                        }
+                        // Only the title line moves over for the badge.
+                        drawText(text.title, topLeft = Offset(titleX, y)); y += text.title.size.height - 1.dp.toPx()
+                        text.sub?.let { drawText(it, topLeft = Offset(x, y)); y += it.size.height - 1.dp.toPx() }
+                        text.desc?.let { drawText(it, topLeft = Offset(x, y)); y += it.size.height - 1.dp.toPx() }
+                        if (text.range == null && text.badges.isNotEmpty()) {
+                            // Compact cell: chips alone on the row floor.
+                            val chipH = text.title.size.height - 4.dp.toPx()
+                            val chipY = size.height - 3.dp.toPx() - chipH
+                            var bx = x
+                            for ((badge, color) in text.badges) {
+                                val cw = badge.size.width + 5.dp.toPx()
+                                if (bx + cw > x0 + w) break
+                                drawRoundRect(color, topLeft = Offset(bx, chipY), size = Size(cw, chipH), cornerRadius = CornerRadius(3.dp.toPx()))
+                                drawText(badge, topLeft = Offset(bx + 2.5.dp.toPx(), chipY + (chipH - badge.size.height) / 2f))
+                                bx += cw + 3.dp.toPx()
+                            }
+                        }
+                        text.range?.let { time ->
+                            // Bottom line sits on the row floor; the lines above stack from the top.
+                            // Phone rows (iPhone): time on its own line, the S/E pill and
+                            // badges on a line under it; 72 dp rows keep them together.
+                            val stacked = descLines == 2 && (text.pill != null || text.badges.isNotEmpty())
+                            val chipH = time.size.height - 4.dp.toPx()
+                            val ty = if (stacked) maxOf(y, size.height - 3.dp.toPx() - chipH - 3.dp.toPx() - time.size.height)
+                                else maxOf(y, size.height - 3.dp.toPx() - time.size.height)
+                            var bx = x
+                            drawText(time, topLeft = Offset(bx, ty))
+                            if (stacked) bx = x else bx += time.size.width + 5.dp.toPx()
+                            val chipY = if (stacked) ty + time.size.height + 3.dp.toPx() else ty + (time.size.height - chipH) / 2f
+                            // S/E first, then the flags (Apple compactBadgeRow).
+                            text.pill?.let { pill ->
+                                val cw = pill.size.width + 5.dp.toPx()
+                                if (bx + cw <= x0 + w) {
+                                    drawRoundRect(outline, topLeft = Offset(bx, chipY), size = Size(cw, chipH), cornerRadius = CornerRadius(3.dp.toPx()), style = Stroke(width = 1.dp.toPx()))
+                                    drawText(pill, topLeft = Offset(bx + 2.5.dp.toPx(), chipY + (chipH - pill.size.height) / 2f))
+                                    bx += cw + 4.dp.toPx()
+                                }
+                            }
+                            for ((badge, color) in text.badges) {
+                                val cw = badge.size.width + 5.dp.toPx()
+                                if (bx + cw > x0 + w) break
+                                drawRoundRect(color, topLeft = Offset(bx, chipY), size = Size(cw, chipH), cornerRadius = CornerRadius(3.dp.toPx()))
+                                drawText(badge, topLeft = Offset(bx + 2.5.dp.toPx(), chipY + (chipH - badge.size.height) / 2f))
+                                bx += cw + 3.dp.toPx()
+                            }
+                        }
+                        if (recording) {
+                            drawCircle(NOW_RED, radius = 4.dp.toPx(), center = Offset(x0 + w - 10.dp.toPx(), 10.dp.toPx()))
+                        }
+                    }
+                }
+                if (infoButton) {
+                    val bs = GUIDE_INFO_BUTTON_SIZE.toPx()
+                    val inset = GUIDE_INFO_BUTTON_INSET.toPx()
+                    translate(left = x0 + w - inset - bs, top = size.height - 1f - inset - bs) {
+                        with(infoPainter) { draw(Size(bs, bs), colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(accent)) }
+                    }
+                }
+            }
+            if (nowMs in (vs + 1) until ve) {
+                val x = (nowMs - vs) * pxPerMs
+                drawLine(NOW_RED, Offset(x, 0f), Offset(x, size.height), strokeWidth = 2.dp.toPx())
+            }
+        }
+        }
+        // Phone / tablet: Apple iOS row rule, accentPrimary 0.08.
+        drawLine(if (isTv) Color.White.copy(alpha = 0.07f) else accent.copy(alpha = 0.08f), Offset(0f, size.height - 0.5f), Offset(size.width, size.height - 0.5f), strokeWidth = 1f)
+        Trace.endSection()
+    }
+}
+
+/**
+ * Channel logos as bitmaps for the row draw pass. A miss enqueues a Coil
+ * load; when it lands the snapshot map changes and the rows that read the
+ * url redraw. Bounded by the number of distinct logo urls in the playlist.
+ */
+class GuideLogoCache(private val context: android.content.Context) {
+    private val bitmaps = mutableStateMapOf<String, ImageBitmap?>()
+    private val inFlight = HashSet<String>()
+
+    fun bitmap(url: String): ImageBitmap? {
+        bitmaps[url]?.let { return it }
+        if (bitmaps.containsKey(url) || !inFlight.add(url)) return null
+        val request = ImageRequest.Builder(context)
+            .data(url)
+            // DECODE TARGET (Logan 2026-09-17). 128 px downsampled almost every
+            // real logo below the rail's box (a TV box is about 208 px wide at
+            // 2x density, more at the larger comfort scales), and the rail then
+            // capped the drawn size at those decoded pixels, so small-source
+            // logos came out about half the size Apple TV gives them. 320 px is
+            // above the widest box the rail can ask for, so the cap is now the
+            // SOURCE's own size rather than a thumbnail's. Coil only ever
+            // downsamples to this target, never upsamples, so an image smaller
+            // than 320 px comes back at its native size.
+            .size(320, 320)
+            .target(
+                onSuccess = { image ->
+                    val bitmap = image.toBitmap()
+                    // Sample the tile/floating verdict once, here, off the
+                    // decoded bitmap: every surface reads the same answer.
+                    com.aeriotv.android.core.ui.ArtworkTile.sample(url, bitmap)
+                    bitmaps[url] = bitmap.asImageBitmap()
+                    inFlight.remove(url)
+                },
+                onError = { bitmaps[url] = null; inFlight.remove(url) },
+            )
+            .build()
+        SingletonImageLoader.get(context).enqueue(request)
+        return null
+    }
+}
+
+val LocalLogoCache = staticCompositionLocalOf<GuideLogoCache> { error("GuideLogoCache not provided") }
+
+/** Focus lane: the seventh visible row (index 6), as on Apple TV. */
+private const val LANE_ROWS = 6
+private const val HOLD_LEFT_REPEATS = 4
+private const val OK_LONG_REPEATS = 1
+/**
+ * Actions about the focused program itself. Mapped to a short Left/Right
+ * they fire on every press; every other action (group menu, timeline,
+ * paging, Nothing, ...) fires only on the live program (Left) or the row's
+ * last program (Right), and the arrow moves focus everywhere else.
+ */
+private val GuideRemoteAction.columnIndependent: Boolean
+    get() = this == GuideRemoteAction.PLAY || this == GuideRemoteAction.PROGRAM_MENU ||
+        this == GuideRemoteAction.PROGRAM_INFO || this == GuideRemoteAction.RECORD
+
+/** Trace name for the D-pad keys the guide logs; null for every other key. */
+private fun guideTraceKeyName(event: KeyEvent): String? = when (event.key) {
+    Key.DirectionCenter, Key.Enter, Key.NumPadEnter -> "Center"
+    else -> TvFocusTrace.nameOf(event)
+}
+
+/** "r<row> <channel> @<programStart>" for the trace. */
+internal fun guideTraceCell(state: GuideGridState): String {
+    val row = state.focusRow
+    if (row !in 0 until state.rows.size) return "r$row(none)"
+    return "r$row ${state.rows.channel(row).name} @${state.focusCellStartMs}"
+}
+
+private fun GuideRemoteAction.orDefault(default: GuideRemoteAction) = if (this == GuideRemoteAction.NONE) default else this
+private const val MIN_CELL_PX = 6f
+/** Airing cell clipped at the strip edge never draws narrower than this, so its title shows. */
+private val AIRING_MIN_VISIBLE = 72.dp
+/** GH #127 guide cell info button: glyph size, corner inset, tap target, min visible cell width. */
+internal val GUIDE_INFO_BUTTON_SIZE = 18.dp
+private val GUIDE_INFO_BUTTON_INSET = 5.dp
+internal val GUIDE_INFO_BUTTON_HIT = 40.dp
+private val GUIDE_INFO_BUTTON_MIN_CELL = 120.dp
+private const val CELL_TEXT_CACHE_SOFT_CAP = 48
+private const val CELL_TEXT_EVICT_MARGIN_MS = 12 * 3_600_000L
+private const val RAIL_NAME_KEY = Long.MIN_VALUE + 2
+private const val RAIL_UNDER_NUMBER_KEY = Long.MIN_VALUE + 3
+
+// Grown rail logo (number and/or name hidden): inset from the rail edges,
+// top clearance under the 12 dp corner icons (4 dp top + 12 dp + 2 dp), and
+// (the wide rail's separate number column is gone: the number is stacked
+// under the logo now).
+private val RAIL_LOGO_INSET = 4.dp
+
+/**
+ * The TV rail's top BAND (Logan 2026-09-16, final Apple TV layout): a fixed
+ * strip at the top of EVERY TV rail cell carrying the channel number at the
+ * start and the favorite star / catch-up clock at the end. Drawn on every row
+ * whether or not the row has either, so the logo block under it is identical
+ * from row to row. The TV guide row height carries this on top of its old
+ * value, so the logo keeps exactly the size it had before the band existed.
+ */
+internal val GUIDE_TV_RAIL_BAND = 11.dp
+
+/** Start / end inset of the band's contents. */
+private val GUIDE_TV_BAND_INSET = 4.dp
+
+/** The band's glyph box (favorite star, catch-up clock). */
+private val GUIDE_TV_BAND_GLYPH = 8.dp
+
+/** Space between the two band glyphs. */
+private val GUIDE_TV_BAND_GLYPH_GAP = 3.dp
+
+/**
+ * Side inset of the TV LOGO column under the band. Wider than the band's own
+ * inset so a width-driven wide logo (ESPN2, ESPNU) can never touch the cell
+ * edge or the rail hairline.
+ */
+private val GUIDE_TV_LOGO_INSET = 8.dp
+
+/**
+ * The same band on the PHONE / TABLET guide column (Logan 2026-09-16), sized
+ * for a 78 dp column: 16 dp tall, 4 dp insets, 10 dp glyphs. The List view is
+ * untouched and keeps the stacked badge.
+ */
+internal val GUIDE_PHONE_RAIL_BAND = 16.dp
+private val GUIDE_PHONE_BAND_INSET = 4.dp
+private val GUIDE_PHONE_BAND_GLYPH = 10.dp
+
+/**
+ * How much the phone / tablet guide row grows for the band: the band's height
+ * less the number line the badge no longer stacks under the logo, so the logo
+ * itself does not shrink.
+ */
+internal val GUIDE_PHONE_ROW_BAND_GROWTH = 4.dp
+
+/**
+ * The guide cell/rail's own corner radius, handed to the SHARED rounding rule
+ * so a rail logo and a list row logo round the same way (Logan 2026-09-16).
+ */
+private val GUIDE_RAIL_CORNER = 6.dp
+private val NOW_RED = Color(0xFFFF4757)
+
+private class CellText(
+    val title: TextLayoutResult,
+    val range: TextLayoutResult?,
+    val desc: TextLayoutResult? = null,
+    val sub: TextLayoutResult? = null,
+    val badges: List<Pair<TextLayoutResult, Color>> = emptyList(),
+    /**
+     * Season / episode label for the badge line, an outlined pill drawn
+     * before the flag badges (Apple's compactBadgeRow order). Null in the TV
+     * Channel Preview cell, where the banner carries it instead.
+     */
+    val pill: TextLayoutResult? = null,
+) {
+    /** Text column width (px) the program layouts were measured for. */
+    var measuredW: Int = -1
+    /** True when [measuredW] was a clipped slice at a strip edge. */
+    var measuredClipped: Boolean = false
+    /** Program start, for window eviction; MIN_VALUE for rail entries. */
+    var startMs: Long = Long.MIN_VALUE
+}

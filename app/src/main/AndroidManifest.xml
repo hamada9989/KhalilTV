@@ -1,0 +1,285 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Google Cast (GH #33) sender-side device discovery. The Cast SDK's mDNS
+         discovery runs in-process (androidx.mediarouter) and needs a Wi-Fi
+         multicast lock to receive the _googlecast._tcp advertisements; without
+         these two normal-protection permissions the phone finds zero cast
+         devices and the Cast button never appears. Neither is a location or
+         hardware-feature permission, so Android TV eligibility is unaffected. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- LAN URL switching probes the server over HTTP (LanReachability); no
+         location or wifi-state permissions needed since the SSID is never
+         read. Keeping the manifest free of location permissions also keeps
+         the app eligible for Android TV devices without location hardware. -->
+    <!-- Phase 9b Local DVR. Foreground service handles in-flight downloads
+         so Android doesn't kill the recording when the user backgrounds the
+         app. mediaPlayback service type matches the spirit of the work even
+         though we're writing the stream to disk rather than rendering it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- API 33+ explicit runtime permission for the ongoing notification. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Partial wake lock so a local DVR recording's download isn't stalled
+         by CPU doze. Gated behind the "Keep device awake during recording"
+         DVR setting (default ON, iOS parity). Normal-protection, granted at
+         install. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Detail screens offer "Play in YouTube" for trailers on TV. API 30+
+         package-visibility filtering hides other apps from resolveActivity
+         unless the intent shape is declared here; without it the YouTube
+         lookup always misses and the menu silently degrades to QR-only. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" android:host="www.youtube.com" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".AerioTVApplication"
+        android:allowBackup="true"
+        android:largeHeap="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:banner="@drawable/tv_banner"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.AerioTV">
+
+        <!-- Allow shell profiling (simpleperf / am profile) of release builds on
+             production devices, so on-device performance can be measured without
+             a debuggable build. Ship-safe and Google-recommended; no effect on
+             behavior, no debuggability exposure. -->
+        <profileable android:shell="true" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.AerioTV">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                Audit task #47. aeriotv:// deep links for direct-to-content
+                launches.
+                  aeriotv://channel/<channelId>  jumps straight to the
+                    fullscreen player for that channel (used by future
+                    Android TV home-channel recommendations, the in-app
+                    reminder banner's tap-to-watch, and a possible CLI/web
+                    handoff).
+                  aeriotv://vod/<movieUuid>      jumps to the VOD movie
+                    detail screen for that movie uuid.
+                Both routes degrade gracefully: if the channel/movie no
+                longer exists in the active playlist the navigator just
+                lands on MAIN silently (see deepLinkTarget handling in
+                AerioTVNavHost).
+            -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="aeriotv" />
+                <data android:host="channel" />
+                <data android:host="vod" />
+                <!-- Audit #47 Watch Next: resume VOD playback directly. -->
+                <data android:host="vodplay" />
+                <!--
+                    Screenshot automation: aeriotv://settings/<page> opens the
+                    Settings tab directly on one page (root, playlists, livetv,
+                    player, movies, dvr, appearance, general, remote, sync,
+                    updates, developer, about, playlist-detail, edit-playlist).
+                    An unknown page lands on the Settings root. Kept in release
+                    builds: it only opens a page the user can already reach.
+                -->
+                <data android:host="settings" />
+            </intent-filter>
+
+            <!--
+                Cast Connect (GH #33). When a phone sender launches AerioTV as an
+                Android-TV RECEIVER, the framework delivers this LAUNCH action to
+                MainActivity. Because the activity is singleTop and already fields
+                MAIN/LEANBACK launches and aeriotv:// deep links, onNewIntent /
+                the launch-intent handler must disambiguate a Cast LAUNCH (route
+                it to the fullscreen player so the persistent PlayerView surface
+                exists) from a normal launch and a deep link. Only meaningful on
+                Android TV devices; harmless elsewhere.
+            -->
+            <intent-filter>
+                <action android:name="com.google.android.gms.cast.tv.action.LAUNCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!--
+                Cast Connect LOAD (Google's core_features guide): a load request
+                for a contentId / queue arrives as this action. MainActivity hands
+                every intent to MediaManager.onNewIntent (AerioCastReceiverController
+                .handleIntent), which dispatches it to the MediaLoadCommandCallback.
+            -->
+            <intent-filter>
+                <action android:name="com.google.android.gms.cast.tv.action.LOAD" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".feature.dvr.LocalRecordingService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!--
+            Cast HLS proxy keep-alive (GH #33 web-receiver rework). While a
+            web/styled cast session is active the phone ingests the raw TS and
+            serves it to the Chromecast as live HLS; this FGS is the only thing
+            keeping the process alive once the app leaves the foreground (the
+            media FGS is deliberately stopped while casting, see
+            CastNotificationController).
+        -->
+        <service
+            android:name=".core.cast.hlsproxy.CastHlsProxyService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <!--
+            Media3 MediaLibraryService: background audio + lock-screen controls
+            AND the Android Auto browse tree. exported=true so Android Auto can
+            bind to it. The android.media.browse.MediaBrowserService action is
+            what Auto (a legacy MediaBrowser client) discovers; Media3 bridges
+            that bind to our MediaLibrarySession automatically.
+        -->
+        <service
+            android:name=".core.playback.AerioMediaPlaybackService"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback"
+            tools:ignore="ExportedService">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
+            </intent-filter>
+        </service>
+
+        <!-- Companion remote: media notification while this phone controls a
+             TV (transport controls forward over the companion socket). -->
+        <service
+            android:name=".core.cast.companion.CompanionRemoteService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+
+        <!-- Declares AerioTV as an Android Auto media app (form factor). -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+
+        <!--
+            Google Cast (GH #33). SENDER options provider: names the class the
+            Cast framework instantiates to obtain CastOptions (receiver App ID +
+            Cast Connect launch flag) the first time CastContext is requested.
+            Init is gated on BuildConfig.CAST_RECEIVER_APP_ID being non-blank, so
+            a build without a registered Cast App ID never touches CastContext
+            and this provider is simply never called.
+        -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.aeriotv.android.core.cast.AerioCastOptionsProvider" />
+
+        <!--
+            Cast Connect RECEIVER options provider: on Android TV, names the
+            class supplying CastReceiverOptions when CastReceiverContext starts.
+        -->
+        <meta-data
+            android:name="com.google.android.gms.cast.tv.RECEIVER_OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.aeriotv.android.core.cast.AerioReceiverOptionsProvider" />
+
+        <receiver
+            android:name=".feature.reminders.ReminderBroadcastReceiver"
+            android:exported="false" />
+
+        <!--
+            FileProvider for sharing debug logs out of the app's private
+            filesDir/logs/. Settings -> Developer -> Share Log File grants
+            a temporary read-URI to the receiving app via this authority.
+            The path set is declared in res/xml/log_file_paths.xml.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            tools:ignore="Typos">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/log_file_paths" />
+        </provider>
+
+        <!--
+            AerioTVApplication implements WorkManager's Configuration.Provider
+            (for the Hilt worker factory). When you supply your own WorkManager
+            configuration, the default androidx.startup auto-initializer must be
+            removed so on-demand init takes over. Without this, lintVitalRelease
+            fails the release build (RemoveWorkManagerInitializer).
+        -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+        <!--
+            Runs on the FIRST process start after this app is updated in place
+            (any channel: adb, Play, or the in-app updater). AlarmManager drops
+            every scheduled alarm when a package is replaced, so programme
+            reminders silently die on each update without this; the receiver
+            re-registers them from the Room table. It also clears the in-app
+            updater's staged APK + bookkeeping after a successful self-update.
+            MY_PACKAGE_REPLACED is a protected broadcast the system delivers
+            only to the replaced app itself, so exported=false is safe.
+        -->
+        <receiver
+            android:name=".core.update.PackageReplacedReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Audit #47: the TV launcher asks the app to (re)populate its
+             home-screen channel row when the user enables it from the
+             launcher's customize UI. Must be exported for the launcher to
+             deliver it; the receiver only republishes launcher metadata. -->
+        <receiver
+            android:name=".core.tv.HomeChannelsInitReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.tv.action.INITIALIZE_PROGRAMS" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

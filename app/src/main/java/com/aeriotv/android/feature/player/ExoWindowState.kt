@@ -1,0 +1,189 @@
+package com.aeriotv.android.feature.player
+
+import androidx.compose.ui.unit.dp
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * App-scoped layout state for the single persistent Media3 PlayerView.
+ *
+ * Direct counterpart of [MpvWindowState] for the Media3 migration.
+ * Architecture is identical: ONE PlayerView lives in MainActivity's
+ * setContent root Box outside the NavHost; routes inside the NavHost
+ * (PlayerScreen, TvMiniPlayerOverlay) flip this state instead of
+ * creating their own AndroidView. The View's parent never changes,
+ * so SurfaceView reattach across nav transitions is avoided.
+ *
+ * SurfaceFlinger's hardware scaler handles the resize for free, so
+ * 210x118 mini -> 1920x1080 fullscreen is essentially free pixel-
+ * pushing-wise. Same as the MPV side.
+ *
+ * Why a separate state class (rather than reusing MpvWindowState):
+ * during the Live TV migration phase BOTH players are mounted in
+ * MainActivity (MPV for any path we haven't ported, Exo for Live TV).
+ * Each player owns its own state so flipping one mode doesn't
+ * inadvertently move the other's view. Once libmpv is torn out
+ * (task #67) MpvWindowState goes away and only this one survives.
+ */
+/**
+ * Chrome geometry the corner mini player has to respect. The mini is mounted
+ * at the ACTIVITY root, outside MainScaffold's composition, so a
+ * CompositionLocal cannot reach it; MainScaffold publishes the MEASURED TV tab
+ * bar height here instead and PersistentExoWindow reads it.
+ *
+ * tvOS pins the mini 87 pt (43.5 dp) below the physical top of the screen so it
+ * clears the system tab bar and the nav action circles beside it (HomeView
+ * .swift:4901). Android's bar is measured rather than fixed, so the inset is
+ * "the bar's own height plus 4 dp" and the mini can never clip the Settings
+ * pill however the bar is laid out.
+ */
+object MiniPlayerChrome {
+    /** Tab bar CONTENT bottom + 4 dp, in dp. The bar Box is 16 dp taller at
+     *  the top and 12 dp taller at the bottom than the capsule it draws, so
+     *  the Box's measured height would park the mini ~13 dp too low; the bar
+     *  reports its drawn bottom instead. Seeded with the designed layout. */
+    val topInsetDp = MutableStateFlow(54f)
+
+    /** Bottom of the Channel Preview banner's program art card in root px,
+     *  published by GuidePreviewBanner while it is mounted, 0 when it is not.
+     *  The mini's BOTTOM edge lines up with it (Logan 2026-09-11, tvOS: "logo,
+     *  copy and the corner mini share one baseline"), which is what keeps the
+     *  mini clear of the guide's time bar whatever the bar and banner measure. */
+    val bannerArtBottomPx = MutableStateFlow(0f)
+
+    /** Mini frame size (tvOS 410x231 pt halved). Lives here so the screens that
+     *  RESERVE a slot for the mini reserve exactly what the window draws. */
+    val miniWidth = 205.dp
+    val miniHeight = 115.dp
+
+    /** Gap between the mini's bottom edge and whatever sits under it. */
+    val miniGap = 8.dp
+
+    /** Top of the Live TV time header (the guide timeline) in root px,
+     *  published by GuideScreen while the Channel Preview banner is OFF and the
+     *  mini is Active; 0 otherwise. With the banner off there is no art card to
+     *  share a baseline with, so the mini's BOTTOM edge is anchored to the
+     *  MEASURED timeline top instead of a fixed inset, and the screen reserves
+     *  [miniHeight] + [miniGap] above the timeline so the timeline and the
+     *  channel rows start below the mini rather than under it (Logan
+     *  2026-09-13). Measured rather than computed so any future header change
+     *  keeps the two aligned. */
+    val timelineTopPx = MutableStateFlow(0f)
+
+    /** True while the TV shell's Settings tab is selected. The corner mini
+     *  slides mostly off the trailing edge (a [stashSliver] of video stays on
+     *  screen) so it never covers Settings, and slides back out the moment
+     *  another tab is selected. Published by MainScaffold's TV branch, and by
+     *  its touch branch on tablets (sw >= 600 dp), where PhoneMiniPlayer.kt
+     *  applies it (iPad parity). Phones never set it. */
+    val settingsStashed = MutableStateFlow(false)
+
+    /** Width of the video left on screen while the mini is stashed. */
+    val stashSliver = 32.dp
+}
+
+@Singleton
+class ExoWindowState @Inject constructor() {
+
+    /**
+     * [Tile]: the live channel that was playing in the mini player is a
+     * Multiview tile (Logan 2026-10-11, Apple parity: Play from a pile staged
+     * on the mini player keeps that channel's player, no re-tune). The window
+     * sits at [tileRectPx] under the NavHost, and the Multiview screen leaves
+     * that rect transparent so the video shows through with the tile chrome
+     * drawn over it.
+     */
+    enum class Mode { Hidden, Fullscreen, Mini, Tile }
+
+    private val _mode = MutableStateFlow(Mode.Hidden)
+    val mode: StateFlow<Mode> = _mode.asStateFlow()
+
+    /** Root-relative px rect of the held Multiview tile (Mode.Tile). */
+    val tileRectPx = MutableStateFlow(androidx.compose.ui.geometry.Rect.Zero)
+
+    fun requestTile() { _mode.value = Mode.Tile }
+
+    fun requestFullscreen() { _mode.value = Mode.Fullscreen }
+    fun requestMini() { _mode.value = Mode.Mini }
+    fun hide() { _mode.value = Mode.Hidden }
+
+    /**
+     * Live channel-flip hook for the hardware-key path. The fullscreen live
+     * PlayerScreen registers this while mounted (cleared on dispose); MainActivity
+     * .dispatchKeyEvent invokes it on D-pad UP/DOWN while [mode] == Fullscreen so
+     * channel surfing works even when the player controls overlay is on screen
+     * (Compose focus traversal otherwise swallows UP/DOWN among the chrome pills).
+     * Delta is +1 for UP (next channel) / -1 for DOWN (previous). Returns true if
+     * the flip was consumed; PlayerScreen returns false while a menu/sheet is open
+     * so UP/DOWN fall through to normal menu navigation there. Mirrors the
+     * PipState.onPipDismissed shared-hook pattern.
+     */
+    @Volatile var onLiveChannelFlip: ((Int) -> Boolean)? = null
+
+    /**
+     * Remote Control phase A2: generic player-action hook, same lifecycle
+     * as [onLiveChannelFlip] (registered by the fullscreen live
+     * PlayerScreen, cleared on dispose). MainActivity dispatches mapped
+     * actions that arrive on ACTIVITY-level keys (long Up/Down, media
+     * keys) through this so PlayerScreen state (chrome, menus, info card,
+     * last-channel zap) can execute them. Returns true when consumed.
+     */
+    @Volatile var onPlayerRemoteAction:
+        ((com.aeriotv.android.core.remote.PlayerRemoteAction) -> Boolean)? = null
+
+    /**
+     * Whether the fullscreen player currently OWNS D-pad UP/DOWN (channel
+     * surf / hold actions). PlayerScreen publishes false while its chrome,
+     * a scrub HUD, a menu/sheet, or the Recently Watched overlay is up -
+     * then MainActivity's short/long split must NOT consume the keys, so
+     * Compose focus traversal can walk the visible controls instead.
+     * Defaults true (bare fullscreen video = surf keys). The A2 deferred
+     * split otherwise swallowed BOTH actions unconditionally, which left
+     * chrome/overlay focus nav dead whenever a hold action was mapped.
+     */
+    @Volatile var dpadVerticalCaptured: Boolean = true
+
+    /**
+     * PR #101 (ruckusvol) re-implementation: whether the fullscreen player
+     * currently OWNS D-pad LEFT/RIGHT, so MainActivity can split a CUSTOM
+     * Left/Right map into short and long presses ahead of Compose focus, the
+     * way [dpadVerticalCaptured] does for Up/Down. PlayerScreen publishes it:
+     * `!chromeVisible && !recentsOverlayVisible && !channelListVisible &&
+     * !interactionLocked && !isCatchupMode`. Unlike vertical it does NOT
+     * release on the scrub HUD (a held seek keeps scrubbing), and it releases
+     * for all of catch-up (PlayerScreen's own block always scrubs there).
+     * Defaults FALSE: until PlayerScreen publishes it, the keys reach
+     * PlayerScreen's own Left/Right block exactly as before.
+     */
+    @Volatile var dpadHorizontalCaptured: Boolean = false
+
+    /**
+     * GH #94 Skip Without Controls: skip by the Skip Back / Skip Forward
+     * interval (forward = true for Skip Forward), the same seek the chrome's
+     * skip buttons run (live rewind or catch-up). Registered by the
+     * fullscreen live PlayerScreen, cleared on dispose. Returns true when a
+     * skip ran; false (or null hook) lets the key fall through.
+     */
+    @Volatile var onSkipRequest: ((forward: Boolean) -> Boolean)? = null
+
+    /**
+     * Remote Control phase A2: session-scoped last-channel zap memory
+     * (`lastChannel` zap-back, a 1-deep stack). [recordTune] is called
+     * on every successful live tune with the channel's stable id; it
+     * shifts the previous current into [lastChannelId]. In-memory only,
+     * deliberately not persisted or synced.
+     */
+    @Volatile var currentChannelId: String? = null
+        private set
+    @Volatile var lastChannelId: String? = null
+        private set
+
+    fun recordTune(channelId: String) {
+        if (channelId == currentChannelId) return
+        lastChannelId = currentChannelId
+        currentChannelId = channelId
+    }
+}

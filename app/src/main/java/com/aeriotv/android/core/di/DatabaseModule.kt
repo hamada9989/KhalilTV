@@ -1,0 +1,584 @@
+package com.aeriotv.android.core.di
+
+import android.content.Context
+import androidx.room.Room
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.aeriotv.android.core.data.db.AerioDatabase
+import com.aeriotv.android.core.data.db.dao.ChannelSnapshotDao
+import com.aeriotv.android.core.data.db.dao.EncryptingPlaylistDao
+import com.aeriotv.android.core.data.db.dao.EpgChunkCoverageDao
+import com.aeriotv.android.core.data.db.dao.EpgProgrammeDao
+import com.aeriotv.android.core.data.db.dao.FavoriteChannelDao
+import com.aeriotv.android.core.data.db.dao.LocalRecordingDao
+import com.aeriotv.android.core.data.db.dao.PlaylistDao
+import com.aeriotv.android.core.data.db.dao.ReminderDao
+import com.aeriotv.android.core.data.db.dao.WatchProgressDao
+import com.aeriotv.android.core.security.CredentialCipher
+import dagger.Module
+import dagger.Provides
+import dagger.hilt.InstallIn
+import dagger.hilt.android.qualifiers.ApplicationContext
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+object DatabaseModule {
+
+    /**
+     * v10 -> v11: add the nullable `dispatcharrProfileId` column to `playlists`
+     * for per-playlist Dispatcharr channel-profile scoping. A real ALTER (vs.
+     * the destructive fallback) so existing saved playlists, credentials, and
+     * LAN URLs survive the upgrade. SQLite ADD COLUMN with no default leaves
+     * existing rows NULL = "All Channels", which is the prior behaviour.
+     */
+    private val MIGRATION_10_11 = object : Migration(10, 11) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE playlists ADD COLUMN dispatcharrProfileId INTEGER")
+        }
+    }
+
+    /**
+     * v11 -> v12: add episode metadata + the up-next queue to `watch_progress`
+     * (iOS Issue #19 parity). Clean ALTERs so existing resume positions survive.
+     * Defaults keep pre-v12 rows behaving as movies with no queue.
+     */
+    private val MIGRATION_11_12 = object : Migration(11, 12) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN vodType TEXT NOT NULL DEFAULT 'movie'")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN seriesId TEXT")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN seasonNumber INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN episodeNumber INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN streamUrl TEXT")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN isFinished INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE watch_progress ADD COLUMN upNextQueue TEXT")
+        }
+    }
+
+    /**
+     * v12 -> v13: add the `epg_programme` disk cache (iOS GuideStore parity) so a
+     * relaunch can paint now-playing + the guide instantly from the last fetch.
+     * A CREATE TABLE (not the destructive fallback, which would drop the user's
+     * playlists / favorites / watch-progress) since those tables are untouched.
+     * The table + index definitions must match what Room generates for
+     * EpgProgrammeEntity, including the auto-named indices.
+     */
+    private val MIGRATION_12_13 = object : Migration(12, 13) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `epg_programme` (" +
+                    "`id` INTEGER NOT NULL, " +
+                    "`playlistId` TEXT NOT NULL, " +
+                    "`channelId` TEXT NOT NULL, " +
+                    "`title` TEXT NOT NULL, " +
+                    "`description` TEXT NOT NULL, " +
+                    "`startMillis` INTEGER NOT NULL, " +
+                    "`endMillis` INTEGER NOT NULL, " +
+                    "`category` TEXT NOT NULL, " +
+                    "`dispatcharrProgramId` INTEGER, " +
+                    "`fetchedAt` INTEGER NOT NULL, " +
+                    "PRIMARY KEY(`id`))",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_epg_programme_playlistId` ON `epg_programme` (`playlistId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_epg_programme_playlistId_channelId` ON `epg_programme` (`playlistId`, `channelId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_epg_programme_endMillis` ON `epg_programme` (`endMillis`)")
+        }
+    }
+
+    /**
+     * v13 -> v14: add the `channel_snapshot` disk cache (the iOS ChannelStore
+     * snapshot pattern, sister to the Phase 121 `epg_programme` cache). So a
+     * cold relaunch can paint the channel rail + cells from disk instantly
+     * instead of staring at an empty rail for ~10-20s while
+     * PlaylistRepository.refresh() round-trips the Dispatcharr / M3U fetch.
+     * Additive CREATE TABLE (not the destructive fallback) so playlists /
+     * favorites / EPG cache / watch progress survive. The table + index
+     * definitions must EXACTLY match what Room generates for
+     * ChannelSnapshotEntity (Phase 121 GOTCHA): autogen Long PK = "INTEGER NOT
+     * NULL ... PRIMARY KEY(`id`)" with no AUTOINCREMENT, nullable columns
+     * declared without NOT NULL, single-column index named
+     * `index_<table>_<column>`.
+     */
+    private val MIGRATION_13_14 = object : Migration(13, 14) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `channel_snapshot` (" +
+                    "`id` INTEGER NOT NULL, " +
+                    "`playlistId` TEXT NOT NULL, " +
+                    "`channelId` TEXT NOT NULL, " +
+                    "`position` INTEGER NOT NULL, " +
+                    "`name` TEXT NOT NULL, " +
+                    "`url` TEXT NOT NULL, " +
+                    "`groupTitle` TEXT NOT NULL, " +
+                    "`tvgID` TEXT NOT NULL, " +
+                    "`tvgName` TEXT NOT NULL, " +
+                    "`tvgLogo` TEXT NOT NULL, " +
+                    "`channelNumber` TEXT, " +
+                    "`dispatcharrChannelId` INTEGER, " +
+                    "`fetchedAt` INTEGER NOT NULL, " +
+                    "PRIMARY KEY(`id`))",
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_channel_snapshot_playlistId` ON `channel_snapshot` (`playlistId`)")
+        }
+    }
+
+    /**
+     * v15: capture the Dispatcharr account level on each playlist so the Record
+     * affordances can be hidden for Standard / Streamer (non-admin) accounts,
+     * which 403 on server-side DVR. Additive ALTER (not destructive) so
+     * playlists / favorites / caches survive. Default 10 = admin keeps every
+     * existing row recording-capable until its next connect re-captures the
+     * real level.
+     */
+    private val MIGRATION_14_15 = object : Migration(14, 15) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `playlists` ADD COLUMN `dispatcharrUserLevel` INTEGER NOT NULL DEFAULT 10",
+            )
+        }
+    }
+
+    /**
+     * v15 -> v16: per-playlist On Demand opt-in column. Mirrors iOS
+     * `ServerConnection.vodEnabled`. Default 1 (true) so every existing
+     * playlist keeps fetching VOD as before; users only toggle it off at
+     * Add / Edit Playlist. Same Boolean-as-INTEGER pattern as the rest of
+     * the Room schema; the `@ColumnInfo(defaultValue = "1")` on the entity
+     * MUST match the SQL `DEFAULT 1` here or Room rejects the post-upgrade
+     * schema on open.
+     */
+    private val MIGRATION_15_16 = object : Migration(15, 16) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `playlists` ADD COLUMN `vodEnabled` INTEGER NOT NULL DEFAULT 1",
+            )
+        }
+    }
+
+    /**
+     * v16 -> v17: capture the connected Dispatcharr account's ASSIGNED Channel
+     * Profile id(s) per playlist (/api/accounts/users/me/ `channel_profiles`,
+     * comma-joined) for the FAIL-CLOSED child-safety channel filter (iOS commit
+     * 3eb4ae3d8). Additive ALTER (not destructive) so playlists / favorites /
+     * caches survive. TEXT NOT NULL DEFAULT '' = no account profile = show all,
+     * so every existing row keeps its current behaviour until its next load
+     * self-heals the real value. The `@ColumnInfo(defaultValue = "")` on
+     * PlaylistEntity MUST match the SQL `DEFAULT ''` here or Room rejects the
+     * post-upgrade schema on open (same rule as dispatcharrUserLevel / vodEnabled).
+     *
+     * Also clears the channel-snapshot cache: a pre-v17 snapshot was written
+     * UNFILTERED, so without this the first post-upgrade cold launch would paint
+     * the stale all-channels rail before the first whoami self-heals -- a brief
+     * but real child-safety leak on a kids device. Clearing it forces one fresh
+     * (filtered) load; the cache is rewritten filtered on that load.
+     */
+    private val MIGRATION_16_17 = object : Migration(16, 17) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `playlists` ADD COLUMN `dispatcharrAccountProfileIds` TEXT NOT NULL DEFAULT ''",
+            )
+            db.execSQL("DELETE FROM `channel_snapshot`")
+        }
+    }
+
+    /** Catch-up (task #133): per-channel archive window + timeshift stream id
+     *  on the channel snapshot so catch-up affordances survive cache-restored
+     *  launches. Defaults (0 / NULL) mean "no catch-up" until the next network
+     *  refresh repopulates the cache with real values. */
+    private val MIGRATION_17_18 = object : Migration(17, 18) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `channel_snapshot` ADD COLUMN `catchupDays` INTEGER NOT NULL DEFAULT 0",
+            )
+            db.execSQL(
+                "ALTER TABLE `channel_snapshot` ADD COLUMN `catchupStreamId` TEXT",
+            )
+        }
+    }
+
+    /** Catch-up EPG history (task #135): per-playlist retention window for
+     *  already-aired guide rows. DEFAULT 7 must match the entity's
+     *  @ColumnInfo(defaultValue = "7"). */
+    private val MIGRATION_18_19 = object : Migration(18, 19) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `playlists` ADD COLUMN `epgRetentionDays` INTEGER NOT NULL DEFAULT 7",
+            )
+        }
+    }
+
+    /** Task #137: dedupe the EPG cache then enforce one row per
+     *  (playlistId, channelId, startMillis) so feed refreshes REPLACE cached
+     *  programmes in place instead of duplicating (the history merge relies
+     *  on this). Duplicates are possible in pre-v20 caches (history rows the
+     *  feed re-sent), so they are cleared before the unique index lands. */
+    private val MIGRATION_19_20 = object : Migration(19, 20) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "DELETE FROM `epg_programme` WHERE `id` NOT IN (" +
+                    "SELECT MIN(`id`) FROM `epg_programme` " +
+                    "GROUP BY `playlistId`, `channelId`, `startMillis`)",
+            )
+            db.execSQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS " +
+                    "`index_epg_programme_playlistId_channelId_startMillis` " +
+                    "ON `epg_programme` (`playlistId`, `channelId`, `startMillis`)",
+            )
+        }
+    }
+
+    /** GH #27: #KODIPROP DRM columns on the channel snapshot cache. */
+    private val MIGRATION_20_21 = object : Migration(20, 21) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `channel_snapshot` ADD COLUMN `drmLicenseType` TEXT")
+            db.execSQL("ALTER TABLE `channel_snapshot` ADD COLUMN `drmLicenseKey` TEXT")
+        }
+    }
+
+    /** EPG program badge metadata (guide/list/info-sheet badges): sub-title,
+     *  season/episode, and the new/live/premiere/finale/repeat flags on the
+     *  cached programme rows. Nullable columns take no default; the NOT NULL
+     *  booleans use `DEFAULT 0`, which MUST match each field's
+     *  @ColumnInfo(defaultValue = "0") on EpgProgrammeEntity or Room rejects the
+     *  post-upgrade schema on open. Existing cached rows keep the defaults
+     *  (no badges) until the next feed refresh REPLACEs them with real values;
+     *  the cache is a pure derived store so no data loss. */
+    private val MIGRATION_21_22 = object : Migration(21, 22) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `subTitle` TEXT")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `season` INTEGER")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `episode` INTEGER")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `isNew` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `isLiveBroadcast` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `isPremiere` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `isFinale` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `isRepeat` INTEGER NOT NULL DEFAULT 0")
+            // Drop the pre-badge cache so the first post-upgrade launch fetches
+            // fresh EPG and the new badges appear immediately. Without this, the
+            // cached rows carry the column defaults (no badges) and, since the
+            // cache reads "fresh", the guide would show badge-less programmes
+            // until the next scheduled refresh -- and on Android TV there is no
+            // pull-to-refresh to force it. Same precedent as MIGRATION_16_17
+            // clearing channel_snapshot; the EPG cache is pure derived data and
+            // repopulates on that first fetch.
+            db.execSQL("DELETE FROM `epg_programme`")
+        }
+    }
+
+    /** Task #49: per-server Dispatcharr auth header shape (iOS
+     *  `ServerConnection.dispatcharrAuthMode` twin). Empty string = legacy
+     *  dual-header behaviour, so existing rows change nothing. */
+    private val MIGRATION_22_23 = object : Migration(22, 23) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrAuthMode` TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
+    /** v24 (2026-08-28): recording watch-progress rows were keyed by raw
+     *  playback URL - device/host-specific (LAN vs WAN base, file://
+     *  paths), useless cross-device, and a URL leak in the Drive
+     *  snapshot. The player now keys server recordings as dvr-<id>;
+     *  legacy URL-keyed rows cannot be re-keyed without the recording
+     *  list, so they are dropped (matching the no-tombstones posture). */
+    private val MIGRATION_23_24 = object : Migration(23, 24) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "DELETE FROM watch_progress WHERE videoId LIKE 'http%' " +
+                    "OR videoId LIKE 'file%' OR videoId LIKE 'content%'",
+            )
+        }
+    }
+
+    /** Guide rebuild: cached programmes remember which source produced them so
+     *  the merge can apply span ownership (docs/guide-semantics.md s.3). */
+    private val MIGRATION_24_25 = object : Migration(24, 25) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE epg_programme ADD COLUMN source TEXT NOT NULL DEFAULT 'grid'")
+        }
+    }
+
+    /** Dispatcharr 0.30 granular permissions + server version (PlaylistEntity). */
+    private val MIGRATION_25_26 = object : Migration(25, 26) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrDvrAccess` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCatchupEnabled` INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrVodMoviesEnabled` INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrVodSeriesEnabled` INTEGER NOT NULL DEFAULT 1")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrServerVersion` TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
+    /** Persistent TMDB art paths for library titles (TmdbArtCache). A new,
+     *  purely derived table: nothing to backfill, and an empty cache simply
+     *  resolves again in the background. */
+    private val MIGRATION_26_27 = object : Migration(26, 27) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `tmdb_art` (`key` TEXT NOT NULL, `tmdbId` TEXT NOT NULL, " +
+                    "`poster` TEXT NOT NULL, `backdrop` TEXT NOT NULL, `overview` TEXT, " +
+                    "`at` INTEGER NOT NULL, PRIMARY KEY(`key`))",
+            )
+        }
+    }
+
+    /**
+     * v27 -> v28: add the `epg_chunk_coverage` map so the Dispatcharr grid
+     * window pass becomes INCREMENTAL (one row per one-day chunk already
+     * fetched). Purely derived data with nothing to backfill: an empty
+     * coverage map simply makes the first post-upgrade launch behave exactly
+     * like today (fetch every chunk once), and every launch after that skips
+     * the chunks it already has. A CREATE TABLE, never the destructive
+     * fallback; the definition must match what Room generates for
+     * EpgChunkCoverage, composite primary key included.
+     */
+    private val MIGRATION_27_28 = object : Migration(27, 28) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `epg_chunk_coverage` (" +
+                    "`playlistId` TEXT NOT NULL, " +
+                    "`chunkStartMs` INTEGER NOT NULL, " +
+                    "`chunkEndMs` INTEGER NOT NULL, " +
+                    "`fetchedAtMs` INTEGER NOT NULL, " +
+                    "`programCount` INTEGER NOT NULL, " +
+                    "PRIMARY KEY(`playlistId`, `chunkStartMs`))",
+            )
+        }
+    }
+
+    /**
+     * v28 -> v29: the cast AAC output profile id (Logan 2026-09-12).
+     * Casting asks Dispatcharr for its built-in "Web Player (AAC Audio)"
+     * profile per request so the phone never transcodes cast audio; the id
+     * is captured from /api/core/outputprofiles/ and persisted per
+     * playlist. NULLABLE INTEGER, so no SQL default is needed (and the
+     * entity declares none either): null means "not looked up yet", which
+     * is exactly the state every existing row should start in.
+     */
+    private val MIGRATION_28_29 = object : Migration(28, 29) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCastAacProfileId` INTEGER")
+        }
+    }
+
+    /**
+     * v29 -> v30: the EPG sources fingerprint (Logan 2026-09-12).
+     * The cached EPG grid is validated against /api/epg/sources/ instead of
+     * being redownloaded: the sorted "id:updated_at" pairs are stored per
+     * playlist, and a difference drops the grid coverage map so the window
+     * refetches. NULLABLE TEXT, so no SQL default is needed (and the entity
+     * declares none either): null means "never captured", which reads as a
+     * change and refetches once.
+     */
+    private val MIGRATION_29_30 = object : Migration(29, 30) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrEpgSourceFingerprint` TEXT")
+        }
+    }
+
+    /**
+     * Composite index for the launch guide read, measured on the Google TV
+     * Streamer 2026-09-12 (gtvlogs/session7.txt): "painted 20171 cached
+     * programmes (read 7605ms, bridge 147ms)" at 14:29:17.640, against the
+     * Nothing Phone's "(read 272ms, bridge 26ms)" for 16693 rows at
+     * 14:29:04.388. SQLite uses ONE index per table reference, so
+     * forPlaylistInWindow's `playlistId = ? AND endMillis > ? AND
+     * startMillis < ?` picked a playlistId-prefixed index, matched every row
+     * the playlist owns (roughly 267K on this box) and filtered the time range
+     * row by row. `(playlistId, endMillis)` makes the equality plus the range
+     * a single index seek, so the rows before the window are never visited.
+     * Index only: no column or table shape changes.
+     */
+    private val MIGRATION_30_31 = object : Migration(30, 31) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS `index_epg_programme_playlistId_endMillis` " +
+                    "ON `epg_programme` (`playlistId`, `endMillis`)"
+            )
+        }
+    }
+
+    /**
+     * Cache the programme's own artwork URL (XMLTV `<icon src>`) so it
+     * survives a relaunch off the disk cache and Program Info can fall back
+     * to it when the Dispatcharr detail lookup and TMDB both miss. Nullable
+     * TEXT column, so no SQL default is needed.
+     */
+    private val MIGRATION_31_32 = object : Migration(31, 32) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `epg_programme` ADD COLUMN `iconUrl` TEXT")
+        }
+    }
+
+    /**
+     * v33: per-user capability SNAPSHOT (Dispatcharr granular permissions).
+     *
+     * Stores what /api/accounts/users/me/ actually said about THIS user -- the
+     * staff / superuser flags and the FULL custom_properties JSON -- plus when
+     * it was read, under which derivation schema, and whether the last probe
+     * failed. Derivation then happens on read, so a new Dispatcharr permission
+     * key needs no further migration.
+     *
+     * Every added column is NOT NULL with a SQL default that MUST match the
+     * entity's `@ColumnInfo(defaultValue = ...)`, or Room rejects the schema on
+     * the first post-upgrade open. `dispatcharrCapabilitiesSchema DEFAULT 0` is
+     * deliberately BELOW CAPABILITIES_SCHEMA so every existing row reads as
+     * "never probed" (all capabilities Unknown = nothing hidden) and is
+     * force-re-probed once on the next launch. That is the repair for users
+     * stuck at view-only DVR under the old hard gates. The pre-existing
+     * dispatcharrDvrAccess / catchup / vod columns are left untouched.
+     */
+    private val MIGRATION_32_33 = object : Migration(32, 33) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrIsStaff` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrIsSuperuser` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCustomProperties` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCapabilitiesFetchedAt` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCapabilitiesSchema` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrCapabilitiesStale` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `dispatcharrSystemCatchupEnabled` INTEGER NOT NULL DEFAULT -1")
+        }
+    }
+
+    /**
+     * Persisted VOD catalog (GH #109): the Movies / TV Shows library moves
+     * out of memory and the snapshot JSON into these tables, so a 100k+ title
+     * account no longer hits a row cap or runs a TV box out of heap. New
+     * tables only; the first launch imports the old snapshot file (see
+     * OnDemandViewModel.startInitialLoads). The SQL mirrors what Room
+     * generates for VodCatalogEntities.kt exactly, or schema validation fails.
+     */
+    private val MIGRATION_33_34 = object : Migration(33, 34) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `vod_title` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`playlistKey` TEXT NOT NULL, `kind` TEXT NOT NULL, `itemKey` TEXT NOT NULL, `title` TEXT NOT NULL, " +
+                    "`sortKey` TEXT NOT NULL, `bucket` TEXT NOT NULL, `year` INTEGER, `rating` TEXT, `ratingValue` REAL, " +
+                    "`posterUrl` TEXT, `category` TEXT, `tmdbId` TEXT, `normTitle` TEXT NOT NULL, `cleanTitle` TEXT NOT NULL, " +
+                    "`artKey` TEXT NOT NULL, `payload` TEXT NOT NULL, `generation` INTEGER NOT NULL)"
+            )
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_itemKey` ON `vod_title` (`playlistKey`, `kind`, `itemKey`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_sortKey` ON `vod_title` (`playlistKey`, `kind`, `sortKey`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_generation` ON `vod_title` (`playlistKey`, `kind`, `generation`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_tmdbId` ON `vod_title` (`playlistKey`, `kind`, `tmdbId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_normTitle` ON `vod_title` (`playlistKey`, `kind`, `normTitle`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_vod_title_playlistKey_kind_cleanTitle` ON `vod_title` (`playlistKey`, `kind`, `cleanTitle`)")
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `vod_sweep_state` (`playlistKey` TEXT NOT NULL, `kind` TEXT NOT NULL, " +
+                    "`generation` INTEGER NOT NULL, `open` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, " +
+                    "`completedAtMs` INTEGER NOT NULL, PRIMARY KEY(`playlistKey`, `kind`))"
+            )
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `vod_sweep_lane` (`playlistKey` TEXT NOT NULL, `kind` TEXT NOT NULL, " +
+                    "`lane` TEXT NOT NULL, `generation` INTEGER NOT NULL, `nextQuery` TEXT, `failures` INTEGER NOT NULL, " +
+                    "`hasContent` INTEGER NOT NULL, PRIMARY KEY(`playlistKey`, `kind`, `lane`))"
+            )
+        }
+    }
+
+    /**
+     * v35: per-playlist User-Agent for Dispatcharr API requests (Apple
+     * `ServerConnection.customUserAgent`). The `DEFAULT ''` here MUST match
+     * `PlaylistEntity.customUserAgent`'s `@ColumnInfo(defaultValue = "")`, or
+     * Room's schema validation rejects the upgraded database.
+     */
+    private val MIGRATION_34_35 = object : Migration(34, 35) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `playlists` ADD COLUMN `customUserAgent` TEXT NOT NULL DEFAULT ''")
+        }
+    }
+
+    /** Radio flag (2026-10-14): server-declared radio channels survive a
+     *  cache-restored cold launch. DEFAULT 0 until the next refresh. */
+    private val MIGRATION_35_36 = object : Migration(35, 36) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE `channel_snapshot` ADD COLUMN `isRadio` INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
+    /**
+     * v37 Profiles (2026-10-16): favorites, watch progress, reminders and the
+     * local recordings index are scoped per Dispatcharr profile. Every existing
+     * row becomes the DEFAULT profile (profileScope = ''), so no row is
+     * dropped, rewritten or re-keyed; only the primary key widens to
+     * (key, profileScope). SQLite cannot alter a primary key, so the three
+     * keyed tables are rebuilt with copy-then-swap inside Room's migration
+     * transaction; the CREATE statements are Room's generated v37 schema
+     * verbatim. local_recording only gains the column.
+     */
+    internal val MIGRATION_36_37 = object : Migration(36, 37) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            migrate36to37(db::execSQL)
+        }
+    }
+
+    /** Pure SQL list so the sqlite3 dry run and a unit test can replay it. */
+    internal val MIGRATION_36_37_SQL = listOf(
+        "CREATE TABLE IF NOT EXISTS `favorite_channel_new` (`channelId` TEXT NOT NULL, `channelName` TEXT NOT NULL, `displayOrder` INTEGER NOT NULL, `addedAt` INTEGER NOT NULL, `profileScope` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`channelId`, `profileScope`))",
+        "INSERT INTO `favorite_channel_new` (`channelId`, `channelName`, `displayOrder`, `addedAt`, `profileScope`) SELECT `channelId`, `channelName`, `displayOrder`, `addedAt`, '' FROM `favorite_channel`",
+        "DROP TABLE `favorite_channel`",
+        "ALTER TABLE `favorite_channel_new` RENAME TO `favorite_channel`",
+        "CREATE TABLE IF NOT EXISTS `watch_progress_new` (`videoId` TEXT NOT NULL, `title` TEXT NOT NULL, `posterUrl` TEXT, `positionMs` INTEGER NOT NULL, `durationMs` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `playlistId` TEXT, `vodType` TEXT NOT NULL, `seriesId` TEXT, `seasonNumber` INTEGER NOT NULL, `episodeNumber` INTEGER NOT NULL, `streamUrl` TEXT, `isFinished` INTEGER NOT NULL, `upNextQueue` TEXT, `profileScope` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`videoId`, `profileScope`), FOREIGN KEY(`playlistId`) REFERENCES `playlists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "INSERT INTO `watch_progress_new` (`videoId`, `title`, `posterUrl`, `positionMs`, `durationMs`, `updatedAt`, `playlistId`, `vodType`, `seriesId`, `seasonNumber`, `episodeNumber`, `streamUrl`, `isFinished`, `upNextQueue`, `profileScope`) SELECT `videoId`, `title`, `posterUrl`, `positionMs`, `durationMs`, `updatedAt`, `playlistId`, `vodType`, `seriesId`, `seasonNumber`, `episodeNumber`, `streamUrl`, `isFinished`, `upNextQueue`, '' FROM `watch_progress`",
+        "DROP TABLE `watch_progress`",
+        "ALTER TABLE `watch_progress_new` RENAME TO `watch_progress`",
+        "CREATE INDEX IF NOT EXISTS `index_watch_progress_playlistId` ON `watch_progress` (`playlistId`)",
+        "CREATE TABLE IF NOT EXISTS `reminder_new` (`reminderKey` TEXT NOT NULL, `channelName` TEXT NOT NULL, `programTitle` TEXT NOT NULL, `startMillis` INTEGER NOT NULL, `endMillis` INTEGER NOT NULL, `alarmRequestCode` INTEGER NOT NULL, `playlistId` TEXT, `profileScope` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`reminderKey`, `profileScope`), FOREIGN KEY(`playlistId`) REFERENCES `playlists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "INSERT INTO `reminder_new` (`reminderKey`, `channelName`, `programTitle`, `startMillis`, `endMillis`, `alarmRequestCode`, `playlistId`, `profileScope`) SELECT `reminderKey`, `channelName`, `programTitle`, `startMillis`, `endMillis`, `alarmRequestCode`, `playlistId`, '' FROM `reminder`",
+        "DROP TABLE `reminder`",
+        "ALTER TABLE `reminder_new` RENAME TO `reminder`",
+        "CREATE INDEX IF NOT EXISTS `index_reminder_playlistId` ON `reminder` (`playlistId`)",
+        "ALTER TABLE `local_recording` ADD COLUMN `profileScope` TEXT NOT NULL DEFAULT ''",
+    )
+
+    internal fun migrate36to37(exec: (String) -> Unit) {
+        MIGRATION_36_37_SQL.forEach(exec)
+    }
+
+    @Provides
+    @Singleton
+    fun provideDatabase(@ApplicationContext context: Context): AerioDatabase =
+        Room.databaseBuilder(context, AerioDatabase::class.java, "aerio.db")
+            // Preserve user data across known schema bumps where a clean ALTER
+            // exists. Destructive fallback is scoped to ONLY pre-v10 dev builds
+            // so an unmapped future migration can never silently wipe a real
+            // user's saved servers and credentials in the field.
+            .addMigrations(MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20, MIGRATION_20_21, MIGRATION_21_22, MIGRATION_22_23, MIGRATION_23_24, MIGRATION_24_25, MIGRATION_25_26, MIGRATION_26_27, MIGRATION_27_28, MIGRATION_28_29, MIGRATION_29_30, MIGRATION_30_31, MIGRATION_31_32, MIGRATION_32_33, MIGRATION_33_34, MIGRATION_34_35, MIGRATION_35_36, MIGRATION_36_37)
+            .fallbackToDestructiveMigrationFrom(true, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+            .build()
+
+    /**
+     * Audit task #53: every consumer gets the encrypting decorator, never the
+     * raw Room DAO. apiKey/username/password are encrypted at rest (Keystore
+     * AES-GCM) and decrypted transparently on read, so call sites are unchanged.
+     */
+    @Provides
+    fun providePlaylistDao(
+        db: AerioDatabase,
+        cipher: CredentialCipher,
+    ): PlaylistDao = EncryptingPlaylistDao(db.playlistDao(), cipher)
+
+    @Provides
+    fun provideWatchProgressDao(db: AerioDatabase): WatchProgressDao = db.watchProgressDao()
+
+    @Provides
+    fun provideLocalRecordingDao(db: AerioDatabase): LocalRecordingDao = db.localRecordingDao()
+
+    @Provides
+    fun provideFavoriteChannelDao(db: AerioDatabase): FavoriteChannelDao = db.favoriteChannelDao()
+
+    @Provides
+    fun provideReminderDao(db: AerioDatabase): ReminderDao = db.reminderDao()
+
+    @Provides
+    fun provideEpgProgrammeDao(db: AerioDatabase): EpgProgrammeDao = db.epgProgrammeDao()
+
+    @Provides
+    fun provideEpgChunkCoverageDao(db: AerioDatabase): EpgChunkCoverageDao = db.epgChunkCoverageDao()
+
+    @Provides
+    fun provideChannelSnapshotDao(db: AerioDatabase): ChannelSnapshotDao = db.channelSnapshotDao()
+
+    @Provides
+    fun provideTmdbArtDao(db: AerioDatabase): com.aeriotv.android.core.data.db.dao.TmdbArtDao = db.tmdbArtDao()
+}

@@ -1,0 +1,1117 @@
+package com.aeriotv.android.feature.livetv
+
+import com.aeriotv.android.ui.scale.subtext
+import android.widget.Toast
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.outlined.FiberManualRecord
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.unit.sp
+import com.aeriotv.android.ui.tv.tvFocusScale
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.foundation.rememberOverscrollEffect
+import androidx.compose.foundation.overscroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Storage
+import com.aeriotv.android.ui.scale.AlertDialog
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import com.aeriotv.android.ui.scale.ModalBottomSheet
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import com.aeriotv.android.core.data.ProgramInfoTarget
+import com.aeriotv.android.feature.dvr.DvrViewModel
+import com.aeriotv.android.feature.dvr.LocalRecordingService
+import com.aeriotv.android.feature.playlist.PlaylistViewModel
+import com.aeriotv.android.feature.settings.SettingsViewModel
+import java.text.DateFormat
+import java.util.Date
+import kotlinx.coroutines.launch
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+
+/**
+ * Bottom-sheet form to schedule a programme recording. Mirrors iOS
+ * `RecordProgramSheet` (RecordProgramSheet.swift) and the canon spec
+ * (project_aeriotv_ios_canon.md:191).
+ *
+ * UI is complete; the actual schedule call is a Phase 9 (DVR) deliverable.
+ * Tapping "Record" emits a Toast informing the user that DVR is en route,
+ * matching the established stub pattern for not-yet-wired backends.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun RecordProgramSheet(
+    target: ProgramInfoTarget,
+    onDismiss: () -> Unit,
+    dvrViewModel: DvrViewModel = hiltViewModel(),
+    playlistViewModel: PlaylistViewModel = hiltViewModel(),
+    settingsViewModel: SettingsViewModel = hiltViewModel(),
+) {
+    // Profiles backstop: no profile without dvr_access == manage can reach
+    // a recording write, whatever entry point opened this sheet.
+    if (com.aeriotv.android.ui.LocalDvrAccess.current != "manage") {
+        androidx.compose.runtime.LaunchedEffect(Unit) { onDismiss() }
+        return
+    }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val isLive = remember(target) {
+        val now = System.currentTimeMillis()
+        target.startMillis <= now
+    }
+
+    // Pull the user's default pre/post-roll so the radios pre-select correctly.
+    val defaultPreRoll by settingsViewModel.dvrDefaultPreRollMins.collectAsStateWithLifecycle(initialValue = 0)
+    val defaultPostRoll by settingsViewModel.dvrDefaultPostRollMins.collectAsStateWithLifecycle(initialValue = 0)
+    val storageCapMB by settingsViewModel.dvrMaxLocalStorageMB.collectAsStateWithLifecycle(initialValue = 10_240)
+    val dvrState by dvrViewModel.state.collectAsStateWithLifecycle()
+
+    // iOS parity: derive recording capability from the ACTIVE playlist. A
+    // non-admin Dispatcharr account (or any non-Dispatcharr source) can only
+    // record to this device, so the destination toggle is hidden and the
+    // record defaults to local. Mirrors iOS RecordProgramSheet.swift.
+    //
+    // Sourced through DvrViewModel (which resolves playlistRepository
+    // .activePlaylist() in its init) and read REACTIVELY off dvrState. The prior
+    // code read playlistViewModel.state.value.playlist NON-reactively at
+    // composition: on a freshly-created PlaylistViewModel whose active-playlist
+    // load had not finished, .playlist was null, so canRecordToServer computed
+    // false ONCE and the server destination toggle stayed hidden for admins for
+    // the whole life of the sheet (a .value read never triggers recomposition).
+    // A fresh DvrViewModel always reloads activePlaylist() in init, and dvrState
+    // is collected reactively, so the toggle now appears when refresh() lands and
+    // destinationServer re-seeds via remember(canRecordToServer) below.
+    val canRecordToServer = dvrState.canRecordToServer
+    val isDispatcharr = dvrState.isDispatcharrDirect
+
+    var preRoll by remember(defaultPreRoll) { mutableStateOf(defaultPreRoll) }
+    var postRoll by remember(defaultPostRoll) { mutableStateOf(defaultPostRoll) }
+    // iOS parity (task #50): the "Custom..." buffer entry. Which row the
+    // stepper dialog is editing (null = closed) and its draft value.
+    var customBufferTarget by remember { mutableStateOf<CustomBufferTarget?>(null) }
+    var customBufferDraft by remember { mutableStateOf(5) }
+    // Task #50: seed the destination from the user's Default Destination
+    // preference AND capability; re-seed if either resolves after the first
+    // composition. Non-admin seeds false and the toggle is hidden, so it can
+    // never flip back to server; a "local" default pre-selects this device
+    // for server-capable accounts too (still switchable in the sheet).
+    val defaultDestination by settingsViewModel.dvrDefaultDestination
+        .collectAsStateWithLifecycle(initialValue = "server")
+    var destinationServer by remember(canRecordToServer, defaultDestination) {
+        mutableStateOf(canRecordToServer && defaultDestination != "local")
+    }
+    var removeCommercials by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
+
+    // Series recording rules (Dispatcharr; Apple parity, RecordProgramSheet
+    // series + EpisodesMode): Just this one schedules a single recording as before; the
+    // others create a series rule and let the server evaluate it at once.
+    val canOfferSeriesRule = isDispatcharr && canRecordToServer && target.title.isNotBlank()
+    var series by remember { mutableStateOf(false) }
+    var episodes by remember { mutableStateOf(EpisodesMode.All) }
+    var customizeMatching by remember { mutableStateOf(false) }
+    var ruleTitleMode by remember { mutableStateOf("exact") }
+    var ruleDescription by remember { mutableStateOf("") }
+    var ruleDescriptionMode by remember { mutableStateOf("contains") }
+    var ruleUntaggedIsNew by remember { mutableStateOf(false) }
+    var ruleAllChannels by remember { mutableStateOf(false) }
+    val usingRule = canOfferSeriesRule && series
+
+    val submit: () -> Unit = submit@{
+                val dispatcharrId = target.channelDispatcharrId
+                if (!destinationServer) {
+                    // Local recording: check the storage cap before
+                    // committing. usedBytes comes from the existing
+                    // local rows in DvrViewModel state.
+                    val usedBytes = dvrState.recordings
+                        .filter { it.source == DvrViewModel.Source.Local }
+                        .sumOf { it.fileSizeBytes }
+                    val usedMB = (usedBytes / (1024L * 1024L)).toInt()
+                    if (usedMB >= storageCapMB) {
+                        Toast.makeText(
+                            context,
+                            "Local storage cap reached. Free space or raise the cap in Settings > DVR.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        onDismiss()
+                        return@submit
+                    }
+                    val playlistState = playlistViewModel.state.value
+                    val channel = playlistState.channels.firstOrNull {
+                        it.name == target.channelName
+                    }
+                    val streamUrl = channel?.url
+                    val apiKey = playlistState.playlist?.apiKey
+                    if (streamUrl.isNullOrBlank()) {
+                        Toast.makeText(
+                            context,
+                            "Couldn't locate stream URL for ${target.channelName}.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    } else {
+                        val durationMs = (target.endMillis + postRoll * 60_000L) -
+                                System.currentTimeMillis()
+                        LocalRecordingService.start(
+                            context = context,
+                            streamUrl = streamUrl,
+                            title = target.title.ifBlank { target.channelName },
+                            channelName = target.channelName,
+                            apiKey = apiKey.orEmpty(),
+                            userAgent = com.aeriotv.android.core.network.PlaybackHeaders
+                                .customUserAgent(playlistState.playlist).orEmpty(),
+                            durationMs = durationMs.coerceAtLeast(60_000L),
+                        )
+                        Toast.makeText(
+                            context,
+                            "Recording started locally.",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                    onDismiss()
+                    return@submit
+                }
+                if (dispatcharrId == null) {
+                    Toast.makeText(
+                        context,
+                        "Recording requires a Dispatcharr playlist.",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                    onDismiss()
+                    return@submit
+                }
+                if (usingRule) {
+                    submitting = true
+                    val channel = playlistViewModel.state.value.channels.firstOrNull {
+                        it.dispatcharrChannelId == dispatcharrId || it.name == target.channelName
+                    }
+                    val tvgId = if (ruleAllChannels) null else channel?.tvgID?.takeIf { it.isNotBlank() }
+                    scope.launch {
+                        val result = dvrViewModel.createSeriesRule(
+                            tvgId = tvgId,
+                            mode = if (episodes == EpisodesMode.NewOnly) "new" else "all",
+                            untaggedIsNew = episodes == EpisodesMode.NewOnly && ruleUntaggedIsNew,
+                            title = target.title,
+                            titleMode = ruleTitleMode,
+                            description = ruleDescription,
+                            descriptionMode = ruleDescriptionMode,
+                            channelDispatcharrId = if (ruleAllChannels) null else dispatcharrId,
+                        )
+                        submitting = false
+                        val msg = result.fold(
+                            onSuccess = { n -> if (n >= 0) "Rule saved: $n recording(s) scheduled" else "Rule saved: ${target.title}" },
+                            onFailure = { t -> "Rule failed: ${t.message ?: t::class.simpleName}" },
+                        )
+                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        onDismiss()
+                    }
+                    return@submit
+                }
+                submitting = true
+                val effectiveStart = target.startMillis - preRoll * 60_000L
+                val effectiveEnd = target.endMillis + postRoll * 60_000L
+                scope.launch {
+                    val result = dvrViewModel.scheduleServerRecording(
+                        channelDispatcharrId = dispatcharrId,
+                        startMillis = effectiveStart,
+                        endMillis = effectiveEnd,
+                        title = target.title,
+                        description = target.description,
+                        comskip = removeCommercials,
+                    )
+                    submitting = false
+                    val msg = result.fold(
+                        onSuccess = { "Scheduled: ${target.title.ifBlank { "recording" }}" },
+                        onFailure = { t -> "Schedule failed: ${t.message ?: t::class.simpleName}" },
+                    )
+                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                }
+            }
+
+    val isTv = com.aeriotv.android.ui.settings.rememberIsTvDevice()
+    if (isTv) {
+        TvRecordForm(
+            target = target, isLive = isLive, onDismiss = onDismiss,
+            canOfferSeriesRule = canOfferSeriesRule, isDispatcharr = isDispatcharr, canRecordToServer = canRecordToServer,
+            series = series, onSeries = { series = it },
+            episodes = episodes, onEpisodes = { episodes = it },
+            customizeMatching = customizeMatching, onCustomizeMatching = { customizeMatching = it },
+            ruleTitleMode = ruleTitleMode, onRuleTitleMode = { ruleTitleMode = it },
+            ruleDescription = ruleDescription, onRuleDescription = { ruleDescription = it },
+            ruleDescriptionMode = ruleDescriptionMode, onRuleDescriptionMode = { ruleDescriptionMode = it },
+            ruleUntaggedIsNew = ruleUntaggedIsNew, onRuleUntaggedIsNew = { ruleUntaggedIsNew = it },
+            ruleAllChannels = ruleAllChannels, onRuleAllChannels = { ruleAllChannels = it },
+            preRoll = preRoll, onPreRoll = { preRoll = it },
+            postRoll = postRoll, onPostRoll = { postRoll = it },
+            onCustomPreRoll = { customBufferDraft = if (preRoll != 0) preRoll else 5; customBufferTarget = CustomBufferTarget.PreRoll },
+            onCustomPostRoll = { customBufferDraft = if (postRoll > 0) postRoll else 5; customBufferTarget = CustomBufferTarget.PostRoll },
+            destinationServer = destinationServer, onDestinationServer = { destinationServer = it },
+            removeCommercials = removeCommercials, onRemoveCommercials = { removeCommercials = it },
+            submitting = submitting, usingRule = usingRule, onSubmit = submit,
+        )
+    } else com.aeriotv.android.ui.FormFactorModal(
+        onDismiss = onDismiss,
+        tvWidthFraction = 0.7f,
+        tvMaxHeight = 620.dp,
+    ) {
+        // The header stays pinned above the scrolling body, as on the iPhone
+        // sheet: with it inside the scroll it slid away under the handle and
+        // left a blank band (Logan 2026-10-02).
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Header row: Cancel / title / Record. Record is the destructive-accent
+            // colour iOS uses (LIVE_RED) to signal it commits a scheduled action.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = if (isLive) "Record from Now" else "Record Program",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(
+                    enabled = !submitting,
+                    onClick = submit,
+                ) {
+                    Text(
+                        text = when {
+                            submitting -> "Scheduling…"
+                            usingRule -> "Save Rule"
+                            else -> "Record"
+                        },
+                        color = LIVE_RED,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+            // End-of-list drag stretches the body (Compose overscroll) like
+            // the iPhone's rubber band instead of being handed to the sheet,
+            // which moved the sheet and snapped it back (Logan 2026-10-02).
+            // Only the downward leftover is kept: a pull past the TOP still
+            // reaches the sheet so dragging the content down dismisses it,
+            // as on iOS, and the handle drag is untouched.
+            val overscroll = rememberOverscrollEffect()
+            val keepBottomOverscroll = remember(overscroll) {
+                object : NestedScrollConnection {
+                    override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                        if (available.y >= 0f) return Offset.Zero
+                        overscroll?.applyToScroll(available, source) { Offset.Zero }
+                        return available
+                    }
+                    override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                        if (available.y >= 0f) return Velocity.Zero
+                        overscroll?.applyToFling(available) { Velocity.Zero }
+                        return available
+                    }
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .nestedScroll(keepBottomOverscroll)
+                    .overscroll(overscroll)
+                    .verticalScroll(rememberScrollState(), overscrollEffect = null),
+            ) {
+            Spacer(Modifier.height(12.dp))
+
+            Column(modifier = Modifier.padding(horizontal = 20.dp)) {
+                LabeledValue("Program", target.title.ifBlank { "Untitled" })
+                LabeledValue("Channel", target.channelName)
+                LabeledValue("Time", formatTimeRange(target))
+
+                if (canOfferSeriesRule) {
+                    Spacer(Modifier.height(18.dp))
+                    SectionLabel("Record")
+                    Spacer(Modifier.height(8.dp))
+                    RecordCard {
+                        RecordRadioRow("Just this one", "Record this airing only.", selected = !series) { series = false }
+                        com.aeriotv.android.ui.settings.SettingsRowDivider(startInset = 52.dp)
+                        RecordRadioRow("Series", "A rule on the server records this title's airings.", selected = series) { series = true }
+                    }
+                    if (series) {
+                        Spacer(Modifier.height(18.dp))
+                        SectionLabel("Episodes")
+                        Spacer(Modifier.height(8.dp))
+                        RecordCard {
+                            EpisodesMode.entries.forEachIndexed { i, m ->
+                                if (i > 0) com.aeriotv.android.ui.settings.SettingsRowDivider(startInset = 52.dp)
+                                RecordRadioRow(m.label, m.detail, selected = episodes == m) { episodes = m }
+                            }
+                            com.aeriotv.android.ui.settings.SettingsRowDivider(startInset = 16.dp)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { customizeMatching = !customizeMatching }
+                                    .padding(start = 16.dp, end = 12.dp, top = 14.dp, bottom = 14.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text("Customize Matching", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground, modifier = Modifier.weight(1f))
+                                androidx.compose.material3.Icon(
+                                    if (customizeMatching) androidx.compose.material.icons.Icons.Filled.KeyboardArrowDown else androidx.compose.material.icons.Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                    if (series && customizeMatching) {
+                        Spacer(Modifier.height(10.dp))
+                        Text("Title Match", style = MaterialTheme.typography.bodySmall.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                            val modes = listOf("exact" to "Exact", "contains" to "Contains", "search" to "Search", "regex" to "Regex")
+                            modes.forEachIndexed { i, (wire, label) ->
+                                SegmentedButton(
+                                    selected = ruleTitleMode == wire,
+                                    onClick = { ruleTitleMode = wire },
+                                    shape = SegmentedButtonDefaults.itemShape(index = i, count = modes.size),
+                                ) { Text(label) }
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        androidx.compose.material3.OutlinedTextField(
+                            value = ruleDescription,
+                            onValueChange = { ruleDescription = it },
+                            label = { Text("Description Contains (Optional)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        if (ruleDescription.isNotBlank()) {
+                            Spacer(Modifier.height(6.dp))
+                            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                                val modes = listOf("contains" to "Contains", "search" to "Search", "regex" to "Regex")
+                                modes.forEachIndexed { i, (wire, label) ->
+                                    SegmentedButton(
+                                        selected = ruleDescriptionMode == wire,
+                                        onClick = { ruleDescriptionMode = wire },
+                                        shape = SegmentedButtonDefaults.itemShape(index = i, count = modes.size),
+                                    ) { Text(label) }
+                                }
+                            }
+                        }
+                    }
+                    if (series && customizeMatching && episodes == EpisodesMode.NewOnly) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Untagged Counts as New", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground)
+                                Text("For guides that only tag repeats.", style = MaterialTheme.typography.bodySmall.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Switch(checked = ruleUntaggedIsNew, onCheckedChange = { ruleUntaggedIsNew = it })
+                        }
+                    }
+                    if (usingRule && customizeMatching) {
+                        Spacer(Modifier.height(8.dp))
+                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Match on Every Channel", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground)
+                                Text("Off records only on ${target.channelName}.", style = MaterialTheme.typography.bodySmall.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Switch(checked = ruleAllChannels, onCheckedChange = { ruleAllChannels = it })
+                        }
+                    }
+                }
+
+                if (!usingRule) {
+                Spacer(Modifier.height(18.dp))
+                SectionLabel("Start Early")
+                Spacer(Modifier.height(8.dp))
+                if (isLive) {
+                    Text(
+                        text = "Pre-roll unavailable (program already started).",
+                        style = MaterialTheme.typography.bodySmall.subtext(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    MinuteRadioFlow(
+                        options = ROLL_OPTIONS,
+                        selected = preRoll,
+                        onSelect = { preRoll = it },
+                        onCustom = {
+                            customBufferDraft = if (preRoll > 0) preRoll else 5
+                            customBufferTarget = CustomBufferTarget.PreRoll
+                        },
+                    )
+                }
+
+                Spacer(Modifier.height(18.dp))
+                SectionLabel("End Late")
+                Spacer(Modifier.height(8.dp))
+                MinuteRadioFlow(
+                    options = ROLL_OPTIONS,
+                    selected = postRoll,
+                    onSelect = { postRoll = it },
+                    onCustom = {
+                        customBufferDraft = if (postRoll > 0) postRoll else 5
+                        customBufferTarget = CustomBufferTarget.PostRoll
+                    },
+                )
+
+                // Destination toggle only for admins. A non-admin Dispatcharr
+                // account (or any non-Dispatcharr source) can only record to
+                // this device, so the server option is hidden and the record is
+                // forced local (destinationServer seeded false above).
+                if (canRecordToServer) {
+                    Spacer(Modifier.height(18.dp))
+                    SectionLabel("Destination")
+                    Spacer(Modifier.height(8.dp))
+                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                        SegmentedButton(
+                            selected = destinationServer,
+                            onClick = { destinationServer = true },
+                            shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                        ) { Text("Dispatcharr Server") }
+                        SegmentedButton(
+                            selected = !destinationServer,
+                            onClick = { destinationServer = false },
+                            shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                        ) { Text("This Device") }
+                    }
+                }
+
+                // iOS parity: a Dispatcharr non-admin live recording lands on
+                // this device. Surface an orange callout explaining why the
+                // server option isn't available. Mirrors iOS .orange
+                // "Saving to this device" hint.
+                if (isDispatcharr && !canRecordToServer) {
+                    Spacer(Modifier.height(18.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Storage,
+                            contentDescription = null,
+                            tint = Color(0xFFFF9500), // iOS .orange
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(Modifier.size(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Saving to this device",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = "Recording to the Dispatcharr server needs DVR manage access on your account. Contact your server administrator for more information.",
+                                style = MaterialTheme.typography.bodySmall.subtext(),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                // Comskip is server-side only; hide it entirely when the account
+                // can't record to the server (iOS parity).
+                if (canRecordToServer) {
+                    Spacer(Modifier.height(18.dp))
+                    RecordCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Remove Commercials (Comskip)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "Detect and remove ad breaks after recording. Processed server-side.",
+                                style = MaterialTheme.typography.bodySmall.subtext(),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = removeCommercials,
+                            onCheckedChange = { removeCommercials = it },
+                            enabled = destinationServer,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = MaterialTheme.colorScheme.primary,
+                                checkedTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                            ),
+                        )
+                    }
+                    }
+                }
+
+                } // !usingRule
+
+                Spacer(Modifier.height(20.dp))
+            }
+            } // scrolling body
+        }
+    }
+
+    // iOS parity (task #50): "Custom Buffer" stepper dialog, 1..120 minutes
+    // (RecordProgramSheet.swift customSheet). Plain buttons so it D-pads
+    // cleanly on TV.
+    customBufferTarget?.let { editTarget ->
+        // GH #67 (djkotik): the pre-roll stepper goes NEGATIVE, meaning "start
+        // recording N minutes after the listed start" - a 9:00pm rugby listing
+        // whose kickoff is 9:50 records from 9:45 with -45. Floored so the
+        // start stays at least a minute before the programme ends. End Late
+        // keeps its positive-only range.
+        val durationMin = ((target.endMillis - target.startMillis) / 60_000L).toInt()
+        val floor = if (editTarget == CustomBufferTarget.PreRoll) {
+            -(durationMin - 1).coerceAtLeast(0)
+        } else 1
+        AlertDialog(
+            onDismissRequest = { customBufferTarget = null },
+            title = { Text("Custom Buffer") },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = {
+                        if (customBufferDraft > floor) customBufferDraft -= 1
+                        if (customBufferDraft == 0 && floor < 0) customBufferDraft = -1
+                    }) { Text("−", style = MaterialTheme.typography.titleLarge) }
+                    Text(
+                        text = if (customBufferDraft < 0)
+                            "${-customBufferDraft} min after start"
+                        else "$customBufferDraft minutes",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                    TextButton(onClick = {
+                        if (customBufferDraft < 120) customBufferDraft += 1
+                        if (customBufferDraft == 0 && floor < 0) customBufferDraft = 1
+                    }) { Text("+", style = MaterialTheme.typography.titleLarge) }
+                }
+                if (editTarget == CustomBufferTarget.PreRoll && floor < 0) {
+                    Text(
+                        text = "Step below zero to start the recording after the listed start time.",
+                        style = MaterialTheme.typography.bodySmall.subtext(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    when (editTarget) {
+                        CustomBufferTarget.PreRoll -> preRoll = customBufferDraft
+                        CustomBufferTarget.PostRoll -> postRoll = customBufferDraft
+                    }
+                    customBufferTarget = null
+                }) { Text("Set") }
+            },
+            dismissButton = {
+                TextButton(onClick = { customBufferTarget = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+/**
+ * tvOS RecordProgramSheet.tvOSForm, halved from the 1080 pt canvas: art
+ * beside the title block, pill rows (Record, Start Early, End Late,
+ * Destination, Comskip), the window summary and a red outlined Record
+ * pill. Menu closes the sheet (no Cancel pill, Logan 2026-09-05). Rows the
+ * tvOS form hides are hidden here too: Start Early for a live program or
+ * a series rule, Destination unless live on Dispatcharr with server
+ * access, Comskip only on Dispatcharr.
+ */
+@Composable
+private fun TvRecordForm(
+    target: ProgramInfoTarget,
+    isLive: Boolean,
+    onDismiss: () -> Unit,
+    canOfferSeriesRule: Boolean,
+    isDispatcharr: Boolean,
+    canRecordToServer: Boolean,
+    series: Boolean, onSeries: (Boolean) -> Unit,
+    episodes: EpisodesMode, onEpisodes: (EpisodesMode) -> Unit,
+    customizeMatching: Boolean, onCustomizeMatching: (Boolean) -> Unit,
+    ruleTitleMode: String, onRuleTitleMode: (String) -> Unit,
+    ruleDescription: String, onRuleDescription: (String) -> Unit,
+    ruleDescriptionMode: String, onRuleDescriptionMode: (String) -> Unit,
+    ruleUntaggedIsNew: Boolean, onRuleUntaggedIsNew: (Boolean) -> Unit,
+    ruleAllChannels: Boolean, onRuleAllChannels: (Boolean) -> Unit,
+    preRoll: Int, onPreRoll: (Int) -> Unit,
+    postRoll: Int, onPostRoll: (Int) -> Unit,
+    onCustomPreRoll: () -> Unit,
+    onCustomPostRoll: () -> Unit,
+    destinationServer: Boolean, onDestinationServer: (Boolean) -> Unit,
+    removeCommercials: Boolean, onRemoveCommercials: (Boolean) -> Unit,
+    submitting: Boolean,
+    usingRule: Boolean,
+    onSubmit: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    val art = remember(target.id) {
+        com.aeriotv.android.feature.livetv.grid.cachedPreviewArt(target.dispatcharrProgramId, target.title)
+            ?: target.iconUrl?.takeIf { it.isNotBlank() }
+    }
+    val hasNoRecordingPath = isDispatcharr && !isLive && !canRecordToServer
+    com.aeriotv.android.ui.scale.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        androidx.compose.material3.Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = com.aeriotv.android.ui.tv.TvChrome.dialogSurface(),
+            modifier = Modifier.width(520.dp).heightIn(max = 530.dp),
+        ) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+                    if (art != null) {
+                        coil3.compose.AsyncImage(
+                            model = art, contentDescription = null,
+                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                            modifier = Modifier.width(100.dp).height(56.dp).clip(RoundedCornerShape(6.dp)),
+                        )
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(if (isLive) "Record from Now" else "Record Program", fontSize = 19.sp, fontWeight = FontWeight.Bold, color = colors.onSurface)
+                        Text(target.title.ifBlank { "Untitled" }, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = colors.onSurface, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                        Text("${target.channelName} · ${formatTimeRange(target)}", fontSize = 11.sp.subtext(), color = colors.onSurfaceVariant)
+                    }
+                }
+
+                if (canOfferSeriesRule) {
+                    TvSectionTitle("Record")
+                    TvPillRow {
+                        SheetPill("Just this one", selected = !series, onClick = { onSeries(false) })
+                        SheetPill("Series", selected = series, onClick = { onSeries(true) })
+                    }
+                    Text(
+                        if (series) "A rule on the server records this title's airings." else "Record this airing only.",
+                        fontSize = 11.sp.subtext(), color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 2.dp),
+                    )
+                    if (series) {
+                        TvSectionTitle("Episodes")
+                        TvPillRow {
+                            EpisodesMode.entries.forEach { m ->
+                                SheetPill(m.label, selected = episodes == m, onClick = { onEpisodes(m) })
+                            }
+                            SheetPill("Customize Matching", selected = customizeMatching, onClick = { onCustomizeMatching(!customizeMatching) })
+                        }
+                        Text(episodes.detail, fontSize = 11.sp.subtext(), color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 2.dp))
+                    }
+                    if (series && customizeMatching) {
+                        Text("Title Match", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 2.dp))
+                        TvPillRow {
+                            listOf("exact" to "Exact", "contains" to "Contains", "search" to "Search", "regex" to "Regex").forEach { (wire, label) ->
+                                SheetPill(label, selected = ruleTitleMode == wire, onClick = { onRuleTitleMode(wire) })
+                            }
+                        }
+                        androidx.compose.material3.OutlinedTextField(
+                            value = ruleDescription,
+                            onValueChange = onRuleDescription,
+                            label = { Text("Description Contains (Optional)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        if (ruleDescription.isNotBlank()) {
+                            Text("Description Match", fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 2.dp))
+                            TvPillRow {
+                                listOf("contains" to "Contains", "search" to "Search", "regex" to "Regex").forEach { (wire, label) ->
+                                    SheetPill(label, selected = ruleDescriptionMode == wire, onClick = { onRuleDescriptionMode(wire) })
+                                }
+                            }
+                        }
+                    }
+                    if (series && customizeMatching) {
+                        TvPillRow {
+                            if (episodes == EpisodesMode.NewOnly) {
+                                SheetPill("Untagged Counts as New", selected = ruleUntaggedIsNew, onClick = { onRuleUntaggedIsNew(!ruleUntaggedIsNew) })
+                            }
+                            SheetPill("Match on Every Channel", selected = ruleAllChannels, onClick = { onRuleAllChannels(!ruleAllChannels) })
+                        }
+                    }
+                }
+
+                if (!isLive && !usingRule) {
+                    TvSectionTitle("Start Early")
+                    TvMinutePills(options = listOf(0, 5, 10, 15, 30), selected = preRoll, onSelect = onPreRoll, onCustom = onCustomPreRoll)
+                }
+                if (!usingRule) {
+                    TvSectionTitle("End Late")
+                    TvMinutePills(options = ROLL_OPTIONS, selected = postRoll, onSelect = onPostRoll, onCustom = onCustomPostRoll)
+                }
+                if (isDispatcharr && isLive && canRecordToServer && !usingRule) {
+                    TvSectionTitle("Destination")
+                    TvPillRow {
+                        SheetPill("Dispatcharr Server", selected = destinationServer, onClick = { onDestinationServer(true) })
+                        SheetPill("This Device", selected = !destinationServer, onClick = { onDestinationServer(false) })
+                    }
+                }
+                // Phone parity: a live recording on an account without DVR
+                // manage access lands on this device; say so with the same
+                // orange note, and hide Comskip (server-side only) entirely.
+                if (isDispatcharr && isLive && !canRecordToServer && !usingRule) {
+                    Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.Top) {
+                        Icon(
+                            imageVector = Icons.Outlined.Storage,
+                            contentDescription = null,
+                            tint = Color(0xFFFF9500),
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Spacer(Modifier.size(8.dp))
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("Saving to this device", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = colors.onSurface)
+                            Text(
+                                "Recording to the Dispatcharr server needs DVR manage access on your account. Contact your server administrator for more information.",
+                                fontSize = 10.sp.subtext(), lineHeight = 13.sp.subtext(), color = colors.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                if (isDispatcharr && canRecordToServer && !usingRule) {
+                    val disabled = !destinationServer
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        TvSectionTitle("Remove Commercials (Comskip)", dim = disabled)
+                        Spacer(Modifier.height(3.dp))
+                        TvPillRow(alpha = if (disabled) 0.45f else 1f) {
+                            SheetPill("Off", selected = !removeCommercials, onClick = { if (!disabled) onRemoveCommercials(false) })
+                            SheetPill("On", selected = removeCommercials, onClick = { if (!disabled) onRemoveCommercials(true) })
+                        }
+                        Text(
+                            if (disabled) "Comskip runs server-side. Switch the destination to Dispatcharr server to enable."
+                            else "Server-side: detects and removes commercial breaks after the recording completes, when Comskip is configured on the Dispatcharr server.",
+                            fontSize = 9.sp.subtext(), lineHeight = 12.sp.subtext(), color = colors.onSurfaceVariant, modifier = Modifier.padding(start = 2.dp, top = 1.dp),
+                        )
+                    }
+                }
+                if (!destinationServer && !usingRule) {
+                    TvNoteBox("Keep AerioTV open. Closing the app will stop this recording.")
+                }
+                if (hasNoRecordingPath) {
+                    TvNoteBox("Recording requires DVR access on Dispatcharr", "Scheduling a recording on the Dispatcharr server needs DVR manage access on your account. Your account can watch and record live programs to this device, but not schedule server recordings. Contact your server administrator for more information, or wait until the program is airing to record it on this device.")
+                }
+
+                if (!hasNoRecordingPath) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(top = 3.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            if (usingRule) tvSeriesRuleSummary(target, episodes, ruleAllChannels) else tvRecordingWindowSummary(target, isLive, preRoll, postRoll),
+                            fontSize = 11.sp.subtext(), color = colors.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        )
+                        TvRecordPill(
+                            label = when { submitting -> "Scheduling…"; usingRule -> "Save Rule"; else -> "Record" },
+                            enabled = !submitting, onClick = onSubmit,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** The sheet's pills: TvPill at a compact 10/4 padding so every row fits without scrolling (Logan 2026-09-10). */
+@Composable
+private fun SheetPill(label: String, selected: Boolean, onClick: () -> Unit) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    val colors = MaterialTheme.colorScheme
+    val fill = if (selected) colors.primary else colors.onSurface.copy(alpha = 0.12f).compositeOver(colors.surface)
+    Text(
+        label, fontSize = 11.sp, fontWeight = FontWeight.Medium,
+        color = when { selected -> colors.onPrimary; focused -> colors.onSurface; else -> colors.onSurfaceVariant },
+        modifier = Modifier
+            .tvFocusScale(focused, focusedScale = 1.05f)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(fill)
+            .border(2.dp, when { !focused -> Color.Transparent; selected -> Color.White; else -> colors.primary }, androidx.compose.foundation.shape.CircleShape)
+            .clickable(interactionSource = interaction, indication = null, onClick = onClick)
+            .padding(horizontal = 11.dp, vertical = 4.dp),
+    )
+}
+
+@Composable
+private fun TvSectionTitle(text: String, dim: Boolean = false) {
+    Text(text, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+        color = if (dim) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f) else MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier.padding(start = 2.dp))
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TvPillRow(alpha: Float = 1f, content: @Composable () -> Unit) {
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+        modifier = Modifier.fillMaxWidth().padding(top = 3.dp).alpha(alpha),
+    ) { content() }
+}
+
+@Composable
+private fun TvMinutePills(options: List<Int>, selected: Int, onSelect: (Int) -> Unit, onCustom: () -> Unit) {
+    val custom = selected !in options
+    TvPillRow {
+        options.forEach { m -> SheetPill(if (m == 0) "None" else "$m min", selected = selected == m, onClick = { onSelect(m) }) }
+        SheetPill(
+            when {
+                custom && selected < 0 -> "Custom (${-selected} min after start)"
+                custom -> "Custom ($selected min)"
+                else -> "Custom"
+            },
+            selected = custom, onClick = onCustom,
+        )
+    }
+}
+
+@Composable
+private fun TvNoteBox(title: String, detail: String? = null) {
+    Column(
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(title, fontSize = 11.sp, fontWeight = if (detail != null) FontWeight.Bold else FontWeight.Normal, color = MaterialTheme.colorScheme.onSurface)
+        if (detail != null) Text(detail, fontSize = 10.sp.subtext(), lineHeight = 13.sp.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** tvOS RecordActionPill: red outline at rest, red fill with white text when focused, scale 1.08. */
+@Composable
+private fun TvRecordPill(label: String, enabled: Boolean, onClick: () -> Unit) {
+    val interaction = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val focused by interaction.collectIsFocusedAsState()
+    Row(
+        modifier = Modifier
+            .tvFocusScale(focused, focusedScale = 1.08f)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(if (focused) LIVE_RED else MaterialTheme.colorScheme.surfaceVariant)
+            .border(2.dp, if (focused) Color.Transparent else LIVE_RED, androidx.compose.foundation.shape.CircleShape)
+            .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
+            .padding(horizontal = 18.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Icon(androidx.compose.material.icons.Icons.Outlined.FiberManualRecord, contentDescription = null, tint = if (focused) Color.White else LIVE_RED, modifier = Modifier.size(12.dp))
+        Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = if (focused) Color.White else LIVE_RED)
+    }
+}
+
+/** "Records 12:00 PM to 3:35 PM · 3 h 35 min" (tvOS recordingWindowSummary). */
+private fun tvRecordingWindowSummary(target: ProgramInfoTarget, isLive: Boolean, preRoll: Int, postRoll: Int): String {
+    val start = if (isLive) System.currentTimeMillis() else target.startMillis - preRoll * 60_000L
+    val end = target.endMillis + postRoll * 60_000L
+    val f = com.aeriotv.android.core.ui.ClockFormat.short()
+    val minutes = ((end - start) / 60_000L).toInt().coerceAtLeast(1)
+    val length = if (minutes >= 60) "${minutes / 60} h ${minutes % 60} min" else "$minutes min"
+    return "Records ${f.format(Date(start))} to ${f.format(Date(end))} · $length"
+}
+
+private fun tvSeriesRuleSummary(target: ProgramInfoTarget, mode: EpisodesMode, allChannels: Boolean): String {
+    val what = if (mode == EpisodesMode.NewOnly) "New episodes of" else "Every episode of"
+    val scope = if (allChannels) "on any channel" else "on ${target.channelName}"
+    return "$what \"${target.title}\" $scope, scheduled by the Dispatcharr server"
+}
+
+private enum class CustomBufferTarget { PreRoll, PostRoll }
+
+@Composable
+private fun LabeledValue(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 34.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium.subtext(),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        fontWeight = FontWeight.SemiBold,
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun MinuteRadioFlow(
+    options: List<Int>,
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    /** iOS parity (task #50): opens the Custom Buffer stepper dialog. */
+    onCustom: () -> Unit,
+) {
+    // A value set through the Custom dialog is not one of the presets; the
+    // trailing chip owns it and echoes the minutes.
+    val isCustomSelected = selected !in options
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        options.forEach { mins ->
+            MinuteChip(
+                label = if (mins == 0) "None" else "$mins min",
+                selected = mins == selected,
+                onClick = { onSelect(mins) },
+            )
+        }
+        MinuteChip(
+            // GH #67: a NEGATIVE pre-roll means "start recording after the
+            // listed start"; echo it in plain words instead of a minus sign.
+            label = when {
+                isCustomSelected && selected < 0 -> "Custom ${-selected} min after start"
+                isCustomSelected -> "Custom $selected min"
+                else -> "Custom"
+            },
+            selected = isCustomSelected,
+            onClick = onCustom,
+        )
+    }
+}
+
+/** Capsule chip for the Start Early / End Late rows (iPhone parity). */
+@Composable
+private fun MinuteChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .height(32.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(if (selected) colors.primary else com.aeriotv.android.ui.settings.settingsCardFill())
+            .selectable(selected = selected, onClick = onClick)
+            .padding(horizontal = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (selected) colors.onPrimary else colors.onBackground,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        )
+    }
+}
+
+/** Grouped card matching the Settings card fill, 14 dp corners. */
+@Composable
+private fun RecordCard(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(14.dp))
+            .background(com.aeriotv.android.ui.settings.settingsCardFill()),
+        content = content,
+    )
+}
+
+private fun formatTimeRange(target: ProgramInfoTarget): String {
+    val timeFormat = com.aeriotv.android.core.ui.ClockFormat.short()
+    val dateFormat = DateFormat.getDateInstance(DateFormat.MEDIUM)
+    return "${dateFormat.format(Date(target.startMillis))} at " +
+            "${timeFormat.format(Date(target.startMillis))} – " +
+            timeFormat.format(Date(target.endMillis))
+}
+
+private val ROLL_OPTIONS = listOf(0, 5, 10, 15, 30, 60)
+private val LIVE_RED = Color(0xFFFF4757)
+
+/** Series rule episode choices (Apple parity: RecordProgramSheet). */
+private enum class EpisodesMode(val label: String, val detail: String) {
+    All("Every episode", "Records every airing of this title."),
+    NewOnly("New episodes only", "Skips airings the guide marks as repeats."),
+}
+
+@Composable
+private fun RecordRadioRow(label: String, detail: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .selectable(selected = selected, onClick = onClick)
+            .padding(start = 4.dp, end = 12.dp, top = 6.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(
+            selected = selected,
+            onClick = null,
+            colors = RadioButtonDefaults.colors(selectedColor = MaterialTheme.colorScheme.primary),
+            modifier = Modifier.size(48.dp),
+        )
+        Column {
+            Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onBackground)
+            Text(detail, style = MaterialTheme.typography.bodySmall.subtext(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}

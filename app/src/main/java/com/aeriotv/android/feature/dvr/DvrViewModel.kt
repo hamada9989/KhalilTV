@@ -1,0 +1,1506 @@
+package com.aeriotv.android.feature.dvr
+
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.aeriotv.android.core.data.SourceType
+import com.aeriotv.android.core.data.db.dao.LocalRecordingDao
+import com.aeriotv.android.core.data.db.entity.LocalRecordingEntity
+import com.aeriotv.android.core.data.db.entity.canRecordToServer
+import com.aeriotv.android.core.data.db.entity.dispatcharrCanViewDvr
+import com.aeriotv.android.core.data.db.entity.capabilitiesNeedProbe
+import com.aeriotv.android.core.data.db.entity.capabilities
+import com.aeriotv.android.core.data.db.entity.allows
+import com.aeriotv.android.core.data.db.entity.isDenied
+import com.aeriotv.android.core.data.capability.Capability
+import com.aeriotv.android.core.data.capability.CapabilityCorrections
+import com.aeriotv.android.core.data.capability.CapabilityNotice
+import com.aeriotv.android.core.data.capability.CapabilityNotices
+import com.aeriotv.android.core.data.capability.CapabilityState
+import com.aeriotv.android.core.data.capability.deniedMessage
+import com.aeriotv.android.core.data.capability.networkRestrictionMessage
+import com.aeriotv.android.core.network.DispatcharrError
+import com.aeriotv.android.core.data.db.entity.isDispatcharrDirectConnect
+import com.aeriotv.android.core.data.repository.PlaylistRepository
+import com.aeriotv.android.core.network.DispatcharrAuthBroker
+import com.aeriotv.android.core.network.DispatcharrClient
+import com.aeriotv.android.core.network.DispatcharrRecording
+import com.aeriotv.android.core.preferences.AppPreferences
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import javax.inject.Inject
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+
+/**
+ * Owns the DVR tab's state and the recording-creation entry point. Phase 9a
+ * is Dispatcharr-server only; Phase 9b adds local recording via a foreground
+ * service.
+ *
+ * Loads recordings from `/api/channels/recordings/` on demand. The shape from
+ * the server feeds [Recording] which the DVR tab filters by status.
+ */
+@HiltViewModel
+class DvrViewModel @Inject constructor(
+    @ApplicationContext private val appContext: Context,
+    private val playlistRepository: PlaylistRepository,
+    private val dispatcharrClient: DispatcharrClient,
+    private val dispatcharrAuth: DispatcharrAuthBroker,
+    private val localRecordingDao: LocalRecordingDao,
+    private val appPreferences: AppPreferences,
+    private val tmdbService: com.aeriotv.android.core.network.TMDBService,
+    private val epgProgrammeDao: com.aeriotv.android.core.data.db.dao.EpgProgrammeDao,
+    private val recordingsCache: DvrRecordingsCache,
+    private val settleGate: com.aeriotv.android.core.app.AppSettleGate,
+) : ViewModel() {
+
+    enum class Filter { Scheduled, Recording, Completed }
+
+    // Serializable because the recordings list is cached on disk per playlist
+    // (DvrRecordingsCache) so the DVR tab opens populated.
+    @kotlinx.serialization.Serializable
+    enum class Source { Server, Local }
+
+    @kotlinx.serialization.Serializable
+    data class Recording(
+        val id: String,
+        val source: Source,
+        val title: String,
+        val description: String,
+        /**
+         * Genre/category string from the matched EPG programme (XMLTV
+         * <category>, comma/slash/semicolon-separated). Empty when the
+         * recording's programme isn't in the cache. Drives the genre pills
+         * under the row, tinted by the same CategoryPalette as the guide.
+         * Mirrors iOS RecordingRow.epgCategory (MyRecordingsView.swift:715).
+         */
+        val category: String = "",
+        val startMillis: Long,
+        val endMillis: Long,
+        val status: Status,
+        val fileSizeBytes: Long,
+        /**
+         * Playable URL for completed recordings. `file://...` for local DVR
+         * captures (audit #43); a server URL for Dispatcharr server-side
+         * recordings will follow in a separate phase. `null` while the
+         * recording is still in-progress / scheduled / failed.
+         */
+        val playbackUrl: String? = null,
+        /**
+         * Dispatcharr channel id this recording is for (audit task #50
+         * watch-live). Populated on server recordings from the
+         * Dispatcharr API response; null on local recordings (the source
+         * channel isn't persisted in LocalRecordingEntity). The DVR tab
+         * surfaces a "Watch Live" action when a server recording is
+         * Recording (in-progress) and this id is non-null.
+         */
+        val dispatcharrChannelId: Int? = null,
+        /**
+         * Server-provided playback URL for an IN-PROGRESS server recording.
+         * Mirrors iOS Recording.dispatcharrFileURL (Models.swift 718): the
+         * resolved custom_properties.output_file_url/file_url. For
+         * Dispatcharr's DVR pipeline this is the growing HLS playlist
+         * (.../recordings/<id>/hls/index.m3u8); on older builds it's the raw
+         * /file/ partial. Null when the server emits neither. Distinct from
+         * playbackUrl, which is only populated for finalized Completed/Stopped
+         * rows.
+         */
+        val inProgressUrl: String? = null,
+        /**
+         * True when inProgressUrl is an HLS playlist (.m3u8): the player
+         * treats the stream as a growing seekable live window (live-edge
+         * clamp + LIVE pill + seek-at-EOF). Mirrors iOS
+         * `isDVR = rec.isInProgress && urlSource == server-hls`
+         * (MyRecordingsView.swift 628). A raw /file/ partial plays as plain
+         * VOD (isDvr=false).
+         */
+        val isDvr: Boolean = false,
+        /**
+         * EPG programme id surfaced from the server recording JSON
+         * (DispatcharrRecording.programId: a top-level int FK or the nested
+         * custom_properties.program.id). The async category resolver uses it
+         * to fetch /api/epg/programs/<id>/ (the only endpoint that returns
+         * `<category>`) for completed rows that arrive with a blank category.
+         * Null on local recordings and on server rows that carry no program
+         * id (those stay best-effort blank, no pill).
+         */
+        val programId: Int? = null,
+        // Media-center DVR (Apple parity): art and facts.
+        val posterUrl: String? = null,
+        /** Landscape art for the 16:9 hero and cards (tvOS Recording.backdropURL); posterUrl is the fallback. */
+        val backdropUrl: String? = null,
+        /** Dispatcharr "interrupted": a partial file. tvOS badges only this, never a user stop. */
+        val partial: Boolean = false,
+        val subTitle: String? = null,
+        /** The guide programme's own airing (tvOS Program Info "Airs"); the recording window is startMillis/endMillis. */
+        val programStartMillis: Long? = null,
+        val programEndMillis: Long? = null,
+        val isNew: Boolean = false,
+        val season: Int? = null,
+        val episode: Int? = null,
+        val fileName: String? = null,
+        val videoCodec: String? = null,
+        val resolution: String? = null,
+        val frameRate: Double? = null,
+        val videoBitrateKbps: Double? = null,
+        val audioCodec: String? = null,
+        val audioChannels: String? = null,
+    ) {
+        @kotlinx.serialization.Serializable
+        enum class Status { Scheduled, Recording, Completed, Failed, Stopped, Unknown }
+
+        private val isTerminal: Boolean
+            get() = status == Status.Completed || status == Status.Stopped ||
+                status == Status.Failed
+
+        /**
+         * Server-side status lags: when AerioTV POSTs a recording for an
+         * already-airing program, Dispatcharr returns status=="scheduled"
+         * for the first several seconds until its scheduler flips the job to
+         * "recording". Treat "now inside [start,end)" as actively recording
+         * so the row lands under Recording immediately. Mirrors iOS isAiringNow
+         * (MyRecordingsView.swift:84). Terminal states never reclassify.
+         */
+        fun isAiringNow(now: Long = System.currentTimeMillis()): Boolean =
+            !isTerminal && startMillis <= now && now < endMillis
+
+        /**
+         * Effective status for bucketing + counts. Terminal states and an
+         * explicit "recording" win; OTHERWISE derive from the [start, end)
+         * window exactly like Dispatcharr's own web UI (DVRUtils.categorize /
+         * RecordingCard).
+         *
+         * GH #11 fix: a one-off scheduled recording is a real Recording row
+         * returned by GET /api/channels/recordings/, but it arrives with NO
+         * `custom_properties.status` -- Dispatcharr only writes
+         * `status="scheduled"` on recurring-RULE materializations, never on a
+         * single future program. So the status-only mapping left every future
+         * one-off as `Unknown`, and it never matched the Scheduled bucket
+         * ("Scheduled (0)"). Bucketing by time: future = Scheduled, inside the
+         * window = Recording, past = Completed. (The server sets an explicit
+         * `completed`/`stopped`/`interrupted` status when a recording actually
+         * finalizes, so real completions still carry their playback URL via the
+         * terminal branch.)
+         */
+        fun effectiveStatus(now: Long = System.currentTimeMillis()): Status {
+            if (isTerminal) return status
+            if (status == Status.Recording || isAiringNow(now)) return Status.Recording
+            return if (now < startMillis) Status.Scheduled else Status.Completed
+        }
+    }
+
+    data class UiState(
+        val isLoading: Boolean = false,
+        val error: String? = null,
+        val recordings: List<Recording> = emptyList(),
+        val filter: Filter = Filter.Scheduled,
+        /** True when the active playlist is NOT Dispatcharr-backed (no DVR available). */
+        val unsupportedSource: Boolean = false,
+        /** True when the active playlist is a Dispatcharr Direct Connect source
+         *  (regardless of admin level). Drives RecordProgramSheet's non-admin
+         *  "records to this device only" hint. Resolved off activePlaylist() in
+         *  [refresh] so the sheet no longer reads a possibly-unloaded VM. */
+        val isDispatcharrDirect: Boolean = false,
+        /** True when the active playlist is Dispatcharr Direct Connect AND the
+         *  stored user level is admin (>=10), so recordings can be scheduled on
+         *  the server. Gates RecordProgramSheet's destination toggle. */
+        val canRecordToServer: Boolean = false,
+        /** Optimistic "this source had recordings last time" verdict from the
+         *  persisted per-playlist hint. Keeps the dynamic DVR tab visible from
+         *  the first frame after launch / playlist switch instead of popping
+         *  in when the server list lands; cleared the moment an authoritative
+         *  refresh completes (the real list takes over). */
+        val hasRecordingsHint: Boolean = false,
+        /** True while LocalRecordingService is capturing on this device. The
+         *  local row only lands when the file finalizes, so without this a
+         *  just-started recording leaves the dynamic DVR tab hidden -- on an
+         *  M3U source with no server rows there is nothing else to keep it
+         *  visible, and the user has no in-app way to reach or stop the
+         *  recording they just started. */
+        val isLocalRecordingActive: Boolean = false,
+    ) {
+        val scheduledCount: Int get() = recordings.count { it.effectiveStatus() == Recording.Status.Scheduled }
+        val recordingCount: Int get() = recordings.count { it.effectiveStatus() == Recording.Status.Recording }
+        val completedCount: Int get() = recordings.count {
+            val s = it.effectiveStatus()
+            s == Recording.Status.Completed || s == Recording.Status.Stopped || s == Recording.Status.Failed
+        }
+        val visible: List<Recording> get() = when (filter) {
+            Filter.Scheduled -> recordings.filter { it.effectiveStatus() == Recording.Status.Scheduled }
+            Filter.Recording -> recordings.filter { it.effectiveStatus() == Recording.Status.Recording }
+            Filter.Completed -> recordings.filter {
+                val s = it.effectiveStatus()
+                s == Recording.Status.Completed || s == Recording.Status.Stopped || s == Recording.Status.Failed
+            }
+        }
+    }
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    /**
+     * Resolved genre/category strings keyed by recording id (e.g.
+     * "server-42"). A COMPLETED recording's programme has rolled out of the
+     * on-disk EPG window, so its category can only come from a network lookup.
+     * That call is comparatively expensive and the row never changes once
+     * finalized, so we memo the result here: each row is fetched at most once
+     * across the 30s refresh loop.
+     *
+     * A sentinel empty string marks "resolved definitively, programme genuinely
+     * carries no category" so we don't re-hit the network for a feed without
+     * `<category>`. Crucially we only memo a miss when the lookup was COMPLETE
+     * (we matched a programme and asked the server for its categories); an
+     * incomplete miss (no programme matched because the feed paginated past the
+     * recording window, or the detail fetch failed) is left UN-cached so the
+     * next refresh retries instead of permanently hiding the pills.
+     *
+     * [ConcurrentHashMap] because writes land from coroutines that resume on
+     * arbitrary OkHttp/Ktor dispatcher threads (the `getProgramDetail` calls),
+     * not necessarily the main thread; a plain MutableMap would be a data race.
+     */
+    private val categoryCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * Media-center DVR art (Apple parity, DVRArtResolver, reduced): for a
+     * server recording without a poster, try TMDB by cleaned title when the
+     * user has a key, then the Dispatcharr programme detail icon. Results are
+     * cached per recording id for the session and published into the rows;
+     * the cards fall back to the channel logo at render time.
+     */
+    private val artCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val artMisses = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    private val backdropCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val backdropMisses = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    private data class Identity(
+        val subTitle: String?, val season: Int?, val episode: Int?,
+        val programStartMillis: Long, val programEndMillis: Long,
+        val isNew: Boolean, val category: String,
+    )
+    private val identityCache = java.util.concurrent.ConcurrentHashMap<String, Identity>()
+    private val identityMisses = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    /** One TMDB details call per title and kind for the session (tvOS tmdbEntries). */
+    private val tmdbDetails = java.util.concurrent.ConcurrentHashMap<String, com.aeriotv.android.core.network.TmdbDetails>()
+    private var artJob: kotlinx.coroutines.Job? = null
+
+    private fun isMovieLike(rec: Recording): Boolean =
+        rec.category.lowercase().let { it.contains("movie") || it.contains("film") }
+
+    private suspend fun tmdbDetailsFor(title: String, isMovie: Boolean, key: String): com.aeriotv.android.core.network.TmdbDetails? {
+        val k = (if (isMovie) "m:" else "t:") + title.lowercase()
+        tmdbDetails[k]?.let { return it }
+        val d = runCatching { tmdbService.detailsForTitle(title, isMovie, key) }.getOrNull() ?: return null
+        tmdbDetails[k] = d
+        return d
+    }
+
+    /**
+     * tvOS DVRArtResolver, reduced: for every server recording fill what the
+     * row lacks. Episode identity (sub_title, season, episode) comes from the
+     * guide programme matched by title and air window; poster art from the
+     * Dispatcharr programme detail icon, then TMDB by cleaned title; the
+     * landscape backdrop (hero and 16:9 cards) from TMDB. Results are cached
+     * per recording id for the session and published into the rows.
+     */
+    private fun resolveArtAsync(playlist: com.aeriotv.android.core.data.db.entity.PlaylistEntity, rows: List<Recording>) {
+        if (artJob?.isActive == true) return
+        artJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            val tmdbOn = runCatching { appPreferences.programPostersTmdbEnabled.first() }.getOrDefault(false)
+            val key = runCatching { appPreferences.tmdbApiKey.first() }.getOrDefault("")
+            val base = playlistRepository.effectiveBaseUrl(playlist)
+            var changed = false
+            for (rec in rows) {
+                if (rec.title.isBlank()) continue
+                val clean = rec.title.replace(Regex("""\s*\((\d{4})\)\s*$"""), "").trim()
+                val isMovie = isMovieLike(rec)
+                // Episode identity from the guide (local rows never carry it).
+                val needsIdentity = (rec.subTitle.isNullOrBlank() || rec.season == null || rec.programStartMillis == null) &&
+                    rec.id !in identityMisses && !identityCache.containsKey(rec.id)
+                if (needsIdentity) {
+                    val hit = runCatching {
+                        epgProgrammeDao.forPlaylistInWindow(playlist.id, rec.startMillis, rec.endMillis)
+                            .filter { it.title == rec.title }
+                            .let { m -> m.firstOrNull { it.subTitle != null || it.season != null } ?: m.firstOrNull() }
+                    }.getOrNull()
+                    if (hit != null) {
+                        identityCache[rec.id] = Identity(hit.subTitle, hit.season, hit.episode, hit.startMillis, hit.endMillis, hit.isNew, hit.category)
+                        changed = true
+                    }
+                    else identityMisses += rec.id
+                }
+                if (rec.posterUrl.isNullOrBlank() && rec.id !in artMisses && !artCache.containsKey(rec.id)) {
+                    var url: String? = null
+                    val pid = rec.programId
+                    if (pid != null && !playlist.apiKey.isNullOrBlank()) {
+                        url = runCatching {
+                            dispatcharrAuth.withApiKeyRetry(playlist.id) { k ->
+                                val d = dispatcharrClient.getProgramDetail(base, k, pid)
+                                (d.posterUrl ?: d.icon)?.let { resolveArtUrl(it, base) }
+                            }
+                        }.getOrNull()
+                    }
+                    if (url.isNullOrBlank() && tmdbOn && key.isNotBlank()) {
+                        url = tmdbDetailsFor(clean, isMovie, key)?.posterPath?.takeIf { it.isNotBlank() }?.let { tmdbService.imageUrlFor(it, "w500") }
+                            ?: runCatching { tmdbService.posterUrlForTitle(clean, key) }.getOrNull()
+                    }
+                    if (url.isNullOrBlank()) artMisses += rec.id else { artCache[rec.id] = url; changed = true }
+                }
+                if (rec.backdropUrl.isNullOrBlank() && tmdbOn && key.isNotBlank() &&
+                    rec.id !in backdropMisses && !backdropCache.containsKey(rec.id)
+                ) {
+                    val b = tmdbDetailsFor(clean, isMovie, key)?.backdropPath?.takeIf { it.isNotBlank() }?.let { tmdbService.imageUrlFor(it, "w1280") }
+                    if (b == null) backdropMisses += rec.id else { backdropCache[rec.id] = b; changed = true }
+                }
+                kotlinx.coroutines.delay(60)
+            }
+            if (changed) _state.update { st -> st.copy(recordings = st.recordings.map(::applyResolved)) }
+        }
+    }
+
+    private fun applyResolved(r: Recording): Recording {
+        var out = r
+        artCache[r.id]?.let { if (out.posterUrl.isNullOrBlank()) out = out.copy(posterUrl = it) }
+        backdropCache[r.id]?.let { if (out.backdropUrl.isNullOrBlank()) out = out.copy(backdropUrl = it) }
+        identityCache[r.id]?.let { id ->
+            out = out.copy(
+                subTitle = out.subTitle?.takeIf { it.isNotBlank() } ?: id.subTitle,
+                season = out.season ?: id.season,
+                episode = out.episode ?: id.episode,
+                programStartMillis = out.programStartMillis ?: id.programStartMillis,
+                programEndMillis = out.programEndMillis ?: id.programEndMillis,
+                isNew = out.isNew || id.isNew,
+                category = out.category.ifBlank { id.category },
+            )
+        }
+        return out
+    }
+
+    /** Set once the first refresh() has produced an authoritative verdict
+     *  (success or unsupported source). Gates the launch hint seed below so a
+     *  slow DataStore read can't resurrect the optimistic tab AFTER the real
+     *  list already said "empty". */
+    @Volatile
+    private var authoritativeLoaded = false
+
+    /** Last raw recordings payload and the rows built from it (refresh early-out). */
+    private class ServerFetch(
+        val playlistId: String,
+        val base: String,
+        val remote: List<DispatcharrRecording>,
+        val rows: List<Recording>,
+    )
+    private var lastServerFetch: ServerFetch? = null
+
+    init {
+        // Cached list first, network second (Logan 2026-09-12): the tab paints
+        // the last known recordings instantly, and the first network refresh is
+        // a quiet background one once the app has settled (guide rendered, past
+        // first frame if anything is playing, ~20 s in). Nothing cached means
+        // there is nothing to show, so that launch refreshes straight away.
+        viewModelScope.launch {
+            val restored = restoreFromCache()
+            if (restored > 0) {
+                com.aeriotv.android.core.app.AppLaunchTrace.noteDvrRestored()
+                settleGate.awaitSettled()
+                settleGate.awaitSweepWindow()
+            }
+            refresh()
+            refreshJob?.join()
+            Log.i(TAG, "[DVR] background refresh: ${_state.value.recordings.size} recordings")
+        }
+        // tvOS reconciles the DVR list immediately and then every 30 s while
+        // the tab is mounted (DVRView.swift:395-402); without it an
+        // in-progress recording's elapsed time freezes and a finished capture
+        // stays in Recording Now. A tick is skipped while a refresh is still
+        // in flight.
+        viewModelScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(30_000)
+                if (refreshJob?.isActive != true) refresh()
+            }
+        }
+        // Mirror the on-device recorder's live state into UiState so the
+        // dynamic DVR tab appears the instant a local recording starts and
+        // steps back out when it ends (real rows then decide). Also refresh
+        // on the falling edge so the finished recording's row is listed by
+        // the time the user opens the tab.
+        viewModelScope.launch {
+            LocalRecordingService.activeRecording.collect { active ->
+                _state.update { st ->
+                    // Drop any previous synthetic row, then add the current
+                    // one. The real Room row only lands when the file
+                    // finalizes, so without this the tab opens on an empty
+                    // list while a capture is plainly running.
+                    val withoutSynthetic = st.recordings.filterNot { it.id == LOCAL_IN_PROGRESS_ID }
+                    val rows = if (active == null) withoutSynthetic else {
+                        withoutSynthetic + Recording(
+                            id = LOCAL_IN_PROGRESS_ID,
+                            source = Source.Local,
+                            title = active.title,
+                            description = active.channelName,
+                            startMillis = active.startedAt,
+                            endMillis = active.endsAt,
+                            status = Recording.Status.Recording,
+                            fileSizeBytes = 0L,
+                        )
+                    }
+                    st.copy(
+                        isLocalRecordingActive = active != null,
+                        recordings = rows.sortedBy { it.startMillis },
+                    )
+                }
+                if (active == null) refresh()
+            }
+        }
+        // Seed the optimistic DVR-tab hint from the last session's verdict so
+        // the tab doesn't pop in seconds after launch while listRecordings is
+        // still in flight.
+        viewModelScope.launch {
+            val playlist = playlistRepository.activePlaylist() ?: return@launch
+            // dvr_access "none": the last session's verdict must not paint the
+            // DVR tab for an account the server no longer lets list recordings.
+            val hint = playlist.dispatcharrCanViewDvr() &&
+                runCatching { appPreferences.dvrTabHintOnce(playlist.id) }.getOrDefault(false)
+            if (hint && !authoritativeLoaded) {
+                _state.update { it.copy(hasRecordingsHint = true) }
+            }
+        }
+        // Playlist switch: the server rows on screen belong to the OLD source.
+        // Drop them immediately (no stale flash while the new list loads),
+        // seed the new source's hint, and reload. drop(1) skips the initial
+        // emission, which the refresh() above already covers.
+        viewModelScope.launch {
+            playlistRepository.observeActiveId()
+                .drop(1)
+                .collect { newId ->
+                    authoritativeLoaded = false
+                    val canView = playlistRepository.activePlaylist()
+                        ?.dispatcharrCanViewDvr() != false
+                    val hint = newId != null && canView &&
+                        runCatching { appPreferences.dvrTabHintOnce(newId) }.getOrDefault(false)
+                    _state.update { st ->
+                        st.copy(
+                            recordings = st.recordings.filter { it.source == Source.Local },
+                            hasRecordingsHint = hint,
+                        )
+                    }
+                    refresh()
+                }
+        }
+        viewModelScope.launch {
+            localRecordingDao.observeAll().collect { rows ->
+                val mapped = rows.map { it.toRecording() }
+                _state.update { st ->
+                    // Keep the synthetic in-progress row: it is not in Room
+                    // yet, and this observer would otherwise drop it on any
+                    // unrelated local-recording change.
+                    val inProgress = st.recordings.filter { it.id == LOCAL_IN_PROGRESS_ID }
+                    val merged = (st.recordings.filter { it.source == Source.Server } + mapped + inProgress)
+                        .sortedBy { it.startMillis }
+                    st.copy(recordings = merged)
+                }
+            }
+        }
+    }
+
+    fun setFilter(filter: Filter) {
+        _state.update { it.copy(filter = filter) }
+    }
+
+    private var refreshJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Publish the cached server recordings for the active playlist. Returns how
+     * many rows were restored (0 when there is no cache, or the source is not
+     * Dispatcharr-backed). Local rows already on screen are kept.
+     */
+    private suspend fun restoreFromCache(): Int {
+        val playlist = playlistRepository.activePlaylist() ?: return 0
+        val snap = recordingsCache.load(recordingsCache.identity(playlist)) ?: return 0
+        if (snap.recordings.isEmpty()) return 0
+        _state.update { st ->
+            val local = st.recordings.filter { it.source == Source.Local }
+            st.copy(
+                recordings = (snap.recordings + local).sortedBy { it.startMillis },
+                // Cached rows are real rows: keep the DVR tab visible and the
+                // list painted rather than showing a spinner over them.
+                isLoading = false,
+                hasRecordingsHint = true,
+            )
+        }
+        Log.i(TAG, "[DVR] restored ${snap.recordings.size} recordings from cache")
+        return snap.recordings.size
+    }
+
+    /** Write the current server rows as this playlist's cached list. */
+    private fun persistRecordingsCache(rows: List<Recording>) {
+        viewModelScope.launch {
+            val playlist = playlistRepository.activePlaylist() ?: return@launch
+            recordingsCache.save(recordingsCache.identity(playlist), rows)
+        }
+    }
+
+    fun refresh() {
+        refreshJob = viewModelScope.launch {
+            // Opportunistic capability probe: entering DVR with a snapshot that
+            // is missing, stale or past its TTL re-reads it before the list is
+            // gated, so a user whose admin just granted DVR manage access does
+            // not have to restart the app. A no-op when the snapshot is fresh,
+            // and it never downgrades on failure.
+            playlistRepository.activePlaylist()?.let { active ->
+                if (active.capabilitiesNeedProbe()) {
+                    runCatching { playlistRepository.probeCapabilities(active.id) }
+                }
+            }
+            val playlist = playlistRepository.activePlaylist()
+            val sourceType = playlist?.sourceType?.let { SourceType.entries.firstOrNull { st -> st.name == it } }
+            val isDispatcharr = sourceType == SourceType.DispatcharrApiKey ||
+                    sourceType == SourceType.DispatcharrUserPass
+            // Record-destination capability for RecordProgramSheet, resolved off
+            // the SAME activePlaylist() the recordings list uses so the sheet no
+            // longer depends on a possibly-unloaded PlaylistViewModel. isDispatcharrDirect
+            // gates the "no server destination" hint; canRecordToServer is now
+            // Capability.CanManageDvr, so a NON-admin account whose
+            // custom_properties.dvr_access is "manage" gets the server
+            // destination toggle too (recording writes are IsAdminOrDVRManager,
+            // not IsAdmin). Unknown reads as capable.
+            val isDispatcharrDirect = playlist?.isDispatcharrDirectConnect() == true
+            val canRecordToServer = playlist?.canRecordToServer() != false
+            if (playlist == null || !isDispatcharr || playlist.apiKey.isNullOrBlank()) {
+                authoritativeLoaded = true
+                _state.update {
+                    it.copy(
+                        unsupportedSource = true,
+                        // Keep on-device rows. Only SERVER scheduling is
+                        // unsupported here; local recordings belong to the
+                        // device, not the playlist, and clearing them made
+                        // them vanish from the DVR tab on M3U / Xtream until
+                        // the next Room emission happened to re-add them.
+                        recordings = it.recordings.filter { r -> r.source == Source.Local },
+                        isLoading = false, error = null,
+                        isDispatcharrDirect = isDispatcharrDirect, canRecordToServer = canRecordToServer,
+                        hasRecordingsHint = false,
+                    )
+                }
+                playlist?.id?.let { id ->
+                    runCatching { appPreferences.setDvrTabHint(id, false) }
+                }
+                return@launch
+            }
+            _state.update {
+                it.copy(
+                    isLoading = true, error = null, unsupportedSource = false,
+                    isDispatcharrDirect = isDispatcharrDirect, canRecordToServer = canRecordToServer,
+                )
+            }
+            // Effective base (LAN when on a saved home SSID, else WAN), the
+            // same base the stream URLs use. Server recordings whose file_url
+            // is a relative path are anchored to this so a phone off the home
+            // network gets the reachable address (iOS resolves file_url
+            // against server.effectiveBaseURL).
+            val base = playlistRepository.effectiveBaseUrl(playlist)
+            // Persisted recordingId -> category map (DataStore). Read once per
+            // refresh off the main thread; seeds completed rows whose programme
+            // has aged out of every cache but WAS resolved while the recording
+            // was airing/recent on a prior session.
+            val persistedCategories = runCatching { appPreferences.recordingCategoriesOnce() }
+                .getOrDefault(emptyMap())
+            runCatching {
+                dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                    // Dispatcharr 0.30 dvr_access "none": the endpoint 403s.
+                    // dvr_access "none": the endpoint 403s. Unknown reads as
+                    // viewable so we ask the server rather than assume.
+                    if (playlist.dispatcharrCanViewDvr()) dispatcharrClient.listRecordings(base, key)
+                    else emptyList()
+                }
+            }.fold(
+                onSuccess = { remote ->
+                    // Early-out: the 30 s tick usually gets back the exact same
+                    // payload. Re-running EPG hydration, the disk cache write,
+                    // the art pass and category resolution for it is wasted
+                    // work, so reapply the last result and stop.
+                    val last = lastServerFetch
+                    if (last != null && last.base == base && last.playlistId == playlist.id && last.remote == remote) {
+                        _state.update { st ->
+                            val local = st.recordings.filter { it.source == Source.Local }
+                            val serverById = last.rows.map(::applyResolved).associateBy { it.id }
+                            st.copy(
+                                isLoading = false,
+                                recordings = (serverById.values + local).sortedBy { it.startMillis },
+                                error = null,
+                                hasRecordingsHint = false,
+                            )
+                        }
+                        return@fold
+                    }
+                    val hosts = trustedServerHosts(playlist)
+                    val server = remote.map { it.toRecording(base, dispatcharrClient, hosts) }
+                    // Fill in programme title/description (and any cached category)
+                    // from the on-disk guide for rows the server left sparse. This
+                    // is a fast LOCAL pass (Room reads only, no network), plus it
+                    // applies any category we already resolved -- first from the
+                    // persisted store (survives restarts), then from the in-memory
+                    // [categoryCache] (this-session network resolutions). We update
+                    // _state from THIS immediately so the DVR tab + list paint
+                    // instantly; network category resolution happens afterward in a
+                    // separate coroutine.
+                    val hydrated = hydrateRecordingsFromEpg(playlist.id, server)
+                    val fromCache = hydrated.map { r ->
+                        if (r.category.isNotBlank()) return@map r
+                        val seed = persistedCategories[r.id]?.takeIf { it.isNotBlank() }
+                            ?: categoryCache[r.id]?.takeIf { it.isNotBlank() }
+                        if (seed != null) r.copy(category = seed) else r
+                    }
+                    // Persist every row that NOW carries a non-blank category
+                    // (cache-hydrated airing/recent rows, the currently-recording
+                    // row, and any previously-seeded row). This captures the
+                    // category WHILE it is resolvable so the row keeps its pill
+                    // after it completes and its programme leaves the cache. Off
+                    // the main thread, fire-and-forget; setRecordingCategory
+                    // de-dups so an unchanged value won't churn the DataStore.
+                    persistResolvedCategories(fromCache, persistedCategories)
+                    authoritativeLoaded = true
+                    _state.update { st ->
+                        val local = st.recordings.filter { it.source == Source.Local }
+                        // Authoritative server list wins by id, so an
+                        // optimistically-inserted row from scheduleServerRecording
+                        // (same "server-$id") is replaced, never duplicated.
+                        val serverById = fromCache.associateBy { it.id }
+                        st.copy(
+                            isLoading = false,
+                            recordings = (serverById.values + local).sortedBy { it.startMillis },
+                            error = null,
+                            // The real list is in - the optimistic tab hint retires.
+                            hasRecordingsHint = false,
+                        )
+                    }
+                    persistRecordingsCache(fromCache)
+                    lastServerFetch = ServerFetch(playlist.id, base, remote, fromCache)
+                    resolveArtAsync(playlist, fromCache)
+                    // Persist this session's verdict so the next launch (or a
+                    // switch back to this source) shows the DVR tab from the
+                    // first frame instead of popping it in after this fetch.
+                    runCatching {
+                        appPreferences.setDvrTabHint(playlist.id, _state.value.recordings.isNotEmpty())
+                    }
+                    // Completed recordings whose programme already aged out of the
+                    // on-disk EPG window still have a blank category. Resolve those
+                    // over the network OFF the critical path so the recordings
+                    // already painted above. Each resolved category is patched back
+                    // into _state as it lands (pills appear a moment later).
+                    resolveCompletedCategoriesAsync(
+                        playlistId = playlist.id,
+                        baseUrl = base,
+                        recordings = fromCache,
+                    )
+                },
+                onFailure = { t ->
+                    Log.w(TAG, "listRecordings failed", t)
+                    _state.update { it.copy(isLoading = false, error = t.message ?: t::class.simpleName) }
+                },
+            )
+        }
+    }
+
+    /**
+     * Deletes a recording. Server rows route through DispatcharrClient.deleteRecording
+     * (Dispatcharr removes the file from disk for completed rows and just unschedules
+     * scheduled rows). Local rows delete the .ts file from getExternalFilesDir
+     * AND drop the Room row so it disappears from the DVR tab immediately.
+     */
+    /**
+     * Audit task #50 (delete-all sub-item): bulk-delete every Completed /
+     * Stopped / Failed recording currently visible. Loops through
+     * deleteRecording per row so server + local sources are each handled
+     * via their respective path (server: API delete + refresh; local: rm
+     * the .ts file + drop the row). Aggregates failures rather than
+     * short-circuiting, so a single server 401 doesn't strand a dozen
+     * local rows.
+     */
+    /**
+     * Settings > DVR > Delete All Recordings (Apple DVRSettingsView parity).
+     * Deletes this device's FINISHED recordings; with [includeInProgress] the
+     * in-flight on-device capture is stopped first, and the partial file it
+     * finalizes is deleted along with the rest.
+     */
+    suspend fun deleteAllLocalRecordings(includeInProgress: Boolean): Result<Int> {
+        if (includeInProgress && LocalRecordingService.isActive) {
+            LocalRecordingService.stop(appContext)
+            // The service writes the partial's row BEFORE it clears its active
+            // flag, so once the flag falls the row is in the database.
+            kotlinx.coroutines.withTimeoutOrNull(15_000L) {
+                LocalRecordingService.activeFlow.first { !it }
+            }
+            refresh()
+            refreshJob?.join()
+        }
+        return deleteAllCompleted(includeServer = false)
+    }
+
+    suspend fun deleteAllCompleted(includeServer: Boolean = true): Result<Int> = runCatching {
+        // Snapshot the list -- as we delete, the state list flips out from
+        // under us; we want to preserve the original work order.
+        // Dispatcharr 0.30 dvr_access "view": the caller passes
+        // includeServer = false so the sweep clears only this device's
+        // files instead of firing a dozen doomed 403s at the server.
+        val targets = _state.value.recordings.filter {
+            (includeServer || it.source == Source.Local) && (
+                it.status == Recording.Status.Completed ||
+                    it.status == Recording.Status.Stopped ||
+                    it.status == Recording.Status.Failed
+                )
+        }
+        var failures = 0
+        for (rec in targets) {
+            deleteRecording(rec).onFailure { failures++ }
+        }
+        if (failures > 0) {
+            throw IllegalStateException("Failed to delete $failures of ${targets.size}")
+        }
+        targets.size
+    }
+
+
+    /**
+     * Run a MUTATING Dispatcharr call that assumed [capability], and
+     * self-correct when the server disagrees.
+     *
+     * On 401 / 403 we re-probe /api/accounts/users/me/, re-derive the
+     * capability, and then either
+     *  - demote the capability for this session (so the affordance disappears
+     *    instead of failing a second time) and surface the specific missing
+     *    permission, or
+     *  - when the re-derived permissions say it SHOULD be allowed, say it looks
+     *    like a network restriction on the account (per-user allowed_networks),
+     *    which is the other thing that produces a 403.
+     *
+     * On SUCCESS, a capability we believed Denied is promoted, so a server-side
+     * grant applies immediately rather than at the next TTL expiry.
+     *
+     * Either way the error is returned to the caller: these are never swallowed.
+     */
+    private suspend fun <T> withCapability(
+        capability: Capability,
+        block: suspend () -> T,
+    ): Result<T> {
+        val playlistId = playlistRepository.activePlaylist()?.id
+        val believedDenied = playlistId != null &&
+            playlistRepository.activePlaylist()?.isDenied(capability) == true
+        val result = runCatching { block() }
+        result.onSuccess {
+            if (believedDenied && playlistId != null) {
+                // We were wrong, and the server just proved it.
+                CapabilityCorrections.record(playlistId, capability, CapabilityState.Allowed)
+                runCatching { playlistRepository.probeCapabilities(playlistId, force = true) }
+                refresh()
+            }
+            return result
+        }
+        val error = result.exceptionOrNull()
+        val denied = error is DispatcharrError.Forbidden ||
+            error is DispatcharrError.Unauthorized
+        if (!denied || playlistId == null) return result
+
+        // Re-probe and re-derive before deciding what to tell the user.
+        val probed = runCatching { playlistRepository.probeCapabilities(playlistId, force = true) }
+            .getOrDefault(false)
+        val fresh = playlistRepository.activePlaylist()
+        val stillAllowed = probed && fresh?.allows(capability) == true &&
+            fresh.capabilities().isKnownAllowed(capability)
+        val message = if (stillAllowed) {
+            // Permissions say yes, the server still said no.
+            capability.networkRestrictionMessage()
+        } else {
+            CapabilityCorrections.record(playlistId, capability, CapabilityState.Denied)
+            capability.deniedMessage()
+        }
+        CapabilityNotices.emit(
+            CapabilityNotice(
+                playlistId = playlistId,
+                capability = capability,
+                message = message,
+                looksLikeNetworkRestriction = stillAllowed,
+            ),
+        )
+        _state.update { it.copy(error = message) }
+        // Re-read so the affordance follows the corrected capability.
+        refresh()
+        return Result.failure(DispatcharrError.Forbidden(message))
+    }
+
+    suspend fun deleteRecording(recording: Recording): Result<Unit> {
+        // Local rows are on-device files; only the SERVER branch needs the
+        // DVR-manage capability, so the local path keeps its plain runCatching.
+        if (recording.source == Source.Local) {
+            return runCatching {
+                val rowId = recording.id.removePrefix("local-").toLongOrNull()
+                    ?: throw IllegalStateException("Invalid local recording id: ${recording.id}")
+                val rows = localRecordingDao.observeAll().first()
+                val match = rows.firstOrNull { it.id == rowId }
+                if (match != null) {
+                    deleteLocalFile(match.filePath)
+                    localRecordingDao.delete(rowId)
+                }
+            }
+        }
+        return withCapability(Capability.CanManageDvr) {
+            when (recording.source) {
+                Source.Server -> {
+                    val playlist = playlistRepository.activePlaylist()
+                        ?: throw IllegalStateException("No playlist loaded.")
+                    if (playlist.apiKey.isNullOrBlank()) {
+                        throw IllegalStateException("Active source is not Dispatcharr-backed.")
+                    }
+                    val intId = recording.id.removePrefix("server-").toIntOrNull()
+                        ?: throw IllegalStateException("Invalid server recording id: ${recording.id}")
+                    val base = playlistRepository.effectiveBaseUrl(playlist)
+                    dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                        dispatcharrClient.deleteRecording(base, key, intId)
+                    }
+                    refresh()
+                }
+                Source.Local -> Unit // handled above
+            }
+        }
+    }
+
+    /**
+     * Schedules a Dispatcharr-server recording for the given channel + program.
+     * Caller passes pre-rolled times (start - preRollMin, end + postRollMin
+     * already applied). Returns a Result that the caller can surface via toast.
+     */
+    /**
+     * Series recording rule (Record sheet: Every episode / New episodes only
+     * / Customize rule). Creates the rule, asks the server to evaluate it so
+     * the matching episodes appear at once, then refreshes the recordings.
+     * Returns the number of recordings the server reports (-1 = unknown).
+     */
+    suspend fun createSeriesRule(
+        tvgId: String?,
+        mode: String,
+        untaggedIsNew: Boolean,
+        title: String,
+        titleMode: String,
+        description: String,
+        descriptionMode: String,
+        channelDispatcharrId: Int?,
+    ): Result<Int> {
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        if (playlist.apiKey.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        }
+        val base = playlistRepository.effectiveBaseUrl(playlist)
+        return runCatching {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.createSeriesRule(
+                    baseUrl = base, apiKey = key, tvgId = tvgId, mode = mode,
+                    untaggedIsNew = untaggedIsNew, title = title, titleMode = titleMode,
+                    description = description, descriptionMode = descriptionMode,
+                    channelId = channelDispatcharrId,
+                )
+            }
+            val count = dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.evaluateSeriesRules(base, key, tvgId)
+            }
+            refresh()
+            count
+        }
+    }
+
+    suspend fun scheduleServerRecording(
+        channelDispatcharrId: Int,
+        startMillis: Long,
+        endMillis: Long,
+        title: String,
+        description: String,
+        comskip: Boolean,
+    ): Result<DispatcharrRecording> {
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        if (playlist.apiKey.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        }
+        val base = playlistRepository.effectiveBaseUrl(playlist)
+        return withCapability(Capability.CanManageDvr) {
+            val result = dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.createRecording(
+                    baseUrl = base,
+                    apiKey = key,
+                    channelId = channelDispatcharrId,
+                    startIso = startMillis.toIsoUtc(),
+                    endIso = endMillis.toIsoUtc(),
+                    title = title,
+                    description = description,
+                    comskip = comskip,
+                )
+            }
+            // Optimistic insert: the POST already returned the full server row
+            // (real id, channel, window). Merge it into state NOW so the
+            // "Recording (N)" pill + red row appear immediately, instead of
+            // waiting for the second LIST round-trip + EPG hydration in
+            // refresh(). effectiveStatus() reclassifies an airing-now row as
+            // Recording on its own, so no status guessing. The row uses the
+            // same "server-$id" key the refresh-produced row will, so the
+            // dedup-by-id guard in refresh() reconciles it in place.
+            val optimistic = result.toRecording(base, dispatcharrClient, trustedServerHosts(playlist))
+            _state.update { st ->
+                val without = st.recordings.filterNot { it.id == optimistic.id }
+                st.copy(recordings = (without + optimistic).sortedBy { it.startMillis })
+            }
+            refresh()
+            result
+        }
+    }
+
+    /**
+     * Edits an already-scheduled Dispatcharr server recording. Mirrors
+     * scheduleServerRecording's signature minus the channel (the channel id
+     * can't change for an existing row). Caller passes pre-rolled times.
+     * Only valid for Source.Server recordings, local recordings (which are
+     * downloads, not scheduled tasks) cannot be edited in place.
+     */
+    suspend fun editServerRecording(
+        recordingId: Int,
+        startMillis: Long,
+        endMillis: Long,
+        title: String,
+        description: String,
+    ): Result<DispatcharrRecording> {
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        if (playlist.apiKey.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        }
+        val base = playlistRepository.effectiveBaseUrl(playlist)
+        // PATCH /api/channels/recordings/<id>/ is IsAdminOrDVRManager: route it
+        // through the capability layer so a 403 self-corrects instead of
+        // surfacing as a bare toast.
+        return withCapability(Capability.CanManageDvr) {
+            val result = dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.updateRecording(
+                    baseUrl = base,
+                    apiKey = key,
+                    recordingId = recordingId,
+                    startIso = startMillis.toIsoUtc(),
+                    endIso = endMillis.toIsoUtc(),
+                    title = title,
+                    description = description,
+                )
+            }
+            refresh()
+            result
+        }
+    }
+
+    /**
+     * Kick off server-side commercial detection / removal on a completed
+     * recording. Mirrors iOS contextMenu "Remove Commercials" (MyRecordingsView
+     * line 305-309). The server handles idempotency so repeated taps are
+     * safe, refresh() afterwards picks up any status change Dispatcharr
+     * surfaces via custom_properties.
+     */
+    suspend fun applyComskip(recording: Recording): Result<Unit> {
+        if (recording.source != Source.Server) {
+            return Result.failure(IllegalStateException("Remove Commercials is server-only."))
+        }
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        if (playlist.apiKey.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        }
+        val intId = recording.id.removePrefix("server-").toIntOrNull()
+            ?: return Result.failure(IllegalStateException("Invalid recording id."))
+        val base = playlistRepository.effectiveBaseUrl(playlist)
+        // Comskip is a server-side write (IsAdminOrDVRManager), so a 403 must
+        // reach the capability self-correction path like every other one.
+        return withCapability(Capability.CanManageDvr) {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.applyComskip(base, key, intId)
+            }
+            refresh()
+        }
+    }
+
+    /**
+     * Stop an in-progress server recording early. The partial file stays on
+     * disk, caller pairs with deleteRecording when the partial isn't wanted.
+     * Mirrors iOS contextMenu "Stop Recording" (MyRecordingsView line 332-336).
+     */
+    suspend fun stopRecording(recording: Recording): Result<Unit> {
+        if (recording.source != Source.Server) {
+            return Result.failure(IllegalStateException("Stop Recording is server-only."))
+        }
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        if (playlist.apiKey.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        }
+        val intId = recording.id.removePrefix("server-").toIntOrNull()
+            ?: return Result.failure(IllegalStateException("Invalid recording id."))
+        val base = playlistRepository.effectiveBaseUrl(playlist)
+        return withCapability(Capability.CanManageDvr) {
+            dispatcharrAuth.withApiKeyRetry(playlist.id) { key ->
+                dispatcharrClient.stopRecording(base, key, intId)
+            }
+            refresh()
+        }
+    }
+
+    /**
+     * Save to Device (audit #43): download a finalized server recording to
+     * local storage via the foreground [LocalRecordingService], after which it
+     * appears in the DVR tab as a Local copy playable offline. Mirrors iOS
+     * downloadDispatcharrRecording. Server recordings only; the playbackUrl is
+     * the same /file/ URL used for streaming, fetched with the source's
+     * X-API-Key.
+     */
+    suspend fun saveToDevice(recording: Recording): Result<Unit> {
+        if (recording.source != Source.Server) {
+            return Result.failure(IllegalStateException("Save to Device is for server recordings."))
+        }
+        val url = recording.playbackUrl
+            ?: return Result.failure(IllegalStateException("This recording has no file to download yet."))
+        val playlist = playlistRepository.activePlaylist()
+            ?: return Result.failure(IllegalStateException("No playlist loaded."))
+        val key = playlist.apiKey?.takeIf { it.isNotBlank() }
+            ?: return Result.failure(IllegalStateException("Active source is not Dispatcharr-backed."))
+        return runCatching {
+            LocalRecordingService.download(
+                context = appContext,
+                fileUrl = url,
+                title = recording.title,
+                channelName = recording.title,
+                apiKey = key,
+                userAgent = com.aeriotv.android.core.network.PlaybackHeaders
+                    .customUserAgent(playlist).orEmpty(),
+            )
+        }
+    }
+
+    /**
+     * Delete a local recording's bytes, handling the public-Downloads /
+     * SAF content:// URI, a file:// URI, and a bare filesystem path (the
+     * app-private fallback). Best-effort; the Room row is dropped regardless.
+     */
+    private fun deleteLocalFile(path: String) {
+        runCatching {
+            when {
+                path.startsWith("content://") ->
+                    appContext.contentResolver.delete(android.net.Uri.parse(path), null, null)
+                path.startsWith("file://") ->
+                    android.net.Uri.parse(path).path?.let { java.io.File(it).delete() }
+                else -> java.io.File(path).delete()
+            }
+        }
+    }
+
+    /**
+     * Fill in programme title/description for server recordings the server left
+     * sparse. Dispatcharr only stamps `custom_properties.program` on some rows
+     * (e.g. ones scheduled from its own guide), so bare or AerioTV-created
+     * schedules arrive with a generic "Recording N" title and no description.
+     * We join each such recording against the disk EPG cache by the channel's
+     * tvg-id and the programme whose airing overlaps the recording window, so
+     * scheduled / ongoing / completed recordings all show full programme info
+     * consistently. Best-effort and offline-safe: rows whose programme isn't in
+     * the cache (e.g. past programmes already pruned) are left untouched.
+     */
+    private suspend fun hydrateRecordingsFromEpg(
+        playlistId: String,
+        recordings: List<Recording>,
+    ): List<Recording> {
+        fun needsHydration(r: Recording): Boolean {
+            if (r.dispatcharrChannelId == null) return false
+            val rawId = r.id.removePrefix("server-")
+            val genericTitle = r.title.isBlank() || r.title == "Recording $rawId"
+            return genericTitle || r.description.isBlank() || r.category.isBlank()
+        }
+        val needy = recordings.filter(::needsHydration)
+        if (needy.isEmpty()) return recordings
+        val tvgByChannelId = playlistRepository.loadCachedChannels(playlistId)
+            .mapNotNull { c -> c.dispatcharrChannelId?.let { id -> id to c.tvgID } }
+            .filter { it.second.isNotBlank() }
+            .toMap()
+        if (tvgByChannelId.isEmpty()) return recordings
+        val from = needy.minOf { it.startMillis }
+        val to = needy.maxOf { it.endMillis }
+        if (from <= 0L || to <= from) return recordings
+        // Best-effort, like the doc says: a failed cache read leaves the rows
+        // unhydrated instead of failing refresh()'s viewModelScope coroutine,
+        // which is uncaught and took the whole app down (Streamer 2026-10-03,
+        // CursorWindow read at EpgProgrammeDao_Impl.forPlaylistInWindow).
+        // Cancellation is rethrown so a cancelled refresh still stops here.
+        val epgRows = try {
+            playlistRepository.loadCachedEpg(playlistId, from, to)
+        } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("DvrViewModel", "hydrateRecordingsFromEpg: EPG cache read failed", e)
+            return recordings
+        }
+        val epgByChannel = epgRows.groupBy { it.channelId }
+        if (epgByChannel.isEmpty()) return recordings
+        return recordings.map { r ->
+            if (!needsHydration(r)) return@map r
+            val tvg = tvgByChannelId[r.dispatcharrChannelId] ?: return@map r
+            val prog = epgByChannel[tvg]
+                ?.maxByOrNull { overlapMillis(it.startMillis, it.endMillis, r.startMillis, r.endMillis) }
+                ?.takeIf { overlapMillis(it.startMillis, it.endMillis, r.startMillis, r.endMillis) > 0L }
+                ?: return@map r
+            val rawId = r.id.removePrefix("server-")
+            val genericTitle = r.title.isBlank() || r.title == "Recording $rawId"
+            r.copy(
+                title = if (genericTitle && prog.title.isNotBlank()) prog.title else r.title,
+                description = if (r.description.isBlank()) prog.description else r.description,
+                category = if (r.category.isBlank()) prog.category else r.category,
+            )
+        }
+    }
+
+    /**
+     * Resolve a genre/category for COMPLETED recordings that arrived with a
+     * blank category (their programme has already rolled out of the on-disk
+     * EPG window, so the local cache pass [hydrateRecordingsFromEpg] couldn't
+     * reach it). Fixes Streamer feedback #6 where only the currently-airing
+     * recording showed pills.
+     *
+     * CRITICAL: this is fire-and-forget. The caller has ALREADY pushed the
+     * recordings to _state (so the DVR tab + list painted instantly); this
+     * launches a separate coroutine that resolves each category and patches it
+     * into _state as it lands, so pills appear a moment later WITHOUT blocking
+     * the first list render. The previous cut computed categories synchronously
+     * before the first _state update, which stalled the DVR tab ~55s.
+     *
+     * Resolution path: a completed recording carries no category field of its
+     * own, but it does surface an EPG programme id (top-level int FK or nested
+     * custom_properties.program.id, exposed as Recording.programId). We feed
+     * that id to getProgramDetail (`/api/epg/programs/<id>/`), the ONLY REST
+     * endpoint that returns `categories` (the bulk list / grid strip them for
+     * perf). This is the same endpoint ProgramInfoSheet uses for guide pills.
+     * NO unfiltered programme-list fetch: the old `?tvg_id=` walk returned the
+     * server's entire ~53k-row programme list (the param didn't filter), which
+     * is what made a refresh take ~55s and never matched.
+     *
+     * Cache discipline ([categoryCache], keyed by recording id):
+     *  - A DEFINITIVE result is memoised so the row is fetched at most once:
+     *    a resolved genre, OR a confirmed "programme has no category" (cached
+     *    as the empty string so we don't re-hit the network for a feed without
+     *    `<category>`).
+     *  - A FETCH FAILURE is NOT cached, so the next 30s refresh retries.
+     *  - Per-programme-id detail fetches are de-duplicated within a single
+     *    pass so two recordings of the same programme don't double-fetch.
+     * Best-effort and offline-safe: a row with no resolvable programme id, or
+     * one whose detail fetch fails, just stays blank (no pill) for now.
+     */
+    private fun resolveCompletedCategoriesAsync(
+        playlistId: String,
+        baseUrl: String,
+        recordings: List<Recording>,
+    ) {
+        // Only blank-category, server rows that carry a programme id and that we
+        // haven't already resolved definitively are worth a lookup.
+        val needy = recordings.filter {
+            it.source == Source.Server &&
+                it.category.isBlank() &&
+                it.programId != null &&
+                !categoryCache.containsKey(it.id)
+        }
+        if (needy.isEmpty()) return
+        viewModelScope.launch {
+            // De-dup detail fetches by programme id within this pass; two
+            // recordings of the same programme share one round-trip.
+            val byProgramId = HashMap<Int, String?>()
+            suspend fun categoriesForProgram(programId: Int): String? {
+                if (byProgramId.containsKey(programId)) return byProgramId[programId]
+                val detail = runCatching {
+                    dispatcharrAuth.withApiKeyRetry(playlistId) { k ->
+                        dispatcharrClient.getProgramDetail(baseUrl, k, programId)
+                    }
+                }.getOrNull()
+                // null result (fetch failed) is NOT memoised, so a transient
+                // failure retries next pass; a definitive empty/non-empty IS.
+                val joined = detail?.categories
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotEmpty() }
+                    ?.joinToString(", ")
+                if (joined != null) byProgramId[programId] = joined
+                return joined
+            }
+            for (rec in needy) {
+                val programId = rec.programId ?: continue
+                // null = fetch failed (leave uncached, retry next pass);
+                // "" = programme genuinely has no category (definitive);
+                // non-blank = resolved genre.
+                val resolved = categoriesForProgram(programId) ?: continue
+                categoryCache[rec.id] = resolved
+                if (resolved.isBlank()) continue
+                // Persist this network-resolved category too, so a completed row
+                // whose programme later leaves the cache still seeds its pill on
+                // the next load. Fire-and-forget on the DataStore IO path.
+                runCatching { appPreferences.setRecordingCategory(rec.id, resolved) }
+                // Patch just this row into _state as its category lands, so the
+                // pill appears without re-rendering or re-sorting the whole list.
+                _state.update { st ->
+                    val idx = st.recordings.indexOfFirst { it.id == rec.id }
+                    if (idx < 0 || st.recordings[idx].category.isNotBlank()) return@update st
+                    val patched = st.recordings.toMutableList()
+                    patched[idx] = patched[idx].copy(category = resolved)
+                    st.copy(recordings = patched)
+                }
+            }
+        }
+    }
+
+    /**
+     * Persist every recording that currently carries a non-blank category to
+     * the DataStore (id -> category), skipping ids whose persisted value
+     * already matches so the 30s refresh loop does not churn the store. This
+     * is the load-bearing half of the "retain pill after Completed" fix: it
+     * captures the category WHILE the recording is airing/recent (its
+     * programme still in the cache, so [hydrateRecordingsFromEpg] stamped it),
+     * including the currently-recording row. Fire-and-forget on a background
+     * coroutine so it never touches the main thread or the first _state
+     * update. [already] is the snapshot read at the top of refresh(), used to
+     * avoid an IO write when nothing changed.
+     */
+    private fun persistResolvedCategories(
+        recordings: List<Recording>,
+        already: Map<String, String>,
+    ) {
+        val toPersist = recordings
+            .filter { it.category.isNotBlank() && already[it.id] != it.category }
+        if (toPersist.isEmpty()) return
+        viewModelScope.launch {
+            for (rec in toPersist) {
+                runCatching { appPreferences.setRecordingCategory(rec.id, rec.category) }
+            }
+        }
+    }
+
+    private fun overlapMillis(aStart: Long, aEnd: Long, bStart: Long, bEnd: Long): Long =
+        (minOf(aEnd, bEnd) - maxOf(aStart, bStart)).coerceAtLeast(0L)
+
+    private companion object {
+        const val TAG = "DvrViewModel"
+
+        /** Stable id for the synthetic row that represents the capture
+         *  currently running in LocalRecordingService. Replaced by the real
+         *  Room row once the file finalizes. */
+        const val LOCAL_IN_PROGRESS_ID = "local-in-progress"
+    }
+}
+
+private fun DispatcharrRecording.toRecording(
+    baseUrl: String,
+    client: DispatcharrClient,
+    trustedHosts: Set<String>,
+): DvrViewModel.Recording {
+    val start = parseIsoMillis(startTime) ?: 0L
+    val end = parseIsoMillis(endTime) ?: start
+    val status = when (this.status?.lowercase()) {
+        "scheduled" -> DvrViewModel.Recording.Status.Scheduled
+        "recording", "in_progress" -> DvrViewModel.Recording.Status.Recording
+        // "interrupted" = a partial file Dispatcharr left when a recording was
+        // cut short; it is playable and Dispatcharr's own UI buckets it as
+        // completed, so treat it as a terminal Completed (builds a playback URL
+        // below). A blank/absent status is deliberately left Unknown here so
+        // effectiveStatus() can bucket it by time (GH #11).
+        "completed", "interrupted" -> DvrViewModel.Recording.Status.Completed
+        "stopped" -> DvrViewModel.Recording.Status.Stopped
+        "failed", "error" -> DvrViewModel.Recording.Status.Failed
+        else -> DvrViewModel.Recording.Status.Unknown
+    }
+    // Build a playback URL for finalized recordings, mirroring iOS
+    // playServerRecording (MyRecordingsView.swift line 559): prefer the
+    // server-reported file_url / output_file_url (resolved against the
+    // effective base), else fall back to the constructed /file/ endpoint for
+    // older Dispatcharr builds. Auth headers (X-API-Key) are applied by the
+    // recording-player route, not baked into the URL.
+    val playback: String? = when (status) {
+        DvrViewModel.Recording.Status.Completed,
+        DvrViewModel.Recording.Status.Stopped ->
+            resolveRecordingUrl(fileUrl, baseUrl, trustedHosts) ?: client.recordingPlaybackUrl(baseUrl, id)
+        else -> null
+    }
+    // In-progress catch-up / watch-live (audit #50, iOS v1.6.22 + #29).
+    // Mirror iOS playServerRecording: prefer the server-reported file_url
+    // (HLS for in-progress on the new DVR pipeline), else the legacy
+    // /file/ partial. Only the .m3u8 case is a true growing DVR window;
+    // the raw partial plays as fixed VOD.
+    val inProgress: String? = if (status == DvrViewModel.Recording.Status.Recording) {
+        resolveRecordingUrl(fileUrl, baseUrl, trustedHosts) ?: client.recordingPlaybackUrl(baseUrl, id)
+    } else null
+    val dvr = inProgress?.contains(".m3u8", ignoreCase = true) == true
+    val cp = customProperties
+    val program = cp?.get("program") as? kotlinx.serialization.json.JsonObject
+    fun str(o: kotlinx.serialization.json.JsonObject?, k: String): String? =
+        (o?.get(k) as? kotlinx.serialization.json.JsonPrimitive)?.content?.takeIf { it.isNotBlank() && it != "null" }
+    fun num(o: kotlinx.serialization.json.JsonObject?, k: String): Double? =
+        (o?.get(k) as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull()
+    val info = cp?.get("stream_info") as? kotlinx.serialization.json.JsonObject
+    // PR 77 (ant462): prefer the poster Dispatcharr cached on the user's OWN
+    // server (custom_properties.poster_logo_id -> /api/channels/logos/<id>/cache/,
+    // byte-identical to the upstream art, LAN-local); the any-host poster_url
+    // (839a5c52) stays the fallback. Server-scheduled rows nest it under program.
+    val posterLogoId = (num(cp, "poster_logo_id") ?: num(program, "poster_logo_id"))
+        ?.toInt()?.takeIf { it > 0 }
+    val poster = posterLogoId?.takeIf { baseUrl.isNotBlank() }?.let { client.logoUrl(baseUrl, it) }
+        ?: (str(cp, "poster_url") ?: str(program, "poster_url"))?.let { resolveArtUrl(it, baseUrl) }
+    val bytesWritten = num(cp, "bytes_written")?.toLong()?.takeIf { it > 0 }
+    return DvrViewModel.Recording(
+        id = "server-$id",
+        source = DvrViewModel.Source.Server,
+        title = title.ifBlank { "Recording $id" },
+        description = description,
+        startMillis = start,
+        endMillis = end,
+        status = status,
+        fileSizeBytes = bytesWritten ?: fileSize ?: 0L,
+        playbackUrl = playback,
+        dispatcharrChannelId = channel,
+        inProgressUrl = inProgress,
+        isDvr = dvr,
+        programId = programId,
+        posterUrl = poster,
+        partial = this.status?.lowercase() == "interrupted",
+        subTitle = str(program, "sub_title") ?: str(cp, "sub_title"),
+        season = num(cp, "season")?.toInt() ?: num(program, "season")?.toInt(),
+        episode = num(cp, "episode")?.toInt() ?: num(program, "episode")?.toInt(),
+        fileName = fileName,
+        videoCodec = str(info, "video_codec"),
+        resolution = str(info, "resolution") ?: run {
+            val w = num(info, "width"); val h = num(info, "height")
+            if (w != null && h != null && w > 0 && h > 0) "${w.toInt()}x${h.toInt()}" else null
+        },
+        frameRate = num(info, "source_fps"),
+        videoBitrateKbps = num(info, "video_bitrate"),
+        audioCodec = str(info, "audio_codec"),
+        audioChannels = str(info, "audio_channels"),
+    )
+}
+
+/**
+ * Hosts a recording FILE url may point at: the playlist's remote URL host and
+ * its LAN URL host. Dispatcharr builds absolute URLs from whichever address it
+ * was configured with, which need not be the base this device is using now.
+ */
+private fun trustedServerHosts(playlist: com.aeriotv.android.core.data.db.entity.PlaylistEntity): Set<String> =
+    listOfNotNull(playlist.urlString, playlist.lanUrlString)
+        .mapNotNull { u -> runCatching { java.net.URI(u.trim()).host }.getOrNull()?.lowercase() }
+        .toSet()
+
+/** Hosts already reported as rejected this process, so the 30 s refresh logs each once. */
+private val rejectedFileHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+/**
+ * Resolve a Dispatcharr-reported recording file_url against the active
+ * server's effective base URL. Mirrors iOS resolveRecordingURL
+ * (MyRecordingsView.swift line 614): an already-absolute value is used if its
+ * host is one of [trustedHosts]; a relative path is anchored to the base.
+ * Returns null for a blank input or an untrusted host.
+ */
+private fun resolveRecordingUrl(fileUrl: String?, baseUrl: String, trustedHosts: Set<String>): String? {
+    val trimmed = fileUrl?.trim().orEmpty()
+    if (trimmed.isEmpty()) return null
+    if (trimmed.startsWith("http://", ignoreCase = true) ||
+        trimmed.startsWith("https://", ignoreCase = true)
+    ) {
+        // The recording player sends X-API-Key with this request, so an
+        // absolute file_url on any host other than the playlist's own remote
+        // or LAN host is rejected: it would hand the API key to that host.
+        val host = runCatching { java.net.URI(trimmed).host }.getOrNull()?.lowercase()
+        if (host == null || host !in trustedHosts) {
+            val key = host ?: "<unparseable>"
+            if (rejectedFileHosts.add(key)) {
+                android.util.Log.w("DvrViewModel", "resolveRecordingUrl: rejected file_url on untrusted host $key (logged once per host)")
+            }
+            return null
+        }
+        return trimmed
+    }
+    val base = baseUrl.trimEnd('/')
+    if (base.isEmpty()) return null
+    val path = if (trimmed.startsWith("/")) trimmed else "/$trimmed"
+    return "$base$path"
+}
+
+/**
+ * Resolve poster/art URLs. Art is a plain image fetch with no API key, so an
+ * absolute URL is accepted from any host (TMDB, provider logo hosts); a
+ * relative path is anchored to the effective base.
+ */
+private fun resolveArtUrl(url: String, baseUrl: String): String {
+    val trimmed = url.trim()
+    if (trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) return trimmed
+    val base = baseUrl.trimEnd('/')
+    if (base.isEmpty()) return trimmed
+    return base + (if (trimmed.startsWith("/")) trimmed else "/$trimmed")
+}
+
+private fun LocalRecordingEntity.toRecording(): DvrViewModel.Recording {
+    val status = when (this.status.lowercase()) {
+        "completed" -> DvrViewModel.Recording.Status.Completed
+        "stopped" -> DvrViewModel.Recording.Status.Stopped
+        "failed", "error" -> DvrViewModel.Recording.Status.Failed
+        else -> DvrViewModel.Recording.Status.Unknown
+    }
+    // file:// URI for libmpv. Path may contain spaces / unicode (the recording
+    // service stamps the user-supplied channel name + ISO start time), so
+    // URL-encode every segment via android.net.Uri.fromFile. mpv on Android
+    // happily resolves file:// against the filesystem when SAF isn't involved.
+    val isPlayable = status == DvrViewModel.Recording.Status.Completed ||
+        status == DvrViewModel.Recording.Status.Stopped
+    val playable = if (isPlayable && filePath.isNotBlank()) {
+        // A recording saved to the public Downloads (MediaStore) or a SAF
+        // custom folder is stored as a content:// URI; a path from the
+        // app-private dir needs wrapping in file://. ExoPlayer's
+        // DefaultDataSource resolves both schemes.
+        if (filePath.startsWith("content://") || filePath.startsWith("file://")) filePath
+        else android.net.Uri.fromFile(java.io.File(filePath)).toString()
+    } else null
+    return DvrViewModel.Recording(
+        id = "local-$id",
+        source = DvrViewModel.Source.Local,
+        title = title.ifBlank { channelName },
+        description = "",
+        startMillis = startedAt,
+        endMillis = endedAt,
+        status = status,
+        fileSizeBytes = byteSize,
+        playbackUrl = playable,
+    )
+}
+
+private val ISO_PARSER = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}
+private val ISO_PARSER_ALT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}
+private val ISO_PARSER_Z = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}
+
+internal fun parseIsoMillis(iso: String): Long? {
+    if (iso.isBlank()) return null
+    return runCatching { ISO_PARSER.parse(iso)?.time }.getOrNull()
+        ?: runCatching { ISO_PARSER_ALT.parse(iso)?.time }.getOrNull()
+        ?: runCatching { ISO_PARSER_Z.parse(iso)?.time }.getOrNull()
+}
+
+private val ISO_EMIT = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+}
+
+internal fun Long.toIsoUtc(): String = ISO_EMIT.format(Date(this))

@@ -1,0 +1,223 @@
+package com.aeriotv.android.core.tv
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.aeriotv.android.ui.scale.Dialog
+
+/**
+ * One row of a [TvActionMenuDialog]. [icon] is nullable because some menus
+ * (the guide programme cell) are text-only; [destructive] swaps the icon and
+ * label to the error color; [enabled] keeps the row visible but inert and
+ * dimmed (e.g. a "Multiview full" state).
+ */
+data class TvMenuAction(
+    val label: String,
+    val icon: ImageVector? = null,
+    val destructive: Boolean = false,
+    val enabled: Boolean = true,
+    val onClick: () -> Unit,
+)
+
+/**
+ * The house long-press action menu for Android TV: a centered Dialog with a
+ * title header and focusable rows carrying the primary 0.18 wash on focus.
+ * Anchored DropdownMenus float oddly mid-screen at 10 feet, so TV branches
+ * render this instead (extracted from the DVR tab's RecordingActionMenu).
+ *
+ * Pair with [TvMenuGuard]: arm() at the long-press that opens the dialog;
+ * row clicks are wrapped here so the spurious OK-release that follows a TV
+ * long-press cannot auto-pick a row. Callers compose this only while open:
+ *   if (menuOpen) TvActionMenuDialog(..., onDismiss = { menuOpen = false })
+ *
+ * D-pad activation is latched per row, not time-based: a row only fires on
+ * an OK KeyUp whose KeyDown it also saw. The release of the long-press that
+ * OPENED the dialog arrives as a bare KeyUp (its KeyDown went to the
+ * launching row), so it is ignored no matter how long the button was held,
+ * including releases slower than the guard's grace window.
+ */
+@Composable
+fun TvActionMenuDialog(
+    title: String,
+    actions: List<TvMenuAction>,
+    guard: TvMenuGuard,
+    onDismiss: () -> Unit,
+    width: androidx.compose.ui.unit.Dp = 250.dp,
+    // Opens with D-pad focus on the appended Cancel row instead of the first
+    // action (the Exit AerioTV? confirm: a stray OK must not close the app).
+    focusCancel: Boolean = false,
+) {
+    val cancelFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    if (focusCancel) {
+        androidx.compose.runtime.LaunchedEffect(Unit) {
+            // The Dialog window attaches a frame after composition.
+            kotlinx.coroutines.delay(50)
+            runCatching { cancelFocus.requestFocus() }
+        }
+    }
+    // Apple TV look (Logan 2026-09-02): a centred translucent card, the
+    // title on top, one capsule per action with accent text, the focused
+    // capsule ringed like the rest of the app, and a Cancel capsule last.
+    val accent = MaterialTheme.colorScheme.primary
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = com.aeriotv.android.ui.tv.TvChrome.dialogSurface(),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
+            // Long menus (the Multiview tile menu) used to run past the
+            // screen bottom with the last rows unreachable: cap the card at
+            // the screen and scroll the rows; focus moves bring the focused
+            // capsule into view.
+            modifier = Modifier.width(width)
+                .heightIn(max = (androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp * 0.92f).dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(androidx.compose.foundation.rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+                actions.forEachIndexed { i, action ->
+                    TvMenuCapsule(
+                        isFirst = i == 0,
+                        label = action.label,
+                        enabled = action.enabled,
+                        destructive = action.destructive,
+                        accent = accent,
+                        onActivate = guard.wrap { onDismiss(); action.onClick() },
+                    )
+                }
+                TvMenuCapsule(
+                    isFirst = actions.isEmpty(),
+                    label = "Cancel",
+                    enabled = true,
+                    destructive = false,
+                    accent = accent,
+                    onActivate = guard.wrap { onDismiss() },
+                    modifier = if (focusCancel) {
+                        Modifier.focusRequester(cancelFocus)
+                    } else {
+                        Modifier
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TvMenuCapsule(
+    isFirst: Boolean,
+    label: String,
+    enabled: Boolean,
+    destructive: Boolean,
+    accent: Color,
+    onActivate: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var focused by remember { mutableStateOf(false) }
+    var okLatched by remember { mutableStateOf(false) }
+    val textColor = when {
+        !enabled -> accent.copy(alpha = 0.35f)
+        destructive -> MaterialTheme.colorScheme.error
+        else -> accent
+    }
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 38.dp)
+            // Clip BEFORE clickable so the focus/press highlight follows the
+            // capsule instead of painting a square behind the ring.
+            .clip(RoundedCornerShape(19.dp))
+            .onFocusChanged {
+                focused = it.isFocused
+                if (!it.isFocused) okLatched = false
+            }
+            .onPreviewKeyEvent { event ->
+                // Up on the first row stays put: there is nothing focusable
+                // above it, and letting the key through dropped focus out of
+                // the menu into empty space (Logan 2026-10-10, Streamer).
+                if (isFirst && event.key == Key.DirectionUp) return@onPreviewKeyEvent true
+                val isOk = event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter
+                if (!isOk) return@onPreviewKeyEvent false
+                when (event.type) {
+                    KeyEventType.KeyDown -> { if (event.nativeKeyEvent.repeatCount == 0) okLatched = true; true }
+                    KeyEventType.KeyUp -> {
+                        val latched = okLatched
+                        okLatched = false
+                        if (latched && enabled) onActivate()
+                        true
+                    }
+                    else -> false
+                }
+            }
+            // Pill canon (Logan 2026-09-05 / 2026-09-10): a menu action is
+            // never "selected", so focus is the ACCENT ring over a quiet
+            // translucent fill, like every other unselected pill.
+            .background(
+                color = Color.White.copy(alpha = if (focused) 0.14f else 0.08f),
+                shape = RoundedCornerShape(19.dp),
+            )
+            .border(2.dp, if (focused) accent else Color.Transparent, RoundedCornerShape(19.dp))
+            .clickable(enabled = enabled, onClick = onActivate),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = textColor,
+            // A long action label (for example "Browse earlier programs")
+            // wraps to a second line inside the capsule instead of being
+            // clipped; short labels are unchanged.
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        )
+    }
+}

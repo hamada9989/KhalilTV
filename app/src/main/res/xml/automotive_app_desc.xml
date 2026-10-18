@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Declares AerioTV as an Android Auto MEDIA app. Android Auto reads this via
+    the com.google.android.gms.car.application meta-data in the manifest and
+    surfaces the app's MediaBrowserService (our Media3 MediaLibraryService)
+    browse tree on the head unit. "media" is the only template type a media app
+    needs; navigation / messaging templates are not used.
+-->
+<automotiveApp>
+    <uses name="media" />
+</automotiveApp>

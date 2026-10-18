@@ -1,0 +1,29 @@
+<!--
+    Notification small-icon silhouette. Android tints this white when shown
+    in the status bar; the colored launcher icon lives in mipmap/ic_launcher.
+    Three concentric stroke arcs + a center dot mirror the iOS AerioLogo
+    signal-wave glyph (Aerio/SupportingFiles/Assets.xcassets/AerioLogo).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+    <!-- Outer arc -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,18 A11,11 0 0,1 16,7 L18,7 A13,13 0 0,0 5,20 Z" />
+    <!-- Middle arc -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,18 A7,7 0 0,1 12,11 L14,11 A9,9 0 0,0 5,20 Z" />
+    <!-- Inner arc -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,18 A3,3 0 0,1 8,15 L10,15 A5,5 0 0,0 5,20 Z" />
+    <!-- Dot -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,18 m-1.6,0 a1.6,1.6 0 1,0 3.2,0 a1.6,1.6 0 1,0 -3.2,0" />
+</vector>

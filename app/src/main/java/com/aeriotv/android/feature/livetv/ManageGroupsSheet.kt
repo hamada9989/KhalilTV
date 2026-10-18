@@ -1,0 +1,788 @@
+package com.aeriotv.android.feature.livetv
+
+import com.aeriotv.android.ui.scale.subtext
+import com.aeriotv.android.ui.theme.textAccent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.FontWeight
+import com.aeriotv.android.feature.playlist.PlaylistViewModel
+import com.aeriotv.android.ui.settings.rememberIsTvDevice
+import com.aeriotv.android.ui.settings.dpadFocusRing
+import androidx.compose.ui.unit.dp
+import com.aeriotv.android.ui.scale.Dialog
+import sh.calvin.reorderable.ReorderableItem
+import sh.calvin.reorderable.rememberReorderableLazyListState
+
+/**
+ * How the Live TV channel groups are ordered. Default keeps the playlist's
+ * first-occurrence (source) order; Alphabetical sorts A-Z; Manual uses the
+ * user's saved drag/move order. Android-only enhancement (iOS groups are
+ * always source-ordered).
+ */
+enum class GroupSortMode {
+    Default, Alphabetical, Manual;
+
+    val label: String
+        get() = when (this) {
+            Default -> "Default"
+            Alphabetical -> "A-Z"
+            Manual -> "Manual"
+        }
+
+    companion object {
+        fun from(name: String?): GroupSortMode =
+            entries.firstOrNull { it.name == name } ?: Default
+    }
+}
+
+/**
+ * Apply the user's group sort preference to the live group-name list.
+ * - [GroupSortMode.Default]: the order passed in (source / first-occurrence).
+ * - [GroupSortMode.Alphabetical]: case-insensitive A-Z.
+ * - [GroupSortMode.Manual]: the saved order, reconciled against the live groups
+ *   (saved entries first in their saved order, then any new groups appended in
+ *   source order; removed/renamed groups drop out). Robust to playlist changes.
+ */
+fun orderGroups(
+    allGroups: List<String>,
+    sortMode: GroupSortMode,
+    savedOrder: List<String>,
+    /** Include the pinned Favorites token (when the user has favorites). */
+    hasFavorites: Boolean = false,
+    /** Include the pinned Recently Watched token (Logan 2026-09-14). Callers
+     *  pass true whenever the token belongs in the list at all; whether it is
+     *  SHOWN is the hidden-groups question, same as any other group. */
+    hasRecent: Boolean = false,
+): List<String> {
+    // The All Channels token is part of the ordered list (Logan 2026-09-08,
+    // Apple parity): in Manual mode any group can sit above it. A provider
+    // group literally named "All" is dropped so it can never collide with
+    // the sentinel (#45 review).
+    val groups = allGroups.filterNot {
+        it.equals(PlaylistViewModel.ALL_GROUPS, ignoreCase = true) ||
+            it == PlaylistViewModel.FAVORITES_GROUP ||
+            it == PlaylistViewModel.RECENT_GROUP
+    }
+    val pinned = buildList {
+        if (hasFavorites) add(PlaylistViewModel.FAVORITES_GROUP)
+        if (hasRecent) add(PlaylistViewModel.RECENT_GROUP)
+        add(PlaylistViewModel.ALL_GROUPS)
+    }
+    return when (sortMode) {
+        GroupSortMode.Default -> pinned + groups
+        GroupSortMode.Alphabetical -> pinned + groups.sortedBy { it.lowercase() }
+        GroupSortMode.Manual -> {
+            val live = groups.toSet() + pinned
+            val ordered = savedOrder.filter { it in live }.distinct()
+            val orderedSet = ordered.toSet()
+            val rest = (pinned + groups).filterNot { it in orderedSet }
+            ordered + rest
+        }
+    }
+}
+
+private fun moveInList(list: List<String>, item: String, delta: Int): List<String> {
+    val idx = list.indexOf(item)
+    if (idx < 0) return list
+    val target = (idx + delta).coerceIn(0, list.lastIndex)
+    if (target == idx) return list
+    return list.toMutableList().apply { add(target, removeAt(idx)) }
+}
+
+/**
+ * Manage Groups bottom sheet. Mirrors iOS Settings > Manage Groups modal:
+ * a scrollable checkbox list with "All / None" toggles in the header. Checked
+ * groups stay visible in the Live TV filter row; unchecked groups disappear
+ * from the chips but their channels remain in "All" so they can still be
+ * found via search.
+ *
+ * Hide/show persists via the [hiddenGroups] set in AppPreferences (working copy,
+ * committed on Done). When [reorderEnabled] (Live TV only), a sort selector is
+ * shown (Default / A-Z / Manual); in Manual mode each row gets a drag handle for
+ * touch reordering, committed via [onReorder] on drag-stop.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ManageGroupsSheet(
+    allGroups: List<String>,
+    hiddenGroups: Set<String>,
+    onSave: (Set<String>) -> Unit,
+    onDismiss: () -> Unit,
+    reorderEnabled: Boolean = false,
+    sortMode: GroupSortMode = GroupSortMode.Default,
+    onSortModeChange: (GroupSortMode) -> Unit = {},
+    onReorder: (List<String>) -> Unit = {},
+) {
+    // Profiles phase 2b: never opens for a Child profile.
+    if (com.aeriotv.android.feature.settings.rememberIsChildProfile()) {
+        androidx.compose.runtime.LaunchedEffect(Unit) { onDismiss() }
+        return
+    }
+    var working by remember(hiddenGroups) { mutableStateOf(hiddenGroups.toMutableSet()) }
+    val manualReorder = reorderEnabled && sortMode == GroupSortMode.Manual
+
+    com.aeriotv.android.ui.FormFactorModal(
+        onDismiss = onDismiss,
+        tvWidthFraction = 0.6f,
+        tvMaxHeight = 620.dp,
+        // Plan B5: cap the touch sheet near 640dp on tablet. The content is a
+        // list of short group names with a visibility toggle; unbounded, it
+        // stretched across a 1280dp display and left the eye travelling the
+        // whole width between a name and its control. Phones are narrower than
+        // the cap, so nothing changes there. The TV path is the centered
+        // dialog above and is unaffected.
+        sheetMaxWidth = 640.dp,
+        // Logan 2026-09-14: the touch sheet opens at a partial height and
+        // drags all the way to full screen. The content below claims the whole
+        // sheet height and the list scrolls inside it, so the expanded anchor
+        // never moves with the content (the 45483dd5 bounce).
+        sheetExpandable = true,
+    ) {
+        val expandable = !rememberIsTvDevice()
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (expandable) Modifier.fillMaxHeight()
+                    else Modifier.heightIn(min = 320.dp, max = 600.dp),
+                )
+                .padding(bottom = 8.dp),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Manage Groups",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = {
+                    onSave(working.toSet())
+                    onDismiss()
+                }) {
+                    Text("Done", color = MaterialTheme.colorScheme.textAccent)
+                }
+            }
+            if (reorderEnabled) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Order",
+                        style = MaterialTheme.typography.bodySmall.subtext(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(start = 4.dp, end = 4.dp),
+                    )
+                    GroupSortMode.entries.forEach { mode ->
+                        val selected = mode == sortMode
+                        TextButton(onClick = { onSortModeChange(mode) }) {
+                            Text(
+                                text = mode.label,
+                                color = if (selected) MaterialTheme.colorScheme.textAccent
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                            )
+                        }
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = if (manualReorder) "Drag to reorder, check to show or hide."
+                    else "Check groups to show, uncheck to hide.",
+                    style = MaterialTheme.typography.bodySmall.subtext(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { working = mutableSetOf() }) {
+                    Text("All", color = MaterialTheme.colorScheme.textAccent)
+                }
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                )
+                TextButton(onClick = { working = allGroups.toMutableSet() }) {
+                    Text("None", color = MaterialTheme.colorScheme.textAccent)
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+            // Manual order carries All Channels inside the list so it can be
+            // moved like any group; other modes keep it pinned above.
+            val listGroups = if (manualReorder) allGroups
+                else allGroups.filterNot { it == PlaylistViewModel.ALL_GROUPS || it == PlaylistViewModel.FAVORITES_GROUP }
+            if (allGroups.isNotEmpty() && !manualReorder) {
+                // GH #80: the All Channels pill is hideable too (large playlists
+                // pay for it on every open). Pinned above the list, never reordered.
+                val allVisible = PlaylistViewModel.ALL_GROUPS !in working
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            working = working.toMutableSet().apply {
+                                if (allVisible) add(PlaylistViewModel.ALL_GROUPS) else remove(PlaylistViewModel.ALL_GROUPS)
+                            }
+                        }
+                        .padding(horizontal = 20.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = allVisible,
+                        onCheckedChange = { checked ->
+                            working = working.toMutableSet().apply {
+                                if (checked) remove(PlaylistViewModel.ALL_GROUPS) else add(PlaylistViewModel.ALL_GROUPS)
+                            }
+                        },
+                        colors = CheckboxDefaults.colors(checkedColor = MaterialTheme.colorScheme.primary),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "All Channels",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+            }
+            if (allGroups.isEmpty()) {
+                // Mirrors iOS ManageGroupsSheet.swift line 50-53 empty
+                // state. Hit when the active playlist has no #EXTINF
+                // group-title field set on any channel -- the Manage
+                // button still appears but tapping it would otherwise
+                // show a blank list with no explanation.
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 32.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "No groups available",
+                        style = MaterialTheme.typography.bodyMedium.subtext(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                return@Column
+            }
+            if (manualReorder) {
+                // Local working copy so the drag preview updates fluidly; the
+                // new order commits to DataStore on drag-stop via onReorder
+                // (same pattern as the Favorites tab).
+                val lazyListState = rememberLazyListState()
+                var workingOrder by remember(listGroups) { mutableStateOf(listGroups) }
+                LaunchedEffect(listGroups) { workingOrder = listGroups }
+                val reorderState = rememberReorderableLazyListState(lazyListState) { from, to ->
+                    workingOrder = workingOrder.toMutableList().apply {
+                        add(to.index, removeAt(from.index))
+                    }
+                }
+                LazyColumn(
+                    state = lazyListState,
+                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
+                    contentPadding = PaddingValues(vertical = 6.dp),
+                ) {
+                    items(workingOrder, key = { it }) { group ->
+                        ReorderableItem(reorderState, key = group) { _ ->
+                            val visible = group !in working
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        working = working.toMutableSet().apply {
+                                            if (visible) add(group) else remove(group)
+                                        }
+                                    }
+                                    .padding(horizontal = 20.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Checkbox(
+                                    checked = visible,
+                                    onCheckedChange = { checked ->
+                                        working = working.toMutableSet().apply {
+                                            if (checked) remove(group) else add(group)
+                                        }
+                                    },
+                                    colors = CheckboxDefaults.colors(
+                                        checkedColor = MaterialTheme.colorScheme.primary,
+                                    ),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = groupSidebarLabel(group),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = if (group == PlaylistViewModel.ALL_GROUPS) FontWeight.SemiBold else FontWeight.Normal,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Icon(
+                                    imageVector = Icons.Filled.Menu,
+                                    contentDescription = "Drag to reorder",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier
+                                        .draggableHandle(
+                                            onDragStopped = { onReorder(workingOrder) },
+                                        )
+                                        .size(24.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
+                    contentPadding = PaddingValues(vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
+                ) {
+                    // All Channels is the pinned row above; listing it again
+                    // here showed it twice (harmless until each row grew a
+                    // Set as Default star, which made the duplicate confusing).
+                    items(
+                        allGroups.filterNot { it == PlaylistViewModel.ALL_GROUPS },
+                        key = { it },
+                    ) { group ->
+                        val visible = group !in working
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    working = working.toMutableSet().apply {
+                                        if (visible) add(group) else remove(group)
+                                    }
+                                }
+                                .padding(horizontal = 20.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = visible,
+                                onCheckedChange = { checked ->
+                                    working = working.toMutableSet().apply {
+                                        if (checked) remove(group) else add(group)
+                                    }
+                                },
+                                colors = CheckboxDefaults.colors(
+                                    checkedColor = MaterialTheme.colorScheme.primary,
+                                ),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                // Tokens are storage values: "__favorites__"
+                                // rendered literally here (GH #81 screenshot).
+                                text = groupDisplayName(group),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * TV-native group on/off picker: a centered, D-pad-driven dialog instead of the
+ * touch bottom sheet. Each row toggles live and the focused row is highlighted,
+ * mirroring the tvOS guide's "Toggle groups on or off" popup. [onToggle] passes
+ * the group and its new visibility so the caller updates hiddenGroups.
+ *
+ * When [reorderEnabled] (Live TV only), a sort selector is shown (Default / A-Z
+ * / Manual). In Manual mode a row enters "move mode" on a long-press of the
+ * D-pad center; while moving, Up/Down reposition the group and OK/Back commit
+ * the new order via [onReorder] (Multiview Move-Tile parity).
+ *
+ * When [sidebarLayout] is non-null (the guide uses the Sidebar Menu group
+ * selector), a second chip row picks the sidebar layout: "overlay" or "shift".
+ */
+@Composable
+fun TvGroupPicker(
+    allGroups: List<String>,
+    hiddenGroups: Set<String>,
+    onDismiss: () -> Unit,
+    reorderEnabled: Boolean = false,
+    sortMode: GroupSortMode = GroupSortMode.Default,
+    onSortModeChange: (GroupSortMode) -> Unit = {},
+    /** TV guide sidebar layout ("overlay" / "shift"); null hides the row. */
+    sidebarLayout: String? = null,
+    onSidebarLayoutChange: (String) -> Unit = {},
+    /** E-4 (perf campaign 2026-08-19): one commit per dialog SESSION, fired at
+     *  dismissal, replacing the per-press onToggle / per-drop onReorder
+     *  callbacks. Each of those was a synchronous DataStore write plus a
+     *  re-emission to every preference collector plus a full guide re-sort -
+     *  measured at 5-6 seconds per move on the Streamer, repeated per press.
+     *  The picker renders from its own working copies, so every press is
+     *  instant; the world updates once, after close. `order` is null when the
+     *  user never completed a manual move. */
+    onCommit: (hidden: Set<String>, order: List<String>?) -> Unit = { _, _ -> },
+) {
+    val manualReorder = reorderEnabled && sortMode == GroupSortMode.Manual
+    var workingHidden by remember { mutableStateOf(hiddenGroups) }
+    var orderDirty by remember { mutableStateOf(false) }
+    // Seeded once per open; deliberately NOT reset on external emissions (the
+    // old LaunchedEffect(allGroups) reset clobbered the working order when a
+    // slow commit round-tripped mid-second-move).
+    val listGroups = if (manualReorder) allGroups
+        else allGroups.filterNot { it == PlaylistViewModel.ALL_GROUPS || it == PlaylistViewModel.FAVORITES_GROUP }
+    var workingOrder by remember { mutableStateOf(listGroups) }
+    val commitAndDismiss = {
+        onCommit(workingHidden, if (orderDirty) workingOrder else null)
+        onDismiss()
+    }
+    Dialog(onDismissRequest = commitAndDismiss) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = com.aeriotv.android.ui.tv.TvChrome.dialogSurface(),
+            tonalElevation = 8.dp,
+            modifier = Modifier
+                .width(640.dp)
+                .heightIn(max = 640.dp),
+        ) {
+            Column(modifier = Modifier.padding(vertical = 20.dp)) {
+                Text(
+                    text = if (manualReorder) {
+                        "Hold OK on a group to move it, then use up and down. OK or Back to finish."
+                    } else {
+                        "Toggle groups on or off to show or hide them."
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 28.dp, vertical = 4.dp),
+                )
+                if (reorderEnabled) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        GroupSortMode.entries.forEach { mode ->
+                            val selected = mode == sortMode
+                            var chipFocused by remember { mutableStateOf(false) }
+                            Box(
+                                modifier = Modifier
+                                    .padding(end = 10.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(
+                                        if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                        else Color.Transparent,
+                                    )
+                                    .border(
+                                        width = if (chipFocused) 2.dp else 0.dp,
+                                        color = if (chipFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                        shape = RoundedCornerShape(10.dp),
+                                    )
+                                    .onFocusChanged { chipFocused = it.isFocused }
+                                    .clickable { onSortModeChange(mode) }
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                            ) {
+                                Text(
+                                    text = mode.label,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selected) MaterialTheme.colorScheme.textAccent
+                                    else MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+                    }
+                }
+                if (sidebarLayout != null) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Sidebar Layout",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(start = 4.dp, end = 14.dp),
+                        )
+                        listOf("overlay" to "Overlay", "shift" to "Shift guide").forEach { (mode, label) ->
+                            val selected = mode == sidebarLayout
+                            var chipFocused by remember { mutableStateOf(false) }
+                            Box(
+                                modifier = Modifier
+                                    .padding(end = 10.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(
+                                        if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                        else Color.Transparent,
+                                    )
+                                    .border(
+                                        width = if (chipFocused) 2.dp else 0.dp,
+                                        color = if (chipFocused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                        shape = RoundedCornerShape(10.dp),
+                                    )
+                                    .onFocusChanged { chipFocused = it.isFocused }
+                                    .clickable { onSidebarLayoutChange(mode) }
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                            ) {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selected) MaterialTheme.colorScheme.textAccent
+                                    else MaterialTheme.colorScheme.onSurface,
+                                )
+                            }
+                        }
+                    }
+                    Text(
+                        text = "Shift guide moves the TV Guide over so the sidebar never covers programs.",
+                        style = MaterialTheme.typography.bodySmall.subtext(),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 28.dp, vertical = 2.dp),
+                    )
+                }
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+                if (allGroups.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 32.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "No groups available",
+                            style = MaterialTheme.typography.bodyMedium.subtext(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    return@Column
+                }
+                val firstFocus = remember { FocusRequester() }
+                val moveFocus = remember { FocusRequester() }
+                var movingGroup by remember { mutableStateOf<String?>(null) }
+                LaunchedEffect(Unit) { runCatching { firstFocus.requestFocus() } }
+                // Keep the D-pad cursor pinned on the moving row as it changes
+                // position (Multiview re-pins dpadIndex the same way).
+                LaunchedEffect(movingGroup, workingOrder) {
+                    if (movingGroup != null) runCatching { moveFocus.requestFocus() }
+                }
+                val displayGroups = if (manualReorder) workingOrder else listGroups
+                // GH #80: pinned All Channels toggle (TV picker); in Manual order
+                // it lives in the list instead so it can be moved.
+                if (!manualReorder) run {
+                    val allVisible = PlaylistViewModel.ALL_GROUPS !in workingHidden
+                    var focused by remember { mutableStateOf(false) }
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                                else Color.Transparent,
+                            )
+                            .border(
+                                width = if (focused) 2.dp else 0.dp,
+                                color = if (focused) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                shape = RoundedCornerShape(12.dp),
+                            )
+                            .onFocusChanged { focused = it.isFocused }
+                            .clickable {
+                                workingHidden = workingHidden.toMutableSet().apply {
+                                    if (allVisible) add(PlaylistViewModel.ALL_GROUPS) else remove(PlaylistViewModel.ALL_GROUPS)
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = allVisible,
+                            onCheckedChange = null,
+                            colors = CheckboxDefaults.colors(checkedColor = MaterialTheme.colorScheme.primary),
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            text = "All Channels",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.padding(vertical = 6.dp),
+                    )
+                }
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    itemsIndexed(displayGroups, key = { _, g -> g }) { index, group ->
+                        val visible = group !in workingHidden
+                        val isMoving = movingGroup == group
+                        var focused by remember { mutableStateOf(false) }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    when {
+                                        isMoving -> MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)
+                                        focused -> MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                                        else -> Color.Transparent
+                                    },
+                                )
+                                .border(
+                                    width = if (focused || isMoving) 2.dp else 0.dp,
+                                    color = if (focused || isMoving) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                    shape = RoundedCornerShape(12.dp),
+                                )
+                                .then(
+                                    when {
+                                        isMoving -> Modifier.focusRequester(moveFocus)
+                                        index == 0 -> Modifier.focusRequester(firstFocus)
+                                        else -> Modifier
+                                    },
+                                )
+                                .onFocusChanged { focused = it.isFocused }
+                                .then(
+                                    if (manualReorder) {
+                                        // Manual mode handles ALL keys via onKeyEvent and stays
+                                        // focusable on its own (a disabled clickable would drop
+                                        // focusability the moment move mode starts, so the D-pad
+                                        // could no longer reach the moving row).
+                                        Modifier
+                                            .focusable()
+                                            .onKeyEvent { ev ->
+                                                if (isMoving) {
+                                                    if (ev.type != KeyEventType.KeyDown) return@onKeyEvent false
+                                                    when (ev.key) {
+                                                        Key.DirectionUp -> {
+                                                            workingOrder = moveInList(workingOrder, group, -1); true
+                                                        }
+                                                        Key.DirectionDown -> {
+                                                            workingOrder = moveInList(workingOrder, group, +1); true
+                                                        }
+                                                        Key.DirectionCenter, Key.Enter, Key.Back -> {
+                                                            movingGroup = null; orderDirty = true; true
+                                                        }
+                                                        else -> false
+                                                    }
+                                                } else when {
+                                                    // Long-press OK (auto-repeat / long-press flag)
+                                                    // picks the group up into move mode.
+                                                    ev.type == KeyEventType.KeyDown &&
+                                                        (ev.key == Key.DirectionCenter || ev.key == Key.Enter) &&
+                                                        (ev.nativeKeyEvent.repeatCount >= 1 ||
+                                                            ev.nativeKeyEvent.isLongPress) -> {
+                                                        movingGroup = group; true
+                                                    }
+                                                    // Short press toggles visibility on release.
+                                                    ev.type == KeyEventType.KeyUp &&
+                                                        (ev.key == Key.DirectionCenter || ev.key == Key.Enter) -> {
+                                                        workingHidden =
+                                                            if (visible) workingHidden + group
+                                                            else workingHidden - group
+                                                        true
+                                                    }
+                                                    else -> false
+                                                }
+                                            }
+                                    } else {
+                                        Modifier.clickable {
+                                            workingHidden =
+                                                if (visible) workingHidden + group
+                                                else workingHidden - group
+                                        }
+                                    },
+                                )
+                                .padding(horizontal = 22.dp, vertical = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = groupSidebarLabel(group),
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = when {
+                                    isMoving -> "Moving"
+                                    visible -> "On"
+                                    else -> "Off"
+                                },
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (visible || isMoving) MaterialTheme.colorScheme.textAccent
+                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

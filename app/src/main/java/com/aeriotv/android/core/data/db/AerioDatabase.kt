@@ -1,0 +1,57 @@
+package com.aeriotv.android.core.data.db
+
+import androidx.room.Database
+import androidx.room.RoomDatabase
+import com.aeriotv.android.core.data.db.dao.ChannelSnapshotDao
+import com.aeriotv.android.core.data.db.dao.EpgChunkCoverageDao
+import com.aeriotv.android.core.data.db.dao.EpgProgrammeDao
+import com.aeriotv.android.core.data.db.dao.FavoriteChannelDao
+import com.aeriotv.android.core.data.db.dao.LocalRecordingDao
+import com.aeriotv.android.core.data.db.dao.PlaylistDao
+import com.aeriotv.android.core.data.db.dao.ReminderDao
+import com.aeriotv.android.core.data.db.dao.TmdbArtDao
+import com.aeriotv.android.core.data.db.dao.VodCatalogDao
+import com.aeriotv.android.core.data.db.dao.WatchProgressDao
+import com.aeriotv.android.core.data.db.entity.ChannelSnapshotEntity
+import com.aeriotv.android.core.data.db.entity.EpgChunkCoverage
+import com.aeriotv.android.core.data.db.entity.EpgProgrammeEntity
+import com.aeriotv.android.core.data.db.entity.FavoriteChannelEntity
+import com.aeriotv.android.core.data.db.entity.LocalRecordingEntity
+import com.aeriotv.android.core.data.db.entity.PlaylistEntity
+import com.aeriotv.android.core.data.db.entity.ReminderEntity
+import com.aeriotv.android.core.data.db.entity.TmdbArtEntity
+import com.aeriotv.android.core.data.db.entity.VodSweepLaneEntity
+import com.aeriotv.android.core.data.db.entity.VodSweepStateEntity
+import com.aeriotv.android.core.data.db.entity.VodTitleEntity
+import com.aeriotv.android.core.data.db.entity.WatchProgressEntity
+
+@Database(
+    entities = [
+        PlaylistEntity::class,
+        WatchProgressEntity::class,
+        LocalRecordingEntity::class,
+        FavoriteChannelEntity::class,
+        ReminderEntity::class,
+        EpgProgrammeEntity::class,
+        EpgChunkCoverage::class,
+        ChannelSnapshotEntity::class,
+        TmdbArtEntity::class,
+        VodTitleEntity::class,
+        VodSweepStateEntity::class,
+        VodSweepLaneEntity::class,
+    ],
+    version = 37,
+    exportSchema = false,
+)
+abstract class AerioDatabase : RoomDatabase() {
+    abstract fun playlistDao(): PlaylistDao
+    abstract fun watchProgressDao(): WatchProgressDao
+    abstract fun localRecordingDao(): LocalRecordingDao
+    abstract fun favoriteChannelDao(): FavoriteChannelDao
+    abstract fun reminderDao(): ReminderDao
+    abstract fun epgProgrammeDao(): EpgProgrammeDao
+    abstract fun epgChunkCoverageDao(): EpgChunkCoverageDao
+    abstract fun channelSnapshotDao(): ChannelSnapshotDao
+    abstract fun tmdbArtDao(): TmdbArtDao
+    abstract fun vodCatalogDao(): VodCatalogDao
+}
