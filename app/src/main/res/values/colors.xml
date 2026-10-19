@@ -1,10 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- خلفية أيقونة التطبيق بالأسود الفحمي -->
-    <color name="launcher_background">#121212</color>
+    <!-- الخلفيات الأساسية -->
+    <color name="launcher_background">#0F0F0F</color>
+    <color name="window_background">#0F0F0F</color>
+    <color name="surface_dark">#1A1A1A</color>
 
-    <!-- ألوان نيون الهوية الجديدة -->
-    <color name="brand_neon_red">#FF1E27</color>
-    <color name="brand_dark_red">#B20710</color>
-    <color name="brand_bg_black">#0F0F0F</color>
+    <!-- الألوان الأساسية والأحمر النيون (بدلاً من الأزرق) -->
+    <color name="primary">#FF1E27</color>
+    <color name="primary_dark">#B20710</color>
+    <color name="colorAccent">#FF1E27</color>
+    <color name="teal_200">#FF1E27</color>
+    <color name="teal_700">#B20710</color>
+    <color name="blue_primary">#FF1E27</color>
+    
+    <!-- النصوص والأيقونات -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#CCCCCC</color>
 </resources>
