@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- خلفية أيقونة التطبيق بالأسود الفحمي -->
     <color name="launcher_background">#121212</color>
+
+    <!-- ألوان نيون الهوية الجديدة -->
+    <color name="brand_neon_red">#FF1E27</color>
+    <color name="brand_dark_red">#B20710</color>
+    <color name="brand_bg_black">#0F0F0F</color>
 </resources>
