@@ -1,4 +1,4 @@
-Package com.aeriotv.android.feature.onboarding
+package com.aeriotv.android.feature.onboarding
 
 import com.aeriotv.android.ui.theme.decorSecondary
 import com.aeriotv.android.ui.scale.subtext
