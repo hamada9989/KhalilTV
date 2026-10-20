@@ -58,7 +58,7 @@
         android:banner="@drawable/tv_banner"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
-        android:theme="@style/Theme.AerioTV">
+        android:theme="@style/Theme.KhalilTV"
 
         <!-- Allow shell profiling (simpleperf / am profile) of release builds on
              production devices, so on-device performance can be measured without
